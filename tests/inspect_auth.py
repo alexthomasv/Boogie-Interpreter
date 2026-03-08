@@ -8,7 +8,7 @@ import os
 import pickle
 import tempfile
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from utils.utils import parse_inputs
 from interpreter.python.Environment import Environment

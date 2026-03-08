@@ -21,7 +21,7 @@ from pathlib import Path
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from parser.declaration import ImplementationDeclaration
 from utils.utils import (
@@ -34,7 +34,7 @@ from utils.utils import (
 from interpreter.python.interpreter import BoogieInterpreter, find_entry_point, process_single_input
 from interpreter.python.Environment import Environment
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
 TEST_PACKAGES = PROJECT_ROOT / "test_packages"
 TEST_INPUT = PROJECT_ROOT / "test_input"
 POSITIVE_EXAMPLES = PROJECT_ROOT / "positive_examples"

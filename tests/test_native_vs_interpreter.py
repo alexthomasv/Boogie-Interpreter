@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pytest
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
 BEARSSL_DIR = PROJECT_ROOT / "examples" / "bearssl"
 BEARSSL_SRC = BEARSSL_DIR / "src"
 BEARSSL_INC = BEARSSL_DIR / "inc"

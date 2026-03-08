@@ -26,11 +26,11 @@ jobs:
 
       - name: Run unit tests
         run: |
-          python -m pytest interpreter/tests/test_interpreter.py -q --tb=short -k "not (EndToEnd or BenchmarkInputs)"
+          python -m pytest tests/test_interpreter.py -q --tb=short -k "not (EndToEnd or BenchmarkInputs)"
 
       - name: Run expression op tests
         run: |
-          python -m pytest interpreter/tests/test_expression_ops.py -q --tb=short
+          python -m pytest tests/test_expression_ops.py -q --tb=short
 
   rust-build:
     runs-on: ubuntu-latest

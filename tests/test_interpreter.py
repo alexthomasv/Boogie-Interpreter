@@ -17,7 +17,7 @@ import json
 import tempfile
 import shutil
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import pytest
 from parser.boogie_parser import bpl, parse_boogie
