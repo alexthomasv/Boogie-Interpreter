@@ -17,7 +17,13 @@ import json
 import tempfile
 import shutil
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# This repo IS the `interpreter` package.
+# Add parent-of-repo-root for `import interpreter.python.*`
+# Add repo root for `import parser.*` and `import utils.*`
+_repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_parent = os.path.dirname(_repo_root)
+sys.path.insert(0, _parent)
+sys.path.insert(0, _repo_root)
 
 import pytest
 from parser.boogie_parser import bpl, parse_boogie

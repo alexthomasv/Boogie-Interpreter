@@ -14,7 +14,10 @@ jobs:
         python-version: ["3.10", "3.11", "3.12"]
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout into interpreter/
+        uses: actions/checkout@v4
+        with:
+          path: interpreter
 
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
@@ -25,12 +28,16 @@ jobs:
         run: pip install pytest lark
 
       - name: Run unit tests
+        env:
+          PYTHONPATH: ${{ github.workspace }}:${{ github.workspace }}/interpreter
         run: |
-          python -m pytest tests/test_interpreter.py -q --tb=short -k "not (EndToEnd or BenchmarkInputs)"
+          python -m pytest interpreter/tests/test_interpreter.py -q --tb=short -k "not (EndToEnd or BenchmarkInputs)"
 
       - name: Run expression op tests
+        env:
+          PYTHONPATH: ${{ github.workspace }}:${{ github.workspace }}/interpreter
         run: |
-          python -m pytest tests/test_expression_ops.py -q --tb=short
+          python -m pytest interpreter/tests/test_expression_ops.py -q --tb=short
 
   rust-build:
     runs-on: ubuntu-latest
@@ -49,5 +56,5 @@ jobs:
         run: pip install maturin
 
       - name: Build native interpreter
-        working-directory: interpreter/native
+        working-directory: native
         run: maturin build --release
