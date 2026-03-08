@@ -11,7 +11,7 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJECT_ROOT)
 os.chdir(PROJECT_ROOT)
 
-from utils.utils import parse_inputs
+from interpreter.utils.utils import parse_inputs
 from interpreter.python.Environment import Environment
 from interpreter.python.interpreter import BoogieInterpreter, find_entry_point
 

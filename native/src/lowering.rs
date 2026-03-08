@@ -234,32 +234,61 @@ pub fn lower_program(py: Python<'_>, program: &Bound<'_, PyAny>) -> PyResult<Com
         let block = &blocks[block_id as usize];
         let mut patches: Vec<(usize, VarId)> = Vec::new();
 
+        // Map compiled stmt index -> Python stmt index.
+        // HavocCurrAddr in compiled code corresponds to a HavocStatement in Python AST.
+        // We need to find which Python stmt index each HavocCurrAddr came from.
+        let mut py_havoc_indices: Vec<usize> = Vec::new();
+        for py_idx in 0..stmts_list.len() {
+            let py_stmt = stmts_list.get_item(py_idx)?;
+            let stmt_type = py_stmt.get_type().name()?.to_string();
+            if stmt_type == "HavocStatement" {
+                let idents = py_stmt.getattr("identifiers")?;
+                let idents_list: &Bound<'_, PyList> = idents.downcast()?;
+                for ident in idents_list.iter() {
+                    let ident_name: String = ident.getattr("name")?.extract()?;
+                    if ident_name == "$CurrAddr" || ident_name == "$CurrAddr.shadow" {
+                        py_havoc_indices.push(py_idx);
+                        break;
+                    }
+                }
+            }
+        }
+
+        let mut havoc_count = 0usize;
         for (i, stmt) in block.body.iter().enumerate() {
-            if let Stmt::HavocCurrAddr { alloc_size_var, .. } = stmt {
+            if let Stmt::HavocCurrAddr { alloc_size_var, var_id } = stmt {
                 if *alloc_size_var == u32::MAX {
-                    // Find the alloc size var from Python statements at offsets +3 and +5
-                    let utils = py.import_bound("utils.utils")?;
+                    let havoc_var_name = intern.names[*var_id as usize].clone();
+                    // Find alloc size var by scanning forward from havoc in Python AST
+                    let py_idx = if havoc_count < py_havoc_indices.len() {
+                        py_havoc_indices[havoc_count]
+                    } else { 0 };
+
+                    let utils = py.import_bound("interpreter.utils.utils")?;
                     let mut size_var_id: Option<VarId> = None;
 
-                    for offset in [3, 5] {
-                        let idx = i + offset;
-                        if idx < stmts_list.len() {
-                            let py_stmt = stmts_list.get_item(idx)?;
-                            let stmt_type = py_stmt.get_type().name()?.to_string();
-                            if stmt_type == "AssumeStatement" {
+                    // Scan forward for AssumeStatements referencing this havoc var
+                    for j in (py_idx + 1)..stmts_list.len() {
+                        let py_stmt = stmts_list.get_item(j)?;
+                        let stmt_type = py_stmt.get_type().name()?.to_string();
+                        if stmt_type == "AssumeStatement" {
+                            let expr_str = py_stmt.getattr("expression")?.str()?.to_string();
+                            if expr_str.contains(havoc_var_name.as_str()) {
                                 let expr = py_stmt.getattr("expression")?;
                                 let vars_set = utils.call_method1("extract_boogie_variables", (&expr,))?;
                                 let vars: Vec<Bound<'_, PyAny>> = vars_set.iter()?.collect::<PyResult<Vec<_>>>()?;
                                 for v in &vars {
                                     let vname: String = v.getattr("name")?.extract::<String>()?;
-                                    if vname.ends_with("$n") || vname.ends_with("$n.shadow") {
+                                    if vname.contains("$n") {
                                         size_var_id = Some(intern.intern(&vname));
                                         break;
                                     }
                                 }
+                                if size_var_id.is_some() {
+                                    break;
+                                }
                             }
-                        }
-                        if size_var_id.is_some() {
+                        } else if stmt_type != "HavocStatement" && stmt_type != "AssumeStatement" {
                             break;
                         }
                     }
@@ -268,6 +297,7 @@ pub fn lower_program(py: Python<'_>, program: &Bound<'_, PyAny>) -> PyResult<Com
                         patches.push((i, svid));
                     }
                 }
+                havoc_count += 1;
             }
         }
 
@@ -520,7 +550,7 @@ fn lower_quantified_assume(
     let op: String = expression.getattr("op")?.extract()?;
 
     // Get all boogie variables in the expression
-    let utils = py.import_bound("utils.utils")?;
+    let utils = py.import_bound("interpreter.utils.utils")?;
     let boogie_vars_set = utils.call_method1("extract_boogie_variables", (&expression,))?;
     let boogie_vars: Vec<Bound<'_, PyAny>> = boogie_vars_set.iter()?.collect::<PyResult<Vec<_>>>()?;
 

@@ -4,10 +4,10 @@ import json
 from collections import defaultdict
 from dataclasses import dataclass, replace
 
-from parser.declaration import ImplementationDeclaration
-from parser.statement import CallStatement
+from interpreter.parser.declaration import ImplementationDeclaration
+from interpreter.parser.statement import CallStatement
 
-from utils.program import extract_boogie_variables, RE_SMACK
+from interpreter.utils.program import extract_boogie_variables, RE_SMACK
 
 
 @dataclass

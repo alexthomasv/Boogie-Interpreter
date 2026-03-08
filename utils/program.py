@@ -2,15 +2,15 @@
 
 import re
 
-from parser.expression import (
+from interpreter.parser.expression import (
     FunctionApplication, StorageIdentifier, Identifier,
     BooleanLiteral,
 )
-from parser.declaration import ImplementationDeclaration
-from parser.statement import (
+from interpreter.parser.declaration import ImplementationDeclaration
+from interpreter.parser.statement import (
     AssertStatement, AssumeStatement, CallStatement, Block,
 )
-from parser.type import BooleanType, IntegerType, CustomType, MapType
+from interpreter.parser.type import BooleanType, IntegerType, CustomType, MapType
 from collections import defaultdict
 
 

@@ -1,17 +1,17 @@
 from cvc5 import Kind, Term, Sort, Solver, SortKind
 import math
-from parser.expression import FunctionApplication, MapSelect, StorageIdentifier, ProcedureIdentifier, BinaryExpression, UnaryExpression, BooleanLiteral, IntegerLiteral, OldExpression, LogicalNegation, QuantifiedExpression, IfExpression, Identifier
-from parser.statement import AssertStatement, AssumeStatement, AssignStatement, Block, CallStatement, GotoStatement, HavocStatement
-from parser.declaration import StorageDeclaration, ImplementationDeclaration, ProcedureDeclaration
-from parser.type import BooleanType, IntegerType, CustomType, MapType
-from utils.cvc5_helper import term_to_string, sign_extend, zero_extend
+from interpreter.parser.expression import FunctionApplication, MapSelect, StorageIdentifier, ProcedureIdentifier, BinaryExpression, UnaryExpression, BooleanLiteral, IntegerLiteral, OldExpression, LogicalNegation, QuantifiedExpression, IfExpression, Identifier
+from interpreter.parser.statement import AssertStatement, AssumeStatement, AssignStatement, Block, CallStatement, GotoStatement, HavocStatement
+from interpreter.parser.declaration import StorageDeclaration, ImplementationDeclaration, ProcedureDeclaration
+from interpreter.parser.type import BooleanType, IntegerType, CustomType, MapType
+from interpreter.utils.cvc5_helper import term_to_string, sign_extend, zero_extend
 
-from utils.utils import boogie_type_bitwidth
+from interpreter.utils.utils import boogie_type_bitwidth
 from collections import deque
 import pickle
 from functools import lru_cache
 from cachetools import LRUCache
-from utils.utils import IndentLogger, indent_log
+from interpreter.utils.utils import IndentLogger, indent_log
 
 # (cvc5_op, op, num_args, op_bit_width, op_out_width)
 fn_to_cvc5_op = {

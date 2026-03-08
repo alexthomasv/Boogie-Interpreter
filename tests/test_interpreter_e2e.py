@@ -23,8 +23,8 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from parser.declaration import ImplementationDeclaration
-from utils.utils import (
+from interpreter.parser.declaration import ImplementationDeclaration
+from interpreter.utils.utils import (
     preprocess_external_inputs,
     parse_inputs,
     generate_function_map,

@@ -13,7 +13,7 @@ if str(PARENT) not in sys.path:
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from utils.utils import (
+from interpreter.utils.utils import (
     slt_fn, sle_fn, sgt_fn, sge_fn,
     add_fn, sub_fn, mul_fn, and_fn, or_fn, xor_fn, not_fn,
     sext_fn, trunc_fn, eq_fn, ne_fn,

@@ -6,9 +6,9 @@ doesn't have to import from an analysis/visualization script.
 
 import logging
 from cvc5 import Kind
-from parser.expression import FunctionApplication
-from parser.statement import AssignStatement
-from utils.utils_cvc5 import extract_variable_terms
+from interpreter.parser.expression import FunctionApplication
+from interpreter.parser.statement import AssignStatement
+from interpreter.utils.utils_cvc5 import extract_variable_terms
 
 log = logging.getLogger(__name__)
 

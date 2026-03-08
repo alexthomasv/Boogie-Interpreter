@@ -26,23 +26,23 @@ sys.path.insert(0, _parent)
 sys.path.insert(0, _repo_root)
 
 import pytest
-from parser.boogie_parser import bpl, parse_boogie
-from parser.expression import (
+from interpreter.parser.boogie_parser import bpl, parse_boogie
+from interpreter.parser.expression import (
     FunctionApplication, MapSelect, StorageIdentifier, ProcedureIdentifier,
     BinaryExpression, UnaryExpression, BooleanLiteral, IntegerLiteral,
     OldExpression, LogicalNegation, QuantifiedExpression, IfExpression,
 )
-from parser.statement import (
+from interpreter.parser.statement import (
     AssertStatement, AssumeStatement, AssignStatement, Block,
     CallStatement, GotoStatement, HavocStatement, ReturnStatement,
 )
-from parser.declaration import StorageDeclaration, ImplementationDeclaration, ProcedureDeclaration
+from interpreter.parser.declaration import StorageDeclaration, ImplementationDeclaration, ProcedureDeclaration
 from interpreter.python.Buffer import ReadBuffer
 from interpreter.python.Environment import Environment
 from interpreter.python.MemoryMap import MemoryMap
 from interpreter.python.Context import Context
 from interpreter.python.interpreter import BoogieInterpreter, find_entry_point, hex_to_bytes
-from utils.utils import (
+from interpreter.utils.utils import (
     Input, parse_inputs, mask_bits, generate_function_map,
     generate_label_to_block, initialize_code_metadata,
 )

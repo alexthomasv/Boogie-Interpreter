@@ -14,7 +14,7 @@ sys.path.insert(0, PROJECT_ROOT)
 from interpreter.python.Environment import Environment
 from interpreter.python.MemoryMap import MemoryMap
 from interpreter.python.interpreter import BoogieInterpreter, find_entry_point
-from utils.utils import parse_inputs
+from interpreter.utils.utils import parse_inputs
 
 
 def main():

@@ -316,7 +316,7 @@ def process_single_input(input_file, test_name, test_path, engine='python',
         with open(test_path, 'rb') as file:
             program = pickle.load(file)
 
-        from utils.utils import parse_inputs
+        from interpreter.utils.utils import parse_inputs
 
         print(f"Processing input file: {input_file}")
         program_inputs = parse_inputs(input_file)
@@ -391,6 +391,18 @@ def main():
     else:
         bpl_hash = None
 
+    # Engine mismatch check: clear traces if engine changed
+    engine_file = trace_dir / f"{test_name}.engine"
+    if trace_dir.exists() and engine_file.exists():
+        stored_engine = engine_file.read_text().strip()
+        if stored_engine != args.engine and args.engine != "both":
+            print(f"Engine changed ({stored_engine} → {args.engine}) — clearing old traces in {trace_dir}")
+            shutil.rmtree(trace_dir)
+            trace_dir.mkdir(parents=True, exist_ok=True)
+            mem_trace_dir = Path("mem_ops_traces") / test_name
+            if mem_trace_dir.exists():
+                shutil.rmtree(mem_trace_dir)
+
     if not args.force and bpl_hash and hash_file.exists() and trace_dir.exists():
         stored_hash = hash_file.read_text().strip()
         if stored_hash == bpl_hash:
@@ -447,6 +459,10 @@ def main():
     if bpl_hash:
         trace_dir.mkdir(parents=True, exist_ok=True)
         hash_file.write_text(bpl_hash + "\n")
+
+    # Record which engine produced these traces
+    trace_dir.mkdir(parents=True, exist_ok=True)
+    engine_file.write_text(args.engine + "\n")
 
     print(f"Done. Engine={args.engine}")
 

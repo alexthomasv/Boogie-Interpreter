@@ -54,7 +54,7 @@ def benchmark_data(benchmark_name):
     with open(pkl_path, 'rb') as f:
         program = pickle.load(f)
 
-    from utils.utils import parse_inputs
+    from interpreter.utils.utils import parse_inputs
     program_inputs = parse_inputs(input_file)
 
     return {

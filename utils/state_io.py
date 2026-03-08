@@ -96,7 +96,7 @@ def get_df(df_serialized_key, state_cache):
 
 
 def find_unpicklable(obj, path="root"):
-    from utils.utils_cvc5 import HollowCvc5Term
+    from interpreter.utils.utils_cvc5 import HollowCvc5Term
     """
     Recursively searches for objects of type HollowCvc5Term.
     """

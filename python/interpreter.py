@@ -1,20 +1,20 @@
 import argparse
 import hashlib
 import shutil
-from parser.expression import (
+from interpreter.parser.expression import (
     FunctionApplication, MapSelect, StorageIdentifier, ProcedureIdentifier,
     BinaryExpression, UnaryExpression, BooleanLiteral, IntegerLiteral,
     OldExpression, LogicalNegation, QuantifiedExpression, IfExpression,
 )
-from parser.statement import (
+from interpreter.parser.statement import (
     AssertStatement, AssumeStatement, AssignStatement, Block,
     CallStatement, GotoStatement, HavocStatement, ReturnStatement,
 )
-from parser.declaration import (
+from interpreter.parser.declaration import (
     StorageDeclaration, ImplementationDeclaration, ProcedureDeclaration,
     ConstantDeclaration, AxiomDeclaration,
 )
-from parser.type import MapType
+from interpreter.parser.type import MapType
 from collections import defaultdict
 from interpreter.python.Environment import Environment
 from interpreter.python.MemoryMap import MemoryMap
@@ -519,8 +519,14 @@ class BoogieInterpreter:
             block = self.label_to_block[self.env.curr_block]
             offset_pc = self.env.pc - self.label_to_pc[self.env.curr_block]
             havoc_var = stmt.identifiers[0].name
-            constraints = {block.statements[offset_pc + 3].expression,
-                           block.statements[offset_pc + 5].expression}
+            # Scan forward for AssumeStatements that constrain this havoc var
+            constraints = set()
+            for j in range(offset_pc + 1, len(block.statements)):
+                s = block.statements[j]
+                if isinstance(s, AssumeStatement) and havoc_var in str(s.expression):
+                    constraints.add(s.expression)
+                elif not isinstance(s, (HavocStatement, AssumeStatement)):
+                    break
             self.env.handle_curr_addr(havoc_var, constraints)
             self._get_var(havoc_var)
 
@@ -882,6 +888,18 @@ if __name__ == '__main__':
     else:
         bpl_hash = None
 
+    # Engine mismatch check: clear traces if they were produced by a different engine
+    engine_file = trace_dir / f"{test_name}.engine"
+    if trace_dir.exists() and engine_file.exists():
+        stored_engine = engine_file.read_text().strip()
+        if stored_engine != "python":
+            print(f"Engine changed ({stored_engine} → python) — clearing old traces in {trace_dir}")
+            shutil.rmtree(trace_dir)
+            trace_dir.mkdir(parents=True, exist_ok=True)
+            mem_trace_dir = Path("mem_ops_traces") / test_name
+            if mem_trace_dir.exists():
+                shutil.rmtree(mem_trace_dir)
+
     if not args.force and bpl_hash and hash_file.exists() and trace_dir.exists():
         stored_hash = hash_file.read_text().strip()
         if stored_hash == bpl_hash:
@@ -935,3 +953,7 @@ if __name__ == '__main__':
     if bpl_hash:
         trace_dir.mkdir(parents=True, exist_ok=True)
         hash_file.write_text(bpl_hash + "\n")
+
+    # Record which engine produced these traces
+    trace_dir.mkdir(parents=True, exist_ok=True)
+    engine_file.write_text("python\n")
