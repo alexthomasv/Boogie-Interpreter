@@ -35,11 +35,12 @@ jobs:
         with:
           path: workspace/interpreter
 
-      - name: Clone parent repo for parser/ and utils/
+      - name: Clone parent repo for parser/, utils/, and grammar
         run: |
           git clone --depth 1 https://github.com/alexthomasv/boogie-parser.git /tmp/boogie-parser
           cp -r /tmp/boogie-parser/parser workspace/parser
           cp -r /tmp/boogie-parser/utils workspace/utils
+          cp /tmp/boogie-parser/boogie.lark workspace/boogie.lark
 
       - name: Run unit tests
         working-directory: workspace
