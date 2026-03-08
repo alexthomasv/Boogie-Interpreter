@@ -37,7 +37,7 @@ from interpreter.python.MemoryMap import MemoryMap
 from interpreter.python.Context import Context
 from interpreter.python.interpreter import BoogieInterpreter, find_entry_point, hex_to_bytes
 from utils.utils import (
-    Input, ProgramInputs, parse_inputs, mask_bits, generate_function_map,
+    Input, parse_inputs, mask_bits, generate_function_map,
     generate_label_to_block, initialize_code_metadata,
 )
 from pathlib import Path

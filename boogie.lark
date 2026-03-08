@@ -1,0 +1,292 @@
+// boogie.lark
+%import common.CNAME
+%import common.ESCAPED_STRING
+%import common.WS
+%import common.NUMBER
+%ignore WS
+
+PARSE_DECL: "$$PARSE_DECL$$"
+PARSE_PARAM: "$$PARSE_PARAM$$"
+PARSE_SPEC: "$$PARSE_SPEC$$"
+PARSE_BLOCKS: "$$PARSE_BLOCKS$$"
+PARSE_STMT: "$$PARSE_STMT$$"
+PARSE_EXPR: "$$PARSE_EXPR$$"
+PARSE_TYPE: "$$PARSE_TYPE$$"
+
+// Start rule
+?start: decl*
+    | PARSE_DECL decl -> parse_decl
+    | PARSE_PARAM param_decl -> parse_param
+    | PARSE_SPEC spec -> parse_spec
+    | PARSE_BLOCKS blocks -> parse_blocks
+    | PARSE_STMT stmt -> parse_stmt
+    | PARSE_EXPR expr -> parse_expr
+    | PARSE_TYPE type -> parse_type
+
+decl: uses_block | axiom_decl | const_decl | func_decl | impl_decl | proc_decl | type_decl | var_decl
+
+uses_block: "uses" "{" axiom_decl* "}"
+
+axiom_decl: "axiom" attrs_opt expr ";"
+const_decl: "const" attrs_opt unique_opt typed_ids order_spec ";"?
+func_decl: "revealed"? "function" attrs_opt name type_args "(" fargs_opt ")" "returns" "(" farg ")" fbody
+impl_decl: "implementation" attrs_opt name type_args "(" param_decls_opt ")" out_params body
+proc_decl: "procedure" attrs_opt name type_args "(" param_decls_opt ")" out_params pspec
+type_decl: "type" attrs_opt finite_opt name tc_params type_syn ";"
+
+MLC: "/*" /(.|\n)*?/ "*/"
+%ignore MLC
+
+finite_opt: "finite"
+            | -> empty_finite
+
+tc_params: name tc_params
+    | -> empty_tc_params   
+
+type_syn: "=" type 
+        | -> empty_type_syn
+
+unique_opt: "unique"
+        | -> empty_unique
+
+order_spec: parent_info complete_opt 
+
+parent_info: "<:" parent_edges_opt
+            | -> empty_parent_info
+
+parent_edge: unique_opt ident
+parent_edges: parent_edge | parent_edge "," parent_edges
+parent_edges_opt: parent_edges
+                | -> empty_parent_edges
+
+complete_opt: "complete"
+            | -> empty_complete
+
+fbody: "{" expr "}"
+    | ";" -> empty_fbody
+
+
+typed_ids: names ":" type 
+
+farg: typed_ids 
+    | type -> farg_type_only
+
+fargs: type -> fargs_type_only
+    | type "," fargs -> fargs_type_comma
+    | type ":" fargs 
+
+fargs_opt: fargs
+    | -> empty_fargs
+
+param_decl: typed_ids_where
+param_decls: param_decl | param_decl "," param_decls 
+param_decls_opt: param_decls
+                | -> empty_param_decls
+
+
+spec: free_opt "requires" attrs_opt expr ";" -> spec_requires
+    | free_opt "modifies" attrs_opt idents ";" -> spec_modifies
+    | free_opt "ensures" attrs_opt expr ";" -> spec_ensures
+specs: spec specs 
+        | -> empty_specs
+pspec: ";" specs | specs body 
+
+
+out_params: "returns" "(" param_decls_opt ")"
+          | -> empty_out_params
+
+body: "{" var_decls blocks "}"
+
+blocks: block*
+        | -> empty_blocks
+
+block: name ":" -> block_label
+    | stmt -> block_stmt
+    
+wc_expr: expr 
+        | "*" -> wildcard_expr 
+wc_exprs: wc_expr 
+        | wc_expr "," wc_exprs
+wc_exprs_opt: wc_exprs
+            | -> empty_wc_exprs
+
+var_decls: var_decl*
+         | -> empty_var_decls
+var_decl: "var" attrs_opt typed_ids_where ";"
+
+free_opt: "free"
+        | -> empty_free
+
+stmt: "assert" attrs_opt expr ";" -> assert_cmd 
+    | "assume" attrs_opt expr ";" -> assume_cmd
+    | lhss ":=" exprs ";" -> assign_cmd
+    | "call" attrs_opt call_lhs "(" exprs_opt ")" ";" -> call_cmd
+    | "call" "forall" ident "(" wc_exprs_opt ")" ";" -> call_forall_cmd
+    | "havoc" idents ";" -> havoc_cmd
+    | par_call_cmd 
+    | "yield" ";" -> yield_cmd
+    | "break" ident? ";" -> break_cmd
+    | "return" ";" -> return_cmd
+    | "return" expr ";" -> return_expr_cmd
+    | "goto" idents ";" -> goto_cmd
+    | if_stmt
+    | "pop" ";"?
+
+if_stmt: "if" "(" wc_expr ")" "{" blocks "}" else_stmt
+else_stmt: "else" "{" blocks "}" -> else_stmt_blocks
+         | "else" if_stmt -> else_if_stmt
+         | -> empty_else_stmt
+
+lhss: lhs | lhs "," lhss
+lhs: ident selects
+
+select: "[" exprs [ ":=" expr ] "]"
+selects: select selects
+        | -> empty_selects
+
+par_call_cmd: "par" attrs_opt call_lhs ( "|" call_lhs )* ";"
+invariant: "invariant" attrs_opt expr ";"
+free_invariant: "free" "invariant" attrs_opt expr ";"
+call_lhs: ident 
+    | idents ":=" ident
+guard: "(" ( "*" | expr ) ")"
+
+type: type_atom 
+    | map_type
+    | name tc_args -> custom_type
+
+types: type ("," type)*
+
+tc_args: type_atom tc_args 
+       | name tc_args 
+       | map_type 
+       | -> empty_tc_args
+
+!type_atom: "bool"
+    | "int"
+    | "real"
+    | "(" type ")" 
+
+map_type: type_args "[" types "]" type
+
+exprs: expr ("," expr)*
+proposition: expr
+
+?expr: expr "<==>" expr  -> binary_expr_iff
+     | expr "==>" expr   -> binary_expr_implies
+     | expr "||" expr    -> binary_expr_or
+     | expr "&&" expr    -> binary_expr_and
+     | expr "==" expr    -> binary_expr_eq
+     | expr "!=" expr    -> binary_expr_neq
+     | expr "<" expr     -> binary_expr_lt
+     | expr ">" expr     -> binary_expr_gt
+     | expr "<=" expr    -> binary_expr_le
+     | expr ">=" expr    -> binary_expr_ge
+     | expr "<:" expr    -> binary_expr_lt_colon
+     | expr "++" expr    -> binary_expr_plus_plus
+     | expr "+" expr     -> binary_expr_plus
+     | expr "-" expr     -> binary_expr_minus
+     | expr "*" expr     -> binary_expr_times
+     | expr "/" expr     -> binary_expr_div
+     | expr "%" expr     -> binary_expr_mod
+     | "!" expr          -> logical_negation
+     | "-" expr          -> arithmetic_negation
+     | expr "[" exprs "]" -> index
+     | expr "[" exprs ":=" expr "]" -> assign_index
+     | expr "[" NUMBER ":" NUMBER "]" -> range_index
+     | "if" expr "then" expr "else" expr -> if_then_else_expr
+     | "old" "(" expr ")" -> old_expr
+     | "(" quantifier type_args param_decls "::" ants_opt expr")" -> quantifier_expr
+     | literal
+     | ident "(" exprs ")" -> func_expr
+     | ident -> expr_ident
+     | "(" expr ")"
+
+?exprs_opt: exprs
+         | -> empty_exprs
+?attrs_opt: attr attrs_opt
+         | -> empty_attr
+
+literal: bool_lit
+         | nat
+         | dec
+         | float_lit
+         | bv_lit
+
+!bool_lit: "true" | "false"
+nat: DIGITS | NUMBER
+dec: DIGITS "e" ["-"] DIGITS
+float_lit: DIGITS "." DIGITS
+bv_lit: DIGITS "bv" DIGITS
+arith_coercion_expr: ( "int" "(" expr ")" | "real" "(" expr ")" )
+
+func_expr: ident "(" exprs ")"
+paren_expr: "(" expr ")"
+lambda_expr: "(" lambda quant_body ")"
+!quantifier: "forall" | "∀" | "exists" | "∃"
+
+lambda: "lambda" | "λ"
+quant_body: ( type_args bound_vars ) qsep attr* expr
+bound_vars: attr_typed_ids_wheres
+qsep: "::" | "•"
+if_then_else_expr: "if" expr "then" expr "else" expr
+code_expr: "|{" var_decl* spec_block* "}|"
+spec_block: ident ":" stmt* ( "goto" idents | "return" expr ) ";"
+
+attr_typed_ids_wheres: attr_typed_ids_where ("," attr_typed_ids_where)*
+attr_typed_ids_where: attrs_opt typed_ids_where
+
+typed_ids_where: typed_ids where_clause
+where_clause: "where" expr 
+            | -> empty_where_clause
+
+type_args: "<" names ">"
+            | -> empty_type_args
+
+ens: string | expr
+enss: ens | ens "," enss 
+enss_opt: enss
+        | -> empty_enss
+attr: "{:" name enss_opt "}"
+
+trigger: "{" exprs "}"
+ant: attr | trigger
+ants: ant ants
+ants_opt: ants
+        | -> empty_ants
+
+string: ESCAPED_STRING
+
+IDENT_START: /\\?[A-Za-z'~#$^_.?`]/
+IDENT_CHAR: /[$A-Za-z0-9'~#$^_.?`]/
+IDENT: IDENT_START IDENT_CHAR*
+ident: IDENT
+idents: ident ("," ident)*
+
+name: IDENT 
+names: name 
+     | name ("," name)*
+
+!binary_op: "**"
+         | "==>"
+         | "||"
+         | "&&"
+         | "=="
+         | "!="
+         | "<"
+         | ">"
+         | "<="
+         | ">="
+         | "<:"
+         | "++"
+         | "+"
+         | "-"
+         | "*"
+         | "/"
+         | "%"
+
+DIGITS: /[0-9]+/
+DOT: "."
+
+COMMENT: /\/\/[^\n]*/
+%ignore COMMENT
