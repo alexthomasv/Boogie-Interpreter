@@ -14,34 +14,40 @@ jobs:
         python-version: ["3.10", "3.11", "3.12"]
 
     steps:
-      - uses: actions/checkout@v4
-
-      # The interpreter depends on parser/ and utils/ from the parent repo.
-      # Clone the parent repo to provide these dependencies.
-      - name: Clone parent repo for dependencies
-        run: |
-          git clone --depth 1 https://github.com/alexthomasv/boogie-parser.git /tmp/boogie-parser
-          # Symlink parser and utils into the working directory's parent
-          # so `from parser.* import` and `from utils.* import` resolve
-          ln -s /tmp/boogie-parser/parser ../parser
-          ln -s /tmp/boogie-parser/utils ../utils
-
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
 
       - name: Install dependencies
+        run: pip install pytest lark
+
+      # Build a workspace that mirrors the parent repo layout:
+      #   workspace/
+      #     interpreter/   <- this repo
+      #     parser/        <- from parent repo
+      #     utils/         <- from parent repo
+      - name: Create workspace
+        run: mkdir -p workspace
+
+      - name: Checkout interpreter
+        uses: actions/checkout@v4
+        with:
+          path: workspace/interpreter
+
+      - name: Clone parent repo for parser/ and utils/
         run: |
-          pip install pytest lark
+          git clone --depth 1 https://github.com/alexthomasv/boogie-parser.git /tmp/boogie-parser
+          cp -r /tmp/boogie-parser/parser workspace/parser
+          cp -r /tmp/boogie-parser/utils workspace/utils
 
       - name: Run unit tests
-        working-directory: ..
+        working-directory: workspace
         run: |
           python -m pytest interpreter/tests/test_interpreter.py -q --tb=short -k "not (EndToEnd or BenchmarkInputs)"
 
       - name: Run expression op tests
-        working-directory: ..
+        working-directory: workspace
         run: |
           python -m pytest interpreter/tests/test_expression_ops.py -q --tb=short
 
