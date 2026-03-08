@@ -1,7 +1,7 @@
-from parser.node import Node
-from parser.declaration import Declaration
-from parser.scope import Scope
-from parser.expression import LabelIdentifier, Identifier
+from .node import Node
+from .declaration import Declaration
+from .scope import Scope
+from .expression import LabelIdentifier, Identifier
 
 
 class Statement(Node):

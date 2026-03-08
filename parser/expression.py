@@ -1,8 +1,8 @@
-from parser.declaration import VariableDeclaration, ProcedureDeclaration
-from parser.node import Node
-from parser.binding import Binding
-from parser.program import Program
-from parser.scope import Scope
+from .declaration import VariableDeclaration, ProcedureDeclaration
+from .node import Node
+from .binding import Binding
+from .program import Program
+from .scope import Scope
 
 
 class Type:

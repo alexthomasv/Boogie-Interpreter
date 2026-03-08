@@ -4,13 +4,13 @@
 
 from lark import Lark, Transformer, v_args
 
-from parser.expression import *
-from parser.statement import *
-from parser.declaration import *
-from parser.type import *
-from parser.specifications import *
-from parser.program import *
-from parser.node import Attribute
+from .expression import *
+from .statement import *
+from .declaration import *
+from .type import *
+from .specifications import *
+from .program import *
+from .node import Attribute
 
 from functools import reduce
 import re

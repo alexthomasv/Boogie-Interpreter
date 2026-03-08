@@ -1,4 +1,4 @@
-from parser.node import Node
+from .node import Node
 
 class Type(Node):
     Boolean = None

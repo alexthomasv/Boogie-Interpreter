@@ -44,7 +44,7 @@ class Node:
         return self.show(lambda a: a.hilite())
 
     def copy(self):
-        from parser.boogie_parser import bpl
+        from .boogie_parser import bpl
         other = bpl(str(self))
         for mine, theirs in zip(self.each(), other.each()):
             if mine.__class__ != theirs.__class__:

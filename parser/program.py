@@ -1,7 +1,7 @@
 # Assuming necessary imports and base classes are defined elsewhere
-from parser.declaration import VariableDeclaration, ConstantDeclaration
-from parser.node import Node
-from parser.scope import Scope
+from .declaration import VariableDeclaration, ConstantDeclaration
+from .node import Node
+from .scope import Scope
 class Program(Node, Scope):
     declarations = []
     children = ["declarations"]

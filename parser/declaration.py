@@ -1,6 +1,6 @@
-from parser.node import Node
-from parser.binding import Binding
-from parser.scope import Scope
+from .node import Node
+from .binding import Binding
+from .scope import Scope
 
 
 class Declaration(Node):
@@ -71,7 +71,7 @@ class StorageDeclaration(Declaration):
             return [self.__class__(names=[name], typ=self.typ, where=self.where) for name in self.names]
 
     def idents(self):
-        from parser.expression import StorageIdentifier
+        from .expression import StorageIdentifier
         ids = [StorageIdentifier(name=name, declaration=self) for name in self.names]
         return ids
 

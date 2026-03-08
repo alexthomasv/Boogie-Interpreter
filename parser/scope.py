@@ -1,9 +1,9 @@
 class Scope:
     def _get_kind_map(self):
-        from parser.declaration import StorageDeclaration, ConstantDeclaration, VariableDeclaration, TypeDeclaration, FunctionDeclaration, ProcedureDeclaration, ImplementationDeclaration
-        from parser.expression import LabelIdentifier, FunctionIdentifier, StorageIdentifier, ProcedureIdentifier
-        from parser.type import CustomType
-        from parser.statement import Block
+        from .declaration import StorageDeclaration, ConstantDeclaration, VariableDeclaration, TypeDeclaration, FunctionDeclaration, ProcedureDeclaration, ImplementationDeclaration
+        from .expression import LabelIdentifier, FunctionIdentifier, StorageIdentifier, ProcedureIdentifier
+        from .type import CustomType
+        from .statement import Block
 
         return {
             CustomType: 'type',
