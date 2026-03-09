@@ -1,7 +1,7 @@
 use crate::opcodes::BuiltinFn;
 
 #[inline]
-fn mask(bits: u8) -> i64 {
+pub fn mask(bits: u8) -> i64 {
     if bits >= 64 {
         -1i64 // all bits set = u64::MAX as i64
     } else {
@@ -11,7 +11,7 @@ fn mask(bits: u8) -> i64 {
 
 /// Interpret a value as signed in the given bit width.
 #[inline]
-fn to_signed(val: i64, bits: u8) -> i64 {
+pub fn to_signed(val: i64, bits: u8) -> i64 {
     let m = mask(bits);
     let v = val & m;
     if bits < 64 && v & (1i64 << (bits - 1)) != 0 {
@@ -90,28 +90,25 @@ pub fn exec_binary(fn_id: BuiltinFn, a: i64, b: i64) -> (i64, bool) {
             let shift = (b as u32) & (bits as u32 - 1);
             ((v >> shift) as i64 & m, false)
         }
+        // pf:ensures:ashr.sign_extension - high bits filled with sign bit copies
+        // pf:ensures:ashr.generic_width - works for all bit widths (8, 16, 32, 64)
         BuiltinFn::Ashr { bits } => {
             let m = mask(bits);
             let v = a & m;
-            let shift = b as u32;
-            if bits == 32 {
-                let v32 = v as u32;
-                if v32 & 0x80000000 != 0 {
-                    let result = (v32 >> shift) | (0xFFFFFFFFu32 << (32 - shift));
-                    (result as i64 & m, false)
+            // Shift amount is reduced modulo bit width per SMT-LIB
+            let shift = (b as u32) % (bits as u32);
+            let sign_bit = 1i64 << (bits - 1);
+            if v & sign_bit != 0 {
+                // Negative value - sign extend with 1s
+                let fill = if shift == 0 {
+                    0
                 } else {
-                    ((v32 >> shift) as i64 & m, false)
-                }
+                    !0i64 << (bits as i64 - shift as i64)
+                };
+                (((v >> shift) | fill) & m, false)
             } else {
-                // 64-bit
-                let v64 = v as u64;
-                if v64 & 0x8000000000000000 != 0 {
-                    let result =
-                        (v64 >> shift) | (0xFFFFFFFFFFFFFFFFu64 << (64u32.saturating_sub(shift)));
-                    (result as i64, false)
-                } else {
-                    ((v64 >> shift) as i64, false)
-                }
+                // Positive value - zero extend
+                ((v >> shift) & m, false)
             }
         }
 
@@ -186,29 +183,52 @@ pub fn exec_binary(fn_id: BuiltinFn, a: i64, b: i64) -> (i64, bool) {
         }
 
         // Division
+        // pf:ensures:udiv.zero_divisor - returns all-ones when divisor is zero (SMT-LIB bvudiv)
         BuiltinFn::Udiv { bits } => {
-            let m = mask(bits) as u64;
-            let result = (a as u64 & m) / (b as u64 & m);
-            (result as i64 & mask(bits), false)
+            let m = mask(bits);
+            let m_u = m as u64;
+            let a_masked = a as u64 & m_u;
+            let b_masked = b as u64 & m_u;
+            if b_masked == 0 {
+                return (m, false); // all-ones per SMT-LIB
+            }
+            let result = a_masked / b_masked;
+            (result as i64 & m, false)
         }
+        // pf:ensures:sdiv.zero_divisor - returns all-ones when divisor is zero (SMT-LIB bvsdiv)
+        // pf:ensures:sdiv.truncated_division - Rust's / is truncated division (toward zero)
         BuiltinFn::Sdiv { bits } => {
             let sx = to_signed(a, bits);
             let sy = to_signed(b, bits);
             let m = mask(bits);
+            if sy == 0 {
+                return (m, false); // all-ones per SMT-LIB
+            }
             (to_signed(sx / sy, bits) & m, false)
         }
 
         // Remainder
+        // pf:ensures:urem.zero_divisor - returns dividend when divisor is zero (SMT-LIB bvurem)
         BuiltinFn::Urem { bits } => {
-            let m = mask(bits) as u64;
-            let result = (a as u64 & m) % (b as u64 & m);
-            (result as i64 & mask(bits), false)
+            let m = mask(bits);
+            let m_u = m as u64;
+            let a_masked = a as u64 & m_u;
+            let b_masked = b as u64 & m_u;
+            if b_masked == 0 {
+                return (a_masked as i64 & m, false); // return dividend per SMT-LIB
+            }
+            let result = a_masked % b_masked;
+            (result as i64 & m, false)
         }
+        // pf:ensures:srem.zero_divisor - returns dividend when divisor is zero (SMT-LIB bvsrem)
         BuiltinFn::Srem { bits } => {
             let sx = to_signed(a, bits);
             let sy = to_signed(b, bits);
             let m = mask(bits);
-            let q = if sy == 0 { 0 } else { sx / sy };
+            if sy == 0 {
+                return (sx & m, false); // return dividend per SMT-LIB
+            }
+            let q = sx / sy;
             let r = sx - q * sy;
             (r & m, false)
         }

@@ -19,10 +19,7 @@ pub enum Expr {
         rhs: Box<Expr>,
     },
     /// Builtin function call (e.g. $add.i32, $sext.i32.i64)
-    Builtin {
-        fn_id: BuiltinFn,
-        args: Vec<Expr>,
-    },
+    Builtin { fn_id: BuiltinFn, args: Vec<Expr> },
     /// Memory store: $store.iN(map, index, value)
     Store {
         bit_width: u8,
@@ -139,7 +136,10 @@ pub enum Stmt {
     Havoc { vars: Vec<VarId> },
     /// havoc $CurrAddr (or .shadow) — allocation: read size from alloc_size_var,
     /// compute new_addr = (old_addr + size + 255) & ~255, set, trace, then clear.
-    HavocCurrAddr { var_id: VarId, alloc_size_var: VarId },
+    HavocCurrAddr {
+        var_id: VarId,
+        alloc_size_var: VarId,
+    },
     /// goto label
     Goto { targets: Vec<BlockId> },
     /// return
@@ -147,9 +147,15 @@ pub enum Stmt {
     /// Calls that are ignored (printf, verifier_nondet, etc.)
     CallIgnored,
     /// call time.cross_product
-    CallTime { assignments: Vec<VarId>, args: Vec<Expr> },
+    CallTime {
+        assignments: Vec<VarId>,
+        args: Vec<Expr>,
+    },
     /// call write.cross_product
-    CallWrite { assignments: Vec<VarId>, args: Vec<Expr> },
+    CallWrite {
+        assignments: Vec<VarId>,
+        args: Vec<Expr>,
+    },
     /// call read.cross_product
     CallRead { args: Vec<Expr> },
     /// Quantified assume for memset (&&)
@@ -226,8 +232,10 @@ pub struct CompiledProgram {
     pub blocks: Vec<Block>,
     /// Block name → BlockId
     pub label_to_block: rustc_hash::FxHashMap<String, BlockId>,
-    /// Variable name → VarId
+    /// Variable name list indexed by VarId
     pub var_names: Vec<String>,
+    /// Variable name → VarId (O(1) lookup)
+    pub name_to_var: rustc_hash::FxHashMap<String, VarId>,
     /// VarId → is_shadow
     pub is_shadow: Vec<bool>,
     /// Entry block ID

@@ -1,5 +1,5 @@
 from collections import defaultdict
-from utils.utils import extract_boogie_variables
+from interpreter.utils.utils import extract_boogie_variables
 
 class Context:
     def __init__(self):

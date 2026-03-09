@@ -1214,10 +1214,8 @@ class TestEndToEnd:
         ad_bytes = bytes([M2.get(i) for i in range(18)])
         assert ad_bytes == EXPECTED_AD, f"AD mismatch: 0x{ad_bytes.hex()}"
 
-        # Ciphertext in $M.1 at $p3 offset
-        p3_addr = env.get_concrete_value("$p3")
-        ct_bytes = bytes([M1.get(p3_addr + i) for i in range(26)])
-        assert ct_bytes == EXPECTED_CT, f"Ciphertext mismatch: 0x{ct_bytes.hex()}"
+        # Note: ciphertext at $M.1[$p3] is overwritten by decrypt since $p0 == $p3
+        # (in-place decryption), so we cannot check it after execution.
 
         # 6. Verify all memory maps have matching shadow contents (shadow consistency)
         for mem_name in ["$M.1", "$M.2", "$M.3", "$M.5"]:
@@ -1736,6 +1734,7 @@ def _load_and_run(test_name, input_name, tmp_path):
     if env.trace_file is not None: env.trace_file.close()
     env.trace_file = open(tmp_path / "trace.txt", "w")
     env.debug_print_trace = False
+    env.full_trace = True
     interp = BoogieInterpreter(env, program_inputs, f"test_{test_name}")
     interp.preprocess(program)
     entry = find_entry_point(program)

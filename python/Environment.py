@@ -2,7 +2,7 @@ from interpreter.python.Context import Context
 from interpreter.python.MemoryMap import MemoryMap
 from interpreter.parser.declaration import StorageDeclaration, ConstantDeclaration
 from interpreter.parser.expression import QuantifiedExpression, BinaryExpression
-from utils.utils import extract_boogie_variables
+from interpreter.utils.utils import extract_boogie_variables
 from collections import defaultdict
 from pathlib import Path
 import pickle

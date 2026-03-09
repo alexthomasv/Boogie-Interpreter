@@ -91,13 +91,7 @@ impl VM {
     }
 
     /// Initialize a memory map variable.
-    pub fn init_memory_map(
-        &mut self,
-        var_id: VarId,
-        name: String,
-        index_bw: u8,
-        element_bw: u8,
-    ) {
+    pub fn init_memory_map(&mut self, var_id: VarId, name: String, index_bw: u8, element_bw: u8) {
         let map = MemoryMap::new(name, index_bw, element_bw);
         let idx = self.memory_maps.len();
         self.memory_maps.push(map);
@@ -116,13 +110,8 @@ impl VM {
             self.alloc_addr_shadow = value;
         }
         if !self.no_trace && !silent && !self.is_shadow[vid] {
-            self.trace.record(
-                var_id,
-                value,
-                self.pc,
-                self.curr_block_id,
-                OP_WRITE,
-            );
+            self.trace
+                .record(var_id, value, self.pc, self.curr_block_id, OP_WRITE);
         }
         self.vars[vid] = Value::Scalar(value);
     }
@@ -135,13 +124,8 @@ impl VM {
             Value::Scalar(v) => {
                 let v = *v;
                 if !self.no_trace && self.log_read && !self.is_shadow[vid] {
-                    self.trace.record(
-                        var_id,
-                        v,
-                        self.pc,
-                        self.curr_block_id,
-                        OP_READ,
-                    );
+                    self.trace
+                        .record(var_id, v, self.pc, self.curr_block_id, OP_READ);
                 }
                 v
             }
@@ -236,7 +220,10 @@ impl VM {
                     assert!(
                         taken.is_none(),
                         "Multiple goto conditions are true for targets: {:?}",
-                        targets.iter().map(|t| &program.blocks[*t as usize].name).collect::<Vec<_>>()
+                        targets
+                            .iter()
+                            .map(|t| &program.blocks[*t as usize].name)
+                            .collect::<Vec<_>>()
                     );
                     taken = Some(target_id);
                 }
@@ -253,8 +240,7 @@ impl VM {
                 self.set_eval_result(*lhs, val);
             }
             Stmt::AssignN { lhs, rhs } => {
-                let vals: Vec<EvalResult> =
-                    rhs.iter().map(|r| self.eval(r, program)).collect();
+                let vals: Vec<EvalResult> = rhs.iter().map(|r| self.eval(r, program)).collect();
                 for (var_id, val) in lhs.iter().zip(vals) {
                     self.set_eval_result(*var_id, val);
                 }
@@ -274,18 +260,27 @@ impl VM {
                     self.clear_var(var_id);
                 }
             }
-            Stmt::HavocCurrAddr { var_id, alloc_size_var } => {
+            Stmt::HavocCurrAddr {
+                var_id,
+                alloc_size_var,
+            } => {
                 // Replicate Python's handle_curr_addr + get_var fallback:
                 // Python: handle_curr_addr sets alloc_addr, then clear_var removes from var_store.
                 // But get_var has a $CurrAddr fallback: if not in var_store, returns alloc_addr.
                 // So the net effect is: $CurrAddr always equals alloc_addr.
                 // We just compute the new address and set it (no clear needed).
-                assert!(*alloc_size_var != u32::MAX,
+                assert!(
+                    *alloc_size_var != u32::MAX,
                     "HavocCurrAddr alloc_size_var not resolved for {}",
-                    self.var_names[*var_id as usize]);
+                    self.var_names[*var_id as usize]
+                );
                 let alloc_size = self.get_scalar_silent(*alloc_size_var);
                 let is_shadow = Some(*var_id) == self.curr_addr_shadow_id;
-                let old_addr = if is_shadow { self.alloc_addr_shadow } else { self.alloc_addr };
+                let old_addr = if is_shadow {
+                    self.alloc_addr_shadow
+                } else {
+                    self.alloc_addr
+                };
                 let new_addr = (old_addr + alloc_size + 255) & !255;
 
                 if is_shadow {
@@ -325,8 +320,7 @@ impl VM {
                 }
             }
             Stmt::CallRead { args } => {
-                let vals: Vec<EvalResult> =
-                    args.iter().map(|a| self.eval(a, program)).collect();
+                let vals: Vec<EvalResult> = args.iter().map(|a| self.eval(a, program)).collect();
                 // args: [fd, fd_shadow, buf_ptr, buf_ptr_shadow, read_len, read_len_shadow]
                 let buf_ptr = match &vals[2] {
                     EvalResult::Scalar(v) => *v,
@@ -354,8 +348,7 @@ impl VM {
                     let m0s_idx = self.get_map_idx(m0s_id);
                     for i in 0..data.len() {
                         self.memory_maps[m0_idx].set(buf_ptr + i as i64, data[i] as i64);
-                        self.memory_maps[m0s_idx]
-                            .set(buf_ptr_shadow + i as i64, data[i] as i64);
+                        self.memory_maps[m0s_idx].set(buf_ptr_shadow + i as i64, data[i] as i64);
                     }
                 }
             }
@@ -374,11 +367,7 @@ impl VM {
                     self.memory_maps[map_idx].set(addr, val_val);
                 }
             }
-            Stmt::QuantMemsetPreserveLt {
-                m_ret,
-                m_src,
-                dst,
-            } => {
+            Stmt::QuantMemsetPreserveLt { m_ret, m_src, dst } => {
                 let dst_val = self.get_scalar(*dst);
                 let src_idx = self.get_map_idx(*m_src);
                 let dst_idx = self.get_map_idx(*m_ret);
@@ -434,11 +423,7 @@ impl VM {
                     self.memory_maps[dst_idx].set(dst_val + offset as i64, val);
                 }
             }
-            Stmt::QuantMemcpyPreserveLt {
-                m_ret,
-                m_src,
-                dst,
-            } => {
+            Stmt::QuantMemcpyPreserveLt { m_ret, m_src, dst } => {
                 let dst_val = self.get_scalar(*dst);
                 let src_idx = self.get_map_idx(*m_src);
                 let dst_idx = self.get_map_idx(*m_ret);
@@ -532,13 +517,8 @@ impl VM {
                     Value::Scalar(v) => {
                         let v = *v;
                         if !self.no_trace && self.log_read && !self.is_shadow[vid] {
-                            self.trace.record(
-                                *var_id,
-                                v,
-                                self.pc,
-                                self.curr_block_id,
-                                OP_READ,
-                            );
+                            self.trace
+                                .record(*var_id, v, self.pc, self.curr_block_id, OP_READ);
                         }
                         EvalResult::Scalar(v)
                     }
@@ -625,17 +605,12 @@ impl VM {
                     let mut result: i64 = 0;
                     let count = bw / ew;
                     for i in 0..count as i64 {
-                        result |=
-                            self.memory_maps[map_idx].get(idx_val + i) << (i * ew as i64);
+                        result |= self.memory_maps[map_idx].get(idx_val + i) << (i * ew as i64);
                     }
                     EvalResult::Scalar(result)
                 }
             }
-            Expr::IfThenElse {
-                cond,
-                then_,
-                else_,
-            } => {
+            Expr::IfThenElse { cond, then_, else_ } => {
                 if self.eval_bool(cond, program) {
                     self.eval(then_, program)
                 } else {

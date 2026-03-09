@@ -78,30 +78,36 @@ fn_to_cvc5_op = {
     # Signed division
     "$sdiv.i64": (Kind.BITVECTOR_SDIV, 2, 64, 64),
     "$sdiv.i32": (Kind.BITVECTOR_SDIV, 2, 32, 32),
+    "$sdiv.i8": (Kind.BITVECTOR_SDIV, 2, 8, 8),
 
     "$ult.ref": (Kind.BITVECTOR_ULT, 2, 64, 64),
     "$ult.i64": (Kind.BITVECTOR_ULT, 2, 64, 64),
     "$ult.i32": (Kind.BITVECTOR_ULT, 2, 32, 32),
+    "$ult.i8": (Kind.BITVECTOR_ULT, 2, 8, 8),
     "$ugt.i64": (Kind.BITVECTOR_UGT, 2, 64, 64),
     "$ugt.i32": (Kind.BITVECTOR_UGT, 2, 32, 32),
+    "$ugt.i8": (Kind.BITVECTOR_UGT, 2, 8, 8),
     "$uge.i64": (Kind.BITVECTOR_UGE, 2, 64, 64),
     "$uge.i32": (Kind.BITVECTOR_UGE, 2, 32, 32),
+    "$uge.i8": (Kind.BITVECTOR_UGE, 2, 8, 8),
 
     # Signed greater than
     "$sgt.ref.bool": (Kind.BITVECTOR_SGT, 2, 64, bool),
-    "$sgt.i32": (Kind.BITVECTOR_SGT, 2, 32, 32),
     "$sgt.i64": (Kind.BITVECTOR_SGT, 2, 64, 64),
+    "$sgt.i32": (Kind.BITVECTOR_SGT, 2, 32, 32),
+    "$sgt.i8": (Kind.BITVECTOR_SGT, 2, 8, 8),
 
     # Signed greater than or equal to
     "$sge.ref.bool": (Kind.BITVECTOR_SGE, 2, 64, bool),
-    "$sge.i32": (Kind.BITVECTOR_SGE, 2, 32, 32),
     "$sge.i64": (Kind.BITVECTOR_SGE, 2, 64, 64),
+    "$sge.i32": (Kind.BITVECTOR_SGE, 2, 32, 32),
+    "$sge.i8": (Kind.BITVECTOR_SGE, 2, 8, 8),
 
     # Signed less than or equal to
-    "$sle.i32": (Kind.BITVECTOR_SLE, 2, 32, 32),
     "$sle.i64": (Kind.BITVECTOR_SLE, 2, 64, 64),
+    "$sle.i32": (Kind.BITVECTOR_SLE, 2, 32, 32),
+    "$sle.i8": (Kind.BITVECTOR_SLE, 2, 8, 8),
     "$sle.ref.bool": (Kind.BITVECTOR_SLE, 2, 64, bool),
-
 
     "$slt.ref.bool": (Kind.BITVECTOR_SLT, 2, 64, bool),
     "$slt.i64": (Kind.BITVECTOR_SLT, 2, 64, 64),
@@ -118,10 +124,13 @@ fn_to_cvc5_op = {
     "$srem.i8": (Kind.BITVECTOR_SREM, 2, 8, 8),
     "$shl.i64": (Kind.BITVECTOR_SHL, 2, 64, 64),
     "$shl.i32": (Kind.BITVECTOR_SHL, 2, 32, 32),
+    "$shl.i8": (Kind.BITVECTOR_SHL, 2, 8, 8),
     "$lshr.i64": (Kind.BITVECTOR_LSHR, 2, 64, 64),
     "$lshr.i32": (Kind.BITVECTOR_LSHR, 2, 32, 32),
+    "$lshr.i8": (Kind.BITVECTOR_LSHR, 2, 8, 8),
     "$ashr.i64": (Kind.BITVECTOR_ASHR, 2, 64, 64),
     "$ashr.i32": (Kind.BITVECTOR_ASHR, 2, 32, 32),
+    "$ashr.i8": (Kind.BITVECTOR_ASHR, 2, 8, 8),
 
     # ——— casts / identity ————————————————————————————————————————————
     "$bitcast.ref.ref": (None, 1, 64, 64),

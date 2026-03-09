@@ -5,6 +5,9 @@ mod opcodes;
 mod trace;
 mod vm;
 
+#[cfg(kani)]
+mod kani_proofs;
+
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList, PySet, PyTuple};
 
@@ -59,32 +62,35 @@ fn execute(
     }
 
     // Initialize memory maps from Python-provided metadata
+    // pf:ensures:var_lookup.constant_time - O(1) HashMap lookup
     for item in mem_map_info.iter() {
         let tuple = item.downcast::<PyTuple>()?;
         let name: String = tuple.get_item(0)?.extract()?;
         let index_bw: u8 = tuple.get_item(1)?.extract()?;
         let element_bw: u8 = tuple.get_item(2)?.extract()?;
 
-        if let Some(vid) = program.var_names.iter().position(|n| n == &name) {
-            vm.init_memory_map(vid as u32, name.clone(), index_bw, element_bw);
+        if let Some(&vid) = program.name_to_var.get(&name) {
+            vm.init_memory_map(vid, name.clone(), index_bw, element_bw);
         }
     }
 
     // Load scalar variable values from Python
+    // pf:ensures:var_lookup.constant_time - O(1) HashMap lookup
     for (key, val) in var_store.iter() {
         let name: String = key.extract()?;
         let value: i64 = val.extract()?;
-        if let Some(vid) = program.var_names.iter().position(|n| n == &name) {
-            vm.set_scalar(vid as u32, value, true);
+        if let Some(&vid) = program.name_to_var.get(&name) {
+            vm.set_scalar(vid, value, true);
         }
     }
 
     // Load memory map contents from Python
+    // pf:ensures:var_lookup.constant_time - O(1) HashMap lookup
     for (key, val) in memory_maps.iter() {
         let name: String = key.extract()?;
         let contents: &Bound<'_, PyDict> = val.downcast()?;
-        if let Some(vid) = program.var_names.iter().position(|n| n == &name) {
-            if let Some(map_idx) = vm.var_to_map[vid] {
+        if let Some(&vid) = program.name_to_var.get(&name) {
+            if let Some(map_idx) = vm.var_to_map[vid as usize] {
                 for (addr, value) in contents.iter() {
                     let a: i64 = addr.extract()?;
                     let v: i64 = value.extract()?;
@@ -98,8 +104,12 @@ fn execute(
     let exec_start = std::time::Instant::now();
     vm.execute(program);
     let exec_elapsed = exec_start.elapsed();
-    eprintln!("[native] Execution: {:.1?}, {} blocks, {} trace entries",
-        exec_elapsed, vm.explored_blocks.len(), vm.trace.total);
+    eprintln!(
+        "[native] Execution: {:.1?}, {} blocks, {} trace entries",
+        exec_elapsed,
+        vm.explored_blocks.len(),
+        vm.trace.total
+    );
 
     // Build result
     let trace_start = std::time::Instant::now();
@@ -296,12 +306,18 @@ fn build_compact_trace_pickled(
 
     // block_values
     build_value_section!("block_values", &trace.block_values, |k: &(u32, u32)| {
-        format!("positive_examples_{}_{}", var_names[k.0 as usize], block_names[k.1 as usize])
+        format!(
+            "positive_examples_{}_{}",
+            var_names[k.0 as usize], block_names[k.1 as usize]
+        )
     });
 
     // op_values
     build_value_section!("op_values", &trace.op_values, |k: &(u32, u32, u8)| {
-        format!("positive_examples_to_op_type_{}_{}_{}", var_names[k.0 as usize], k.1, k.2 as char)
+        format!(
+            "positive_examples_to_op_type_{}_{}_{}",
+            var_names[k.0 as usize], k.1, k.2 as char
+        )
     });
 
     // pc_registry: pickled raw ints
@@ -358,7 +374,10 @@ fn build_compact_trace_raw(
     let block_values = PyDict::new_bound(py);
     for (&(var_id, block_id), values) in &trace.block_values {
         let block_name = &block_names[block_id as usize];
-        let key = format!("positive_examples_{}_{}", var_names[var_id as usize], block_name);
+        let key = format!(
+            "positive_examples_{}_{}",
+            var_names[var_id as usize], block_name
+        );
         let pset = PySet::empty_bound(py)?;
         for &val in values {
             pset.add(to_py_int(py, val))?;
@@ -370,7 +389,10 @@ fn build_compact_trace_raw(
     let op_values = PyDict::new_bound(py);
     for (&(var_id, pc, op), values) in &trace.op_values {
         let op_char = op as char;
-        let key = format!("positive_examples_to_op_type_{}_{}_{}", var_names[var_id as usize], pc, op_char);
+        let key = format!(
+            "positive_examples_to_op_type_{}_{}_{}",
+            var_names[var_id as usize], pc, op_char
+        );
         let pset = PySet::empty_bound(py)?;
         for &val in values {
             pset.add(to_py_int(py, val))?;

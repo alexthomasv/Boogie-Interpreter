@@ -36,14 +36,7 @@ impl TraceAccumulator {
 
     /// Record a trace entry. All keys are u32 — no allocations.
     #[inline]
-    pub fn record(
-        &mut self,
-        var_id: VarId,
-        value: i64,
-        pc: u32,
-        block_id: u32,
-        op_type: u8,
-    ) {
+    pub fn record(&mut self, var_id: VarId, value: i64, pc: u32, block_id: u32, op_type: u8) {
         self.pc_values
             .entry((var_id, pc))
             .or_default()
@@ -56,10 +49,7 @@ impl TraceAccumulator {
             .entry((var_id, pc, op_type))
             .or_default()
             .insert(value);
-        self.pc_registry
-            .entry(var_id)
-            .or_default()
-            .insert(pc);
+        self.pc_registry.entry(var_id).or_default().insert(pc);
         self.block_registry
             .entry(var_id)
             .or_default()

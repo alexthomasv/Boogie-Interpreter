@@ -8,9 +8,9 @@ import time
 
 class IndentLogger:
     _local = threading.local()
-    _logger = logging.getLogger("ray")
+    _logger = logging.getLogger("swoosh.abduction")
 
-    _direct_print_mode = True
+    _direct_print_mode = False
     _timing_threshold = 0.1
 
     def __init__(self, label=None, *args):

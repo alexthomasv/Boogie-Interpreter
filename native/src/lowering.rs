@@ -5,7 +5,7 @@ use rustc_hash::FxHashMap;
 
 /// Intern table: variable name → VarId
 pub struct InternTable {
-    map: FxHashMap<String, VarId>,
+    pub map: FxHashMap<String, VarId>,
     names: Vec<String>,
     shadows: Vec<bool>,
 }
@@ -256,13 +256,19 @@ pub fn lower_program(py: Python<'_>, program: &Bound<'_, PyAny>) -> PyResult<Com
 
         let mut havoc_count = 0usize;
         for (i, stmt) in block.body.iter().enumerate() {
-            if let Stmt::HavocCurrAddr { alloc_size_var, var_id } = stmt {
+            if let Stmt::HavocCurrAddr {
+                alloc_size_var,
+                var_id,
+            } = stmt
+            {
                 if *alloc_size_var == u32::MAX {
                     let havoc_var_name = intern.names[*var_id as usize].clone();
                     // Find alloc size var by scanning forward from havoc in Python AST
                     let py_idx = if havoc_count < py_havoc_indices.len() {
                         py_havoc_indices[havoc_count]
-                    } else { 0 };
+                    } else {
+                        0
+                    };
 
                     let utils = py.import_bound("interpreter.utils.utils")?;
                     let mut size_var_id: Option<VarId> = None;
@@ -275,8 +281,10 @@ pub fn lower_program(py: Python<'_>, program: &Bound<'_, PyAny>) -> PyResult<Com
                             let expr_str = py_stmt.getattr("expression")?.str()?.to_string();
                             if expr_str.contains(havoc_var_name.as_str()) {
                                 let expr = py_stmt.getattr("expression")?;
-                                let vars_set = utils.call_method1("extract_boogie_variables", (&expr,))?;
-                                let vars: Vec<Bound<'_, PyAny>> = vars_set.iter()?.collect::<PyResult<Vec<_>>>()?;
+                                let vars_set =
+                                    utils.call_method1("extract_boogie_variables", (&expr,))?;
+                                let vars: Vec<Bound<'_, PyAny>> =
+                                    vars_set.iter()?.collect::<PyResult<Vec<_>>>()?;
                                 for v in &vars {
                                     let vname: String = v.getattr("name")?.extract::<String>()?;
                                     if vname.contains("$n") {
@@ -319,6 +327,7 @@ pub fn lower_program(py: Python<'_>, program: &Bound<'_, PyAny>) -> PyResult<Com
         blocks,
         label_to_block,
         var_names: intern.names().to_vec(),
+        name_to_var: intern.map.clone(),
         is_shadow: intern.shadows().to_vec(),
         entry_block: 0,
         mem_maps,
@@ -438,11 +447,7 @@ fn lower_stmt(
 }
 
 /// Lower a call statement.
-fn lower_call(
-    py: Python<'_>,
-    stmt: &Bound<'_, PyAny>,
-    intern: &mut InternTable,
-) -> PyResult<Stmt> {
+fn lower_call(py: Python<'_>, stmt: &Bound<'_, PyAny>, intern: &mut InternTable) -> PyResult<Stmt> {
     let proc = stmt.getattr("procedure")?;
     let proc_name: String = proc.getattr("name")?.extract()?;
 
@@ -552,7 +557,8 @@ fn lower_quantified_assume(
     // Get all boogie variables in the expression
     let utils = py.import_bound("interpreter.utils.utils")?;
     let boogie_vars_set = utils.call_method1("extract_boogie_variables", (&expression,))?;
-    let boogie_vars: Vec<Bound<'_, PyAny>> = boogie_vars_set.iter()?.collect::<PyResult<Vec<_>>>()?;
+    let boogie_vars: Vec<Bound<'_, PyAny>> =
+        boogie_vars_set.iter()?.collect::<PyResult<Vec<_>>>()?;
 
     // Classify by checking variable name suffixes
     let mut var_names: Vec<(String, VarId)> = Vec::new();
@@ -726,11 +732,7 @@ fn find_var_by_suffix_either_ref(vars: &[&(String, VarId)], suffixes: &[&str]) -
 }
 
 /// Lower a Python expression to a Rust Expr.
-fn lower_expr(
-    py: Python<'_>,
-    expr: &Bound<'_, PyAny>,
-    intern: &mut InternTable,
-) -> PyResult<Expr> {
+fn lower_expr(py: Python<'_>, expr: &Bound<'_, PyAny>, intern: &mut InternTable) -> PyResult<Expr> {
     let type_name = expr.get_type().name()?.to_string();
 
     match type_name.as_str() {
@@ -947,27 +949,34 @@ fn resolve_builtin(name: &str) -> Option<BuiltinFn> {
 
         "$sdiv.i64" => BuiltinFn::Sdiv { bits: 64 },
         "$sdiv.i32" => BuiltinFn::Sdiv { bits: 32 },
+        "$sdiv.i8" => BuiltinFn::Sdiv { bits: 8 },
 
         "$ult.ref" | "$ult.i64" => BuiltinFn::Ult { bits: 64 },
         "$ult.i32" => BuiltinFn::Ult { bits: 32 },
+        "$ult.i8" => BuiltinFn::Ult { bits: 8 },
 
         "$ugt.i64" => BuiltinFn::Ugt { bits: 64 },
         "$ugt.i32" => BuiltinFn::Ugt { bits: 32 },
+        "$ugt.i8" => BuiltinFn::Ugt { bits: 8 },
 
         "$uge.i64" => BuiltinFn::Uge { bits: 64 },
         "$uge.i32" => BuiltinFn::Uge { bits: 32 },
+        "$uge.i8" => BuiltinFn::Uge { bits: 8 },
 
         // Signed comparisons
         "$sgt.ref.bool" => BuiltinFn::SgtBool { bits: 64 },
         "$sgt.i32" => BuiltinFn::Sgt { bits: 32 },
         "$sgt.i64" => BuiltinFn::Sgt { bits: 64 },
+        "$sgt.i8" => BuiltinFn::Sgt { bits: 8 },
 
         "$sge.ref.bool" => BuiltinFn::SgeBool { bits: 64 },
         "$sge.i32" => BuiltinFn::Sge { bits: 32 },
         "$sge.i64" => BuiltinFn::Sge { bits: 64 },
+        "$sge.i8" => BuiltinFn::Sge { bits: 8 },
 
         "$sle.i32" => BuiltinFn::Sle { bits: 32 },
         "$sle.i64" => BuiltinFn::Sle { bits: 64 },
+        "$sle.i8" => BuiltinFn::Sle { bits: 8 },
         "$sle.ref.bool" => BuiltinFn::SleBool { bits: 64 },
 
         "$slt.ref.bool" => BuiltinFn::SltBool { bits: 64 },
@@ -991,12 +1000,15 @@ fn resolve_builtin(name: &str) -> Option<BuiltinFn> {
         // Shifts
         "$shl.i64" => BuiltinFn::Shl { bits: 64 },
         "$shl.i32" => BuiltinFn::Shl { bits: 32 },
+        "$shl.i8" => BuiltinFn::Shl { bits: 8 },
 
         "$lshr.i64" => BuiltinFn::Lshr { bits: 64 },
         "$lshr.i32" => BuiltinFn::Lshr { bits: 32 },
+        "$lshr.i8" => BuiltinFn::Lshr { bits: 8 },
 
         "$ashr.i64" => BuiltinFn::Ashr { bits: 64 },
         "$ashr.i32" => BuiltinFn::Ashr { bits: 32 },
+        "$ashr.i8" => BuiltinFn::Ashr { bits: 8 },
 
         // Casts
         "$bitcast.ref.ref" => BuiltinFn::Bitcast,

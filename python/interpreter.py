@@ -19,7 +19,7 @@ from collections import defaultdict
 from interpreter.python.Environment import Environment
 from interpreter.python.MemoryMap import MemoryMap
 from interpreter.python.Buffer import ReadBuffer
-from utils.utils import *
+from interpreter.utils.utils import *
 import pickle
 import time
 from pathlib import Path
@@ -27,6 +27,9 @@ from concurrent.futures import ProcessPoolExecutor
 import os
 import functools
 import operator
+from swoosh_logging import get_module_logger
+
+log = get_module_logger("interpreter")
 
 
 # ============================================================
@@ -155,7 +158,7 @@ class BoogieInterpreter:
                 if isinstance(decl.type, MapType):
                     assert len(decl.names) == 1
                     if kind == "global":
-                        print(f"Initializing global memory: {decl.names[0]} {type(decl.names[0])}")
+                        log.debug(f"Initializing global memory: {decl.names[0]} {type(decl.names[0])}")
                     bw = convert_type_to_bitwidth(decl.type)
                     assert len(bw) == 2, f"Expected 2 elements for map type: {decl.type}"
                     self.env.set_value(
@@ -166,7 +169,7 @@ class BoogieInterpreter:
                     self.env.set_value(decl.names[0], 0, silent=True)
             elif isinstance(decl, ConstantDeclaration):
                 if kind == "global":
-                    print(f"Initializing global constant: {decl.names[0]} {type(decl.names[0])}")
+                    log.debug(f"Initializing global constant: {decl.names[0]} {type(decl.names[0])}")
                 self.env.set_value(decl.names[0], 0, silent=True)
             elif kind == "local":
                 assert False, f"Unknown declaration type: {decl}"
@@ -179,7 +182,7 @@ class BoogieInterpreter:
                     lhs = constraint.lhs
                     rhs = self.eval(constraint.rhs)
                     if isinstance(lhs, StorageIdentifier) or isinstance(rhs, StorageIdentifier):
-                        print(f"Concretizing global memory for {lhs.name} {rhs}")
+                        log.debug(f"Concretizing global memory for {lhs.name} {rhs}")
                         self.env.set_value(lhs.name, rhs)
 
     def concretize_proc_inputs(self, procedure):
@@ -187,10 +190,10 @@ class BoogieInterpreter:
             assert len(param.names) == 1
             name = param.names[0]
             if name in self.program_inputs and self.program_inputs[name].value is not None:
-                print(f"Concretizing procedure input: {name} to {self.program_inputs[name]}")
+                log.debug(f"Concretizing procedure input: {name} to {self.program_inputs[name]}")
                 self.env.set_value(name, self.program_inputs[name].value)
             else:
-                print(f"No value for {name}")
+                log.debug(f"No value for {name}")
                 self.env.set_value(name, 0, silent=True)
 
     # ----------------------------------------------------------
@@ -211,15 +214,15 @@ class BoogieInterpreter:
                 maps[arr_info.mem_map][arr_info.base_ptr] = buf_size
 
         ptr_assignments = {}
-        print(f"{'MEM MAP':<15} | {'POINTER':<15} | {'ADDRESS':<10} | {'SIZE':<10}")
-        print("-" * 60)
+        log.debug(f"{'MEM MAP':<15} | {'POINTER':<15} | {'ADDRESS':<10} | {'SIZE':<10}")
+        log.debug("-" * 60)
 
         for mem_map, ptr_dict in maps.items():
             current_addr = 0
             for ptr in sorted(ptr_dict.keys()):
                 size = ptr_dict[ptr]
                 ptr_assignments[ptr] = current_addr
-                print(f"{mem_map:<15} | {ptr:<15} | {hex(current_addr):<10} | {size:<10}")
+                log.debug(f"{mem_map:<15} | {ptr:<15} | {hex(current_addr):<10} | {size:<10}")
                 current_addr += (size + 7) & ~7
 
         return ptr_assignments
@@ -232,7 +235,7 @@ class BoogieInterpreter:
           - struct:  ordered struct fields with scalars and pointer-to-buffer fields
           - (scalars are handled by concretize_proc_inputs)
         """
-        print("[concretize_input_memory] Concretizing input memory")
+        log.debug("[concretize_input_memory] Concretizing input memory")
 
         # Phase 1: Collect allocation requests with correct sizes from JSON
         alloc_requests = []  # list of (ArrayInfo, buffer_size_bytes)
@@ -281,7 +284,7 @@ class BoogieInterpreter:
     def _concretize_buffers(self, var_name, inp):
         """Write simple buffer data (non-struct arrays) to memory maps."""
         if var_name not in self.arr_inputs:
-            print(f"[WARNING] {var_name} has buffer data but no BPL {{:array}} annotations")
+            log.warning(f"[WARNING] {var_name} has buffer data but no BPL {{:array}} annotations")
             return
 
         non_shadow = [a for a in self.arr_inputs[var_name] if '.shadow' not in a.mem_map]
@@ -350,7 +353,7 @@ class BoogieInterpreter:
         for i in range(size):
             addr = base + i
             val = contents[i] if i < len(contents) else 0
-            print(f"{mem_map.name}[{addr}] <- {hex(val)}")
+            log.debug(f"{mem_map.name}[{addr}] <- {hex(val)}")
             mem_map.set(addr, val)
 
     def _write_field(self, field_data, field_info):
@@ -370,7 +373,7 @@ class BoogieInterpreter:
         base_ptr = self.eval(field_info.base_ptr)
         for i, chunk in enumerate(chunks):
             addr = base_ptr + i * element_bit_width
-            print(f"Concretizing field: {field_info.mem_map}[{addr}] = {hex(chunk)}")
+            log.debug(f"Concretizing field: {field_info.mem_map}[{addr}] = {hex(chunk)}")
             mem_map.set(addr, chunk)
 
     # ----------------------------------------------------------
@@ -381,7 +384,7 @@ class BoogieInterpreter:
         self._initialize_vars(procedure.body.locals, kind="local")
         self.concretize_proc_inputs(procedure)
         self.concretize_input_memory()
-        print(f"[execute_procedure] Concretized input memory")
+        log.debug(f"[execute_procedure] Concretized input memory")
 
         # Cache for the hot loop
         label_to_block = self.label_to_block
@@ -499,7 +502,7 @@ class BoogieInterpreter:
     def _handle_assert(self, stmt):
         if not self.eval(stmt.expression):
             self.eval(stmt.expression, debug=True)
-            print(f"Assertion {stmt.expression} is violated")
+            log.debug(f"Assertion {stmt.expression} is violated")
             self.env.dump_memory()
             assert False, f"Assert failed: {stmt}"
 
@@ -795,7 +798,7 @@ class BoogieInterpreter:
         memory_map = self._eval(expr.arguments[1])
         read_len = self._eval(expr.arguments[2])
         data = self.external_buffer.read(read_len)
-        print(f"Reading {read_len} bytes from {data}")
+        log.debug(f"Reading {read_len} bytes from {data}")
         for i in range(read_len):
             memory_map.set(i, data[i])
         assert False, f"TODO: Handle read: {expr}"
@@ -804,7 +807,7 @@ class BoogieInterpreter:
         fd = self._eval(expr.arguments[0])
         memory_map = self._eval(expr.arguments[1])
         write_len = self._eval(expr.arguments[2])
-        print(f"Writing {write_len} bytes to {memory_map}")
+        log.debug(f"Writing {write_len} bytes to {memory_map}")
         assert False, f"TODO: Handle write: {expr}"
 
     # ----------------------------------------------------------
@@ -829,14 +832,14 @@ def process_single_input(input_file, test_name, test_path, force=False, full_tra
         with open(test_path, 'rb') as file:
             program = pickle.load(file)
 
-        print(f"Processing input file: {input_file}")
+        log.debug(f"Processing input file: {input_file}")
         program_inputs = parse_inputs(input_file)
         input_name = Path(input_file.name).stem
 
         trace_path = Path("positive_examples") / test_name / f"{input_name}.trace.txt"
         explored_path = Path("positive_examples") / test_name / f"{input_name}.explored_blocks.txt"
         if not force and explored_path.exists() and trace_path.exists() and trace_path.stat().st_size > 0:
-            print(f"Skipping input file: {input_file} because it has already been explored")
+            log.debug(f"Skipping input file: {input_file} because it has already been explored")
             return
 
         # Clean up partial trace from a previous interrupted run
@@ -853,7 +856,7 @@ def process_single_input(input_file, test_name, test_path, force=False, full_tra
         entry = find_entry_point(program)
         assert entry is not None, "No entry point found"
 
-        print(f"[process_single_input] Executing entry procedure: {entry.name}")
+        log.debug(f"[process_single_input] Executing entry procedure: {entry.name}")
         interp.execute_procedure(entry)
         with open(f"positive_examples/{test_name}/{input_name}.explored_blocks.txt", "w") as f:
             for block in interp.explored_blocks:
@@ -893,7 +896,7 @@ if __name__ == '__main__':
     if trace_dir.exists() and engine_file.exists():
         stored_engine = engine_file.read_text().strip()
         if stored_engine != "python":
-            print(f"Engine changed ({stored_engine} → python) — clearing old traces in {trace_dir}")
+            log.debug(f"Engine changed ({stored_engine} → python) — clearing old traces in {trace_dir}")
             shutil.rmtree(trace_dir)
             trace_dir.mkdir(parents=True, exist_ok=True)
             mem_trace_dir = Path("mem_ops_traces") / test_name
@@ -911,13 +914,13 @@ if __name__ == '__main__':
                 for p in input_files_check
             )
             if all_done and input_files_check:
-                print(f"Skipping interpretation — {inline_bpl} unchanged and all inputs complete")
+                log.debug(f"Skipping interpretation — {inline_bpl} unchanged and all inputs complete")
                 exit(0)
             else:
                 done = sum(1 for p in input_files_check if (trace_dir / f"{p.stem}.explored_blocks.txt").exists())
-                print(f"Resuming interpretation — {done}/{len(input_files_check)} inputs complete")
+                log.debug(f"Resuming interpretation — {done}/{len(input_files_check)} inputs complete")
         elif stored_hash != bpl_hash:
-            print(f"Hash mismatch — trashing old trace files in {trace_dir}")
+            log.debug(f"Hash mismatch — trashing old trace files in {trace_dir}")
             shutil.rmtree(trace_dir)
             trace_dir.mkdir(parents=True, exist_ok=True)
             # Also trash old mem_ops_traces
@@ -930,7 +933,7 @@ if __name__ == '__main__':
     assert len(input_files) > 0, f"No input files found in {input_directory}"
 
     max_workers = min(max(1, os.cpu_count() - 1), len(input_files))
-    print(f"Using {max_workers} workers for {len(input_files)} inputs")
+    log.debug(f"Using {max_workers} workers for {len(input_files)} inputs")
     worker_func = functools.partial(process_single_input, test_name=test_name, test_path=test_path, force=args.force, full_trace=getattr(args, 'full_trace', False), no_read_trace=getattr(args, 'no_read_trace', False))
 
     failed = False
@@ -941,12 +944,12 @@ if __name__ == '__main__':
                 pass
         except Exception:
             import traceback
-            print("A worker failed! Here is the stack trace:")
+            log.error("A worker failed! Here is the stack trace:")
             traceback.print_exc()
             failed = True
 
     if failed:
-        print("Interpretation did not complete — run again to resume")
+        log.warning("Interpretation did not complete — run again to resume")
         exit(1)
 
     # Write hash only after ALL inputs succeed

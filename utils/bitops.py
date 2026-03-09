@@ -2,7 +2,9 @@
 
 __all__ = [
     'mask_bits', '_mask', '_sign', '_to_signed',
-    'lshr_32', 'lshr_64', 'ashr_32', 'ashr_64', 'shl_fn',
+    'lshr_fn', 'lshr_32', 'lshr_64',
+    'ashr_fn', 'ashr_32', 'ashr_64',
+    'shl_fn',
     'sdiv_fn', 'srem_fn', 'udiv_fn', 'urem_fn',
     'add_fn', 'sub_fn', 'mul_fn',
     'and_fn', 'or_fn', 'xor_fn', 'not_fn',
@@ -32,33 +34,42 @@ def _to_signed(val: int, bits: int) -> int:
 
 # ── Shift operations ──────────────────────────────────────────────────────
 
-def lshr_32(value: int, shift: int) -> int:
-    value &= 0xFFFFFFFF
-    return (value >> shift) & 0xFFFFFFFF
+def lshr_fn(bits: int):
+    """Generic logical shift right for any bit width (SMT-LIB bvlshr)."""
+    m = _mask(bits)
+    def _lshr(value: int, shift: int) -> int:
+        v = value & m
+        s = shift % bits
+        return (v >> s) & m
+    return _lshr
 
-def lshr_64(value: int, shift: int) -> int:
-    value &= 0xFFFFFFFFFFFFFFFF
-    return (value >> shift) & 0xFFFFFFFFFFFFFFFF
+# Keep legacy names for backward compatibility in fn_map_to_op
+lshr_32 = lshr_fn(32)
+lshr_64 = lshr_fn(64)
 
-def ashr_32(value: int, shift: int) -> int:
-    value &= 0xFFFFFFFF
-    if value & 0x80000000:
-        return ((value >> shift) | (0xFFFFFFFF << (32 - shift))) & 0xFFFFFFFF
-    else:
-        return (value >> shift) & 0xFFFFFFFF
+def ashr_fn(bits: int):
+    """Generic arithmetic shift right for any bit width (SMT-LIB bvashr)."""
+    m = _mask(bits)
+    sign_bit = 1 << (bits - 1)
+    def _ashr(value: int, shift: int) -> int:
+        v = value & m
+        s = shift % bits
+        if v & sign_bit:
+            fill = (m << (bits - s)) & m if s > 0 else 0
+            return ((v >> s) | fill) & m
+        else:
+            return (v >> s) & m
+    return _ashr
 
-def ashr_64(value: int, shift: int) -> int:
-    value &= 0xFFFFFFFFFFFFFFFF
-    if value & 0x8000000000000000:
-        return ((value >> shift) | (0xFFFFFFFFFFFFFFFF << (64 - shift))) & 0xFFFFFFFFFFFFFFFF
-    else:
-        return (value >> shift) & 0xFFFFFFFFFFFFFFFF
+# Keep legacy names for backward compatibility in fn_map_to_op
+ashr_32 = ashr_fn(32)
+ashr_64 = ashr_fn(64)
 
 def shl_fn(bits: int):
     m = _mask(bits)
-    sa_mask = bits - 1
     def _shl(x: int, y: int) -> int:
-        return ((x & m) << (y & sa_mask)) & m
+        s = y & (bits - 1)
+        return ((x & m) << s) & m
     return _shl
 
 
@@ -67,10 +78,14 @@ def shl_fn(bits: int):
 def sdiv_fn(w):
     m = _mask(w)
     def _sdiv(x, y):
-        sx, sy = _sign(x, w), _sign(y, w)
+        sx, sy = _to_signed(x, w), _to_signed(y, w)
         if sy == 0:
-            raise ZeroDivisionError("division by zero")
-        return (_sign(sx // sy, w)) & m
+            return m  # all-ones per SMT-LIB bvsdiv
+        # Truncated division toward zero (NOT floor division)
+        q = abs(sx) // abs(sy)
+        if (sx < 0) != (sy < 0):
+            q = -q
+        return _to_signed(q, w) & m
     return _sdiv
 
 def srem_fn(bits: int):
@@ -79,8 +94,11 @@ def srem_fn(bits: int):
         sx = _to_signed(x, bits)
         sy = _to_signed(y, bits)
         if sy == 0:
-            raise ZeroDivisionError("srem by zero")
-        q = int(sx / sy)
+            return sx & mask  # return dividend per SMT-LIB bvsrem
+        # Truncated division toward zero
+        q = abs(sx) // abs(sy)
+        if (sx < 0) != (sy < 0):
+            q = -q
         r = sx - q * sy
         return r & mask
     return _srem
@@ -91,13 +109,19 @@ def srem_fn(bits: int):
 def udiv_fn(bits: int):
     m = _mask(bits)
     def _udiv(x: int, y: int) -> int:
-        return ((x & m) // (y & m)) & m
+        bm = y & m
+        if bm == 0:
+            return m  # all-ones per SMT-LIB bvudiv
+        return ((x & m) // bm) & m
     return _udiv
 
 def urem_fn(bits: int):
     m = _mask(bits)
     def _urem(x: int, y: int) -> int:
-        return ((x & m) % (y & m)) & m
+        bm = y & m
+        if bm == 0:
+            return (x & m)  # return dividend per SMT-LIB bvurem
+        return ((x & m) % bm) & m
     return _urem
 
 
