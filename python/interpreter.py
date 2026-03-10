@@ -27,7 +27,12 @@ from concurrent.futures import ProcessPoolExecutor
 import os
 import functools
 import operator
-from swoosh_logging import get_module_logger
+try:
+    from swoosh_logging import get_module_logger
+except ImportError:
+    import logging
+    def get_module_logger(name: str) -> logging.Logger:
+        return logging.getLogger(f"swoosh.{name}")
 
 log = get_module_logger("interpreter")
 
