@@ -1,5 +1,6 @@
 """Program input parsing and array/field metadata extraction."""
 
+import json
 import os
 import re
 from collections import defaultdict
@@ -221,3 +222,35 @@ def preprocess_external_inputs(proc):
         field_info_shadow = process_field_stmt(stmt, True)
         field_map[field_info_shadow.var_name].append(field_info_shadow)
     return arr_map, field_map
+
+
+# ── Legacy JSON input parsing ────────────────────────────────────────────
+
+def parse_inputs(input_json) -> ProgramInputs:
+    """Parse a legacy JSON input file into ProgramInputs.
+
+    Kept for backward compatibility with existing tests and .json input files.
+    New code should use input_parser.parse_input_file() for .input files.
+    """
+    with open(input_json, 'r') as f:
+        raw = json.load(f)
+
+    variables = {}
+    extra_data = None
+
+    for entry in raw:
+        if 'extra_data' in entry:
+            extra_data = bytes.fromhex(entry['extra_data'])
+            continue
+
+        name = entry['var']
+        inp = Input(
+            name=name,
+            private=entry['private'],
+            value=entry.get('value'),
+            buffers=entry.get('buffers'),
+            struct=entry.get('struct'),
+        )
+        variables[name] = inp
+
+    return ProgramInputs(variables=variables, extra_data=extra_data)
