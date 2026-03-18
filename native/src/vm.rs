@@ -296,6 +296,9 @@ impl VM {
                 self.get_scalar(*var_id);
             }
             Stmt::CallIgnored => {}
+            Stmt::CallPrintf { args } => {
+                self.execute_printf(args, program);
+            }
             Stmt::CallTime { assignments, args } => {
                 // Evaluate args for side effects
                 for arg in args {
@@ -634,6 +637,255 @@ impl VM {
             EvalResult::MapRef(_) => panic!("Expected scalar, got map"),
         }
     }
+
+    /// Read a null-terminated C string from a memory map.
+    fn read_cstring(&self, map_idx: usize, mut ptr: i64) -> String {
+        let mut bytes = Vec::new();
+        loop {
+            let byte = self.memory_maps[map_idx].get(ptr) & 0xFF;
+            if byte == 0 {
+                break;
+            }
+            bytes.push(byte as u8);
+            ptr += 1;
+            if bytes.len() > 4096 {
+                break;
+            }
+        }
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    /// Execute a printf call: read format string from $M.0, format args, print.
+    fn execute_printf(&mut self, args: &[Expr], program: &CompiledProgram) {
+        let vals: Vec<i64> = args.iter().map(|a| self.eval_i64(a, program)).collect();
+        // After shadowing, args are doubled. Take first half.
+        let n = vals.len() / 2;
+        let vals = &vals[..n];
+
+        let m0_id = match self.m0_id {
+            Some(id) => id,
+            None => return, // no $M.0 — can't read format string
+        };
+        let m0_idx = self.get_map_idx(m0_id);
+
+        let fmt_ptr = vals[0];
+        let fmt = self.read_cstring(m0_idx, fmt_ptr);
+        let printf_args = &vals[1..];
+
+        let output = format_printf(&fmt, printf_args, &self.memory_maps[m0_idx]);
+        print!("{}", output);
+    }
+}
+
+/// Read a null-terminated C string from a memory map (standalone helper).
+fn read_cstring_from_map(map: &crate::memory_map::MemoryMap, mut ptr: i64) -> String {
+    let mut bytes = Vec::new();
+    loop {
+        let byte = map.get(ptr) & 0xFF;
+        if byte == 0 {
+            break;
+        }
+        bytes.push(byte as u8);
+        ptr += 1;
+        if bytes.len() > 4096 {
+            break;
+        }
+    }
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+/// Format a C-style printf string with the given arguments.
+fn format_printf(fmt: &str, args: &[i64], m0: &crate::memory_map::MemoryMap) -> String {
+    use std::fmt::Write;
+    let mut result = String::new();
+    let bytes = fmt.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+    let mut arg_idx = 0;
+
+    while i < len {
+        if bytes[i] == b'%' {
+            i += 1;
+            if i >= len {
+                break;
+            }
+            if bytes[i] == b'%' {
+                result.push('%');
+                i += 1;
+                continue;
+            }
+            // Parse flags
+            let mut flag_minus = false;
+            let mut flag_zero = false;
+            let mut flag_hash = false;
+            while i < len {
+                match bytes[i] {
+                    b'-' => flag_minus = true,
+                    b'0' => flag_zero = true,
+                    b'+' | b' ' => {}
+                    b'#' => flag_hash = true,
+                    _ => break,
+                }
+                i += 1;
+            }
+            // Parse width
+            let mut width: usize = 0;
+            while i < len && bytes[i].is_ascii_digit() {
+                width = width * 10 + (bytes[i] - b'0') as usize;
+                i += 1;
+            }
+            // Parse precision
+            let mut precision: Option<usize> = None;
+            if i < len && bytes[i] == b'.' {
+                i += 1;
+                let mut p = 0usize;
+                while i < len && bytes[i].is_ascii_digit() {
+                    p = p * 10 + (bytes[i] - b'0') as usize;
+                    i += 1;
+                }
+                precision = Some(p);
+            }
+            // Skip length modifiers
+            while i < len && matches!(bytes[i], b'h' | b'l' | b'L' | b'z' | b'j' | b't') {
+                i += 1;
+            }
+            if i >= len {
+                break;
+            }
+            let spec = bytes[i] as char;
+            i += 1;
+
+            if arg_idx >= args.len() {
+                result.push_str("<?>");
+                continue;
+            }
+            let val = args[arg_idx];
+            arg_idx += 1;
+
+            match spec {
+                'd' | 'i' => {
+                    // signed
+                    let signed_val = val;
+                    let formatted = if width > 0 {
+                        if flag_minus {
+                            format!("{:<width$}", signed_val, width = width)
+                        } else if flag_zero {
+                            format!("{:0>width$}", signed_val, width = width)
+                        } else {
+                            format!("{:>width$}", signed_val, width = width)
+                        }
+                    } else {
+                        format!("{}", signed_val)
+                    };
+                    result.push_str(&formatted);
+                }
+                'u' => {
+                    let uval = val as u64;
+                    let formatted = if width > 0 {
+                        if flag_minus {
+                            format!("{:<width$}", uval, width = width)
+                        } else if flag_zero {
+                            format!("{:0>width$}", uval, width = width)
+                        } else {
+                            format!("{:>width$}", uval, width = width)
+                        }
+                    } else {
+                        format!("{}", uval)
+                    };
+                    result.push_str(&formatted);
+                }
+                'x' => {
+                    let uval = val as u64;
+                    let prefix = if flag_hash { "0x" } else { "" };
+                    let hex = format!("{:x}", uval);
+                    if width > 0 {
+                        let pad_width = width.saturating_sub(prefix.len());
+                        if flag_minus {
+                            let _ = write!(result, "{}{:<width$}", prefix, hex, width = pad_width);
+                        } else if flag_zero {
+                            let _ =
+                                write!(result, "{}{:0>width$}", prefix, hex, width = pad_width);
+                        } else {
+                            let _ = write!(result, "{}{:>width$}", prefix, hex, width = pad_width);
+                        }
+                    } else {
+                        let _ = write!(result, "{}{}", prefix, hex);
+                    }
+                }
+                'X' => {
+                    let uval = val as u64;
+                    let prefix = if flag_hash { "0X" } else { "" };
+                    let hex = format!("{:X}", uval);
+                    if width > 0 {
+                        let pad_width = width.saturating_sub(prefix.len());
+                        if flag_zero {
+                            let _ =
+                                write!(result, "{}{:0>width$}", prefix, hex, width = pad_width);
+                        } else {
+                            let _ = write!(result, "{}{:>width$}", prefix, hex, width = pad_width);
+                        }
+                    } else {
+                        let _ = write!(result, "{}{}", prefix, hex);
+                    }
+                }
+                'o' => {
+                    let uval = val as u64;
+                    if width > 0 {
+                        if flag_zero {
+                            let _ = write!(result, "{:0>width$o}", uval, width = width);
+                        } else {
+                            let _ = write!(result, "{:>width$o}", uval, width = width);
+                        }
+                    } else {
+                        let _ = write!(result, "{:o}", uval);
+                    }
+                }
+                'c' => {
+                    result.push((val & 0xFF) as u8 as char);
+                }
+                's' => {
+                    let mut s = read_cstring_from_map(m0, val);
+                    if let Some(p) = precision {
+                        s.truncate(p);
+                    }
+                    result.push_str(&s);
+                }
+                'p' => {
+                    let _ = write!(result, "0x{:x}", val as u64);
+                }
+                _ => {
+                    let _ = write!(result, "<{}?>", spec);
+                }
+            }
+        } else if bytes[i] == b'\\' && i + 1 < len {
+            match bytes[i + 1] {
+                b'n' => {
+                    result.push('\n');
+                    i += 2;
+                }
+                b't' => {
+                    result.push('\t');
+                    i += 2;
+                }
+                b'0' => {
+                    result.push('\0');
+                    i += 2;
+                }
+                b'\\' => {
+                    result.push('\\');
+                    i += 2;
+                }
+                _ => {
+                    result.push(bytes[i] as char);
+                    i += 1;
+                }
+            }
+        } else {
+            result.push(bytes[i] as char);
+            i += 1;
+        }
+    }
+    result
 }
 
 /// Result of evaluating an expression.

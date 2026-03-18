@@ -61,9 +61,11 @@ def put_state(serialized_state_key: bytes, state, state_cache):
     try:
         serialized_coi = pickle.dumps(state.coi)
     except Exception as e:
-        print(f"Error serializing state: {e}")
+        import traceback
+        print(f"Error serializing COI: {e}")
+        traceback.print_exc()
         find_unpicklable(state.coi)
-        assert False, f"Error serializing state: {e}"
+        raise
     sha256_hex = _cached_sha256(serialized_state_key)
     compressed_state = zlib.compress(serialized_state)
     compressed_coi = zlib.compress(serialized_coi)
@@ -95,21 +97,35 @@ def get_df(df_serialized_key, state_cache):
         return None
 
 
-def find_unpicklable(obj, path="root"):
+def find_unpicklable(obj, path="root", _visited=None, _depth=0):
+    """Recursively search for unpicklable objects (e.g. live cvc5 Terms)."""
+    if _depth > 30:
+        return
+    if _visited is None:
+        _visited = set()
+    obj_id = id(obj)
+    if obj_id in _visited:
+        return
+    _visited.add(obj_id)
+
     from interpreter.utils.utils_cvc5 import HollowCvc5Term
-    """
-    Recursively searches for objects of type HollowCvc5Term.
-    """
     if isinstance(obj, HollowCvc5Term):
         print(f"FOUND CULPRIT at {path}: {type(obj)} -> {obj}")
         return
 
+    # Check if obj itself is unpicklable
+    try:
+        pickle.dumps(obj)
+        return  # picklable, no need to recurse
+    except Exception:
+        pass
+
     if isinstance(obj, dict):
         for k, v in obj.items():
-            find_unpicklable(v, f"{path}['{k}']")
-    elif isinstance(obj, list) or isinstance(obj, tuple):
+            find_unpicklable(v, f"{path}['{k}']", _visited, _depth + 1)
+    elif isinstance(obj, (list, tuple)):
         for i, v in enumerate(obj):
-            find_unpicklable(v, f"{path}[{i}]")
+            find_unpicklable(v, f"{path}[{i}]", _visited, _depth + 1)
     elif hasattr(obj, "__dict__"):
         for k, v in obj.__dict__.items():
-            find_unpicklable(v, f"{path}.{k}")
+            find_unpicklable(v, f"{path}.{k}", _visited, _depth + 1)

@@ -459,9 +459,138 @@ class BoogieInterpreter:
             for l, v in zip(lhs_list, values):
                 self._set_value(l.name, v)
 
+    def _read_cstring(self, mem_map, ptr):
+        """Read a null-terminated C string from a memory map starting at ptr."""
+        chars = []
+        while True:
+            byte = mem_map.get(ptr) & 0xFF
+            if byte == 0:
+                break
+            chars.append(byte)
+            ptr += 1
+            if len(chars) > 4096:
+                break
+        return bytes(chars).decode('ascii', errors='replace')
+
+    def _handle_printf(self, stmt):
+        """Handle printf.ref.* calls: read format string from $M.0, format args, print."""
+        args = [self.eval(arg) for arg in stmt.arguments]
+        # After shadowing, args are doubled (non-shadow, shadow). Take first half.
+        n = len(args) // 2
+        args = args[:n]
+
+        # First arg is format string pointer into $M.0
+        fmt_ptr = args[0]
+        m0 = self._get_var("$M.0")
+        fmt = self._read_cstring(m0, fmt_ptr)
+
+        # Remaining args are printf variadic arguments
+        printf_args = args[1:]
+
+        # Format and print
+        output = self._format_printf(fmt, printf_args, m0)
+        print(output, end='')
+
+    def _format_printf(self, fmt, args, m0):
+        """Parse C-style format string and substitute arguments."""
+        result = []
+        i = 0
+        arg_idx = 0
+        while i < len(fmt):
+            ch = fmt[i]
+            if ch == '%':
+                i += 1
+                if i >= len(fmt):
+                    break
+                if fmt[i] == '%':
+                    result.append('%')
+                    i += 1
+                    continue
+                # Parse flags, width, precision
+                flags = ''
+                while i < len(fmt) and fmt[i] in '-+ 0#':
+                    flags += fmt[i]
+                    i += 1
+                width = ''
+                while i < len(fmt) and fmt[i].isdigit():
+                    width += fmt[i]
+                    i += 1
+                precision = ''
+                if i < len(fmt) and fmt[i] == '.':
+                    i += 1
+                    while i < len(fmt) and fmt[i].isdigit():
+                        precision += fmt[i]
+                        i += 1
+                # Length modifiers
+                while i < len(fmt) and fmt[i] in 'hlLzjt':
+                    i += 1
+                if i >= len(fmt):
+                    break
+                spec = fmt[i]
+                i += 1
+                if arg_idx >= len(args):
+                    result.append('<?>')
+                    continue
+                val = args[arg_idx]
+                arg_idx += 1
+                # Build Python format spec
+                py_fmt = '%' + flags + width
+                if precision:
+                    py_fmt += '.' + precision
+                if spec in ('d', 'i'):
+                    # signed
+                    if val & (1 << 63):
+                        val = val - (1 << 64)
+                    result.append(py_fmt % val if py_fmt != '%' else str(val))
+                elif spec == 'u':
+                    val = val & ((1 << 64) - 1)
+                    result.append((py_fmt.replace('u', 'd')) % val if py_fmt != '%' else str(val))
+                elif spec == 'x':
+                    val = val & ((1 << 64) - 1)
+                    result.append((py_fmt + 'x') % val)
+                elif spec == 'X':
+                    val = val & ((1 << 64) - 1)
+                    result.append((py_fmt + 'X') % val)
+                elif spec == 'o':
+                    val = val & ((1 << 64) - 1)
+                    result.append((py_fmt + 'o') % val)
+                elif spec == 'c':
+                    result.append(chr(val & 0xFF))
+                elif spec == 's':
+                    s = self._read_cstring(m0, val)
+                    if precision:
+                        s = s[:int(precision)]
+                    result.append(s)
+                elif spec == 'p':
+                    result.append('0x' + format(val & ((1 << 64) - 1), 'x'))
+                else:
+                    result.append(f'<{spec}?>')
+            elif ch == '\\' and i + 1 < len(fmt):
+                nxt = fmt[i + 1]
+                if nxt == 'n':
+                    result.append('\n')
+                    i += 2
+                elif nxt == 't':
+                    result.append('\t')
+                    i += 2
+                elif nxt == '0':
+                    result.append('\0')
+                    i += 2
+                elif nxt == '\\':
+                    result.append('\\')
+                    i += 2
+                else:
+                    result.append(ch)
+                    i += 1
+            else:
+                result.append(ch)
+                i += 1
+        return ''.join(result)
+
     def _handle_call(self, stmt):
         proc = stmt.procedure.name
         if RE_PRINTF.match(proc):
+            self._handle_printf(stmt)
             return
         if any(pat.match(proc) for pat in CALL_IGNORE_FN_PATTERNS):
             return
@@ -832,13 +961,32 @@ class BoogieInterpreter:
 # Entry points
 # ============================================================
 
-def process_single_input(input_file, test_name, test_path, force=False, full_trace=False, no_read_trace=False):
+# Shared state for fork-based COW sharing (Python engine __main__ only)
+_PYINTERP_SHARED_PROGRAM = None
+_PYINTERP_SHARED_FIELD_SIZES = None
+
+
+def _process_input_shared(input_file, test_name, test_path, force=False, full_trace=False, no_read_trace=False):
+    """Worker function that uses fork-inherited _PYINTERP_SHARED_* globals."""
+    return process_single_input(
+        input_file, test_name=test_name, test_path=test_path, force=force,
+        full_trace=full_trace, no_read_trace=no_read_trace,
+        program=_PYINTERP_SHARED_PROGRAM, field_sizes=_PYINTERP_SHARED_FIELD_SIZES,
+    )
+
+
+def process_single_input(input_file, test_name, test_path, force=False, full_trace=False, no_read_trace=False,
+                         program=None, field_sizes=None):
     try:
-        with open(test_path, 'rb') as file:
-            program = pickle.load(file)
+        if program is None:
+            with open(test_path, 'rb') as file:
+                program = pickle.load(file)
 
         log.debug(f"Processing input file: {input_file}")
-        program_inputs = parse_inputs(input_file)
+        from interpreter.utils.input_parser import parse_input_file, get_bpl_field_sizes
+        if field_sizes is None:
+            field_sizes = get_bpl_field_sizes(test_path.parent, program=program)
+        program_inputs = parse_input_file(input_file, field_sizes=field_sizes)
         input_name = Path(input_file.name).stem
 
         trace_path = Path("positive_examples") / test_name / f"{input_name}.trace.txt"
@@ -913,7 +1061,7 @@ if __name__ == '__main__':
         if stored_hash == bpl_hash:
             # Hash matches — but check if ALL inputs are complete
             input_directory_check = Path("test_input") / f"{test_name}"
-            input_files_check = list(input_directory_check.glob("*.json"))
+            input_files_check = list(input_directory_check.glob("*.input"))
             all_done = all(
                 (trace_dir / f"{p.stem}.explored_blocks.txt").exists()
                 for p in input_files_check
@@ -934,15 +1082,26 @@ if __name__ == '__main__':
                 shutil.rmtree(mem_trace_dir)
 
     input_directory = Path("test_input") / f"{test_name}"
-    input_files = list(input_directory.glob("*.json"))
+    input_files = list(input_directory.glob("*.input"))
     assert len(input_files) > 0, f"No input files found in {input_directory}"
 
     max_workers = min(max(1, os.cpu_count() - 1), len(input_files))
     log.debug(f"Using {max_workers} workers for {len(input_files)} inputs")
-    worker_func = functools.partial(process_single_input, test_name=test_name, test_path=test_path, force=args.force, full_trace=getattr(args, 'full_trace', False), no_read_trace=getattr(args, 'no_read_trace', False))
+
+    # Load program once, share via fork COW
+    import multiprocessing
+    assert hasattr(os, 'fork'), "Fork-based multiprocessing required (Linux only)"
+    with open(test_path, 'rb') as f:
+        _PYINTERP_SHARED_PROGRAM = pickle.load(f)
+    from interpreter.utils.input_parser import get_bpl_field_sizes
+    _PYINTERP_SHARED_FIELD_SIZES = get_bpl_field_sizes(test_path.parent, program=_PYINTERP_SHARED_PROGRAM)
+    mp_context = multiprocessing.get_context('fork')
+    worker_func = functools.partial(_process_input_shared, test_name=test_name, test_path=test_path,
+                                    force=args.force, full_trace=getattr(args, 'full_trace', False),
+                                    no_read_trace=getattr(args, 'no_read_trace', False))
 
     failed = False
-    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+    with ProcessPoolExecutor(max_workers=max_workers, mp_context=mp_context) as executor:
         results_iterator = executor.map(worker_func, input_files)
         try:
             for result in results_iterator:

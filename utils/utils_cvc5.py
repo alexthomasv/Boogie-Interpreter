@@ -285,17 +285,6 @@ def cvc5_cast_to_bool(solver, expr):
     else:
         return expr
     
-def extract_assert_expr(stmt):
-    if isinstance(stmt, AssertStatement):
-        return stmt.expression
-    elif isinstance(stmt, CallStatement):
-        return stmt.arguments[0]
-    elif isinstance(stmt, FunctionApplication):
-        return stmt.arguments[0]
-    else:
-        IndentLogger.debug("unknown statement", stmt, type(stmt))
-        assert False
-
 def convert_type_to_cvc5(solver, type_, mono_mem = True) -> Sort:
     if isinstance(type_, BooleanType):
         return solver.getBooleanSort()
@@ -487,15 +476,6 @@ def convert_expr_cvc5(cvc5_fn_map, state_cache, solver, expr, mono_mem: bool) ->
         return expr
     else:
         assert False, f"unknown expression {expr} {type(expr)}"
-
-def unravel_store_chain(store_term):
-    assert store_term.getKind() == Kind.STORE, f"Expected store term, got {store_term}"
-    writes = []
-    cur = store_term
-    while cur.getKind() == Kind.STORE:
-        writes.append((cur[1], cur[2]))   # index, value
-        cur = cur[0]                      # follow previous array
-    return cur, writes  
 
 KIND_TO_NUM = {
     Kind.EQUAL: 0,
@@ -986,6 +966,26 @@ def conjunct(solver, predicates):
         return Predicate(solver.mkTerm(Kind.AND, *[predicate.predicate for predicate in predicates]))
 
 import re
+
+def _coerce_bv_sorts(solver, a, b):
+    """Ensure two bitvector terms have matching widths via zero-extension."""
+    from cvc5 import Kind
+    try:
+        as_, bs_ = a.getSort(), b.getSort()
+        if not as_.isBitVector() or not bs_.isBitVector():
+            return a, b
+        aw, bw = as_.getBitVectorSize(), bs_.getBitVectorSize()
+        if aw < bw:
+            op = solver.solver.mkOp(Kind.BITVECTOR_ZERO_EXTEND, bw - aw)
+            a = solver.solver.mkTerm(op, a)
+        elif bw < aw:
+            op = solver.solver.mkOp(Kind.BITVECTOR_ZERO_EXTEND, aw - bw)
+            b = solver.solver.mkTerm(op, b)
+    except Exception:
+        pass
+    return a, b
+
+
 def parse_constraint_tuple(tuple_str):
     """
     Parses constraint tuples including assignments, shadow checks, disjunctions,
@@ -1117,7 +1117,9 @@ def parse_constraint_tuple(tuple_str):
             return result
 
         # --- TYPE 2: Shadow Variable Check ---
-        if "shadow" in rhs and "[" not in lhs:
+        # RHS must be a simple variable name (e.g. $i4730.shadow), not a
+        # compound expression like "$i4729.shadow < $i4727.shadow"
+        if "shadow" in rhs and "[" not in lhs and re.match(r'^[\$\w.]+$', rhs):
             result["type"] = "shadow_variable"
             result["variable"] = lhs
             result["shadow_variable"] = rhs
@@ -1134,6 +1136,186 @@ def parse_constraint_tuple(tuple_str):
     result["type"] = "unknown"
     result["raw_body"] = body
     return result
+
+def _parse_infix_expr(s, state_cache):
+    """Parse an infix expression (from term_to_string output) into a cvc5 Term.
+
+    Handles variables, integers, array select, STORE, and binary operators.
+    All arithmetic is bitvector (64-bit default, or inferred from variable sort).
+    """
+    from cvc5 import Kind
+    import re as _re
+
+    # Reverse operator map: string op → cvc5 Kind (prefer bitvector)
+    _BIN_OPS = {
+        '+': Kind.BITVECTOR_ADD, '-': Kind.BITVECTOR_SUB,
+        '*': Kind.BITVECTOR_MULT, '/': Kind.BITVECTOR_UDIV,
+        '%': Kind.BITVECTOR_SREM,
+        '>>': Kind.BITVECTOR_LSHR, '<<': Kind.BITVECTOR_SHL,
+        '<': Kind.BITVECTOR_ULT, '>': Kind.BITVECTOR_UGT,
+        '<=': Kind.BITVECTOR_ULE, '>=': Kind.BITVECTOR_UGE,
+        '&': Kind.BITVECTOR_AND, '^': Kind.BITVECTOR_XOR,
+        '||': Kind.BITVECTOR_OR,
+        '==': Kind.EQUAL, '!=': Kind.DISTINCT,
+    }
+
+    # Operator precedence (lower = binds tighter)
+    _PREC = {
+        '==': 1, '!=': 1,
+        '<': 2, '>': 2, '<=': 2, '>=': 2,
+        '+': 3, '-': 3,
+        '*': 4, '/': 4, '%': 4,
+        '>>': 5, '<<': 5,
+        '&': 6, '^': 6, '||': 6,
+    }
+
+    solver = state_cache.solver
+    tokens = []
+    i = 0
+    s = s.strip()
+    while i < len(s):
+        if s[i].isspace():
+            i += 1
+        elif s[i] == '$' or (s[i].isalpha() and s[i:i+5] == 'STORE'):
+            # Variable or STORE keyword
+            j = i
+            if s[i] == '$':
+                j += 1
+                while j < len(s) and (s[j].isalnum() or s[j] in '._'):
+                    j += 1
+            else:
+                j = i + 5
+            tokens.append(('ID', s[i:j]))
+            i = j
+        elif s[i].isdigit():
+            j = i
+            while j < len(s) and s[j].isdigit():
+                j += 1
+            tokens.append(('NUM', s[i:j]))
+            i = j
+        elif s[i:i+2] in ('>>', '<<', '<=', '>=', '==', '!=', '||'):
+            tokens.append(('OP', s[i:i+2]))
+            i += 2
+        elif s[i] in '+-*/%<>&^~':
+            tokens.append(('OP', s[i]))
+            i += 1
+        elif s[i] in '()[],':
+            tokens.append((s[i], s[i]))
+            i += 1
+        else:
+            i += 1  # skip unknown chars
+
+    pos = [0]
+
+    def peek():
+        return tokens[pos[0]] if pos[0] < len(tokens) else (None, None)
+
+    def advance():
+        t = tokens[pos[0]]
+        pos[0] += 1
+        return t
+
+    def expect(typ):
+        t = advance()
+        assert t[0] == typ, f"Expected {typ}, got {t} at pos {pos[0]-1}"
+        return t
+
+    def _bool_to_bv1(term):
+        """Convert Bool term to bv1: ITE(term, 1, 0)."""
+        return solver.mkTerm(Kind.ITE, term,
+                             solver.mkBitVector(1, 1),
+                             solver.mkBitVector(1, 0))
+
+    def parse_expr(min_prec=0):
+        left = parse_primary()
+        while True:
+            typ, val = peek()
+            if typ != 'OP' or val not in _PREC or _PREC[val] < min_prec:
+                break
+            advance()
+            right = parse_expr(_PREC[val] + 1)
+            kind = _BIN_OPS[val]
+            # Ensure operands match sort (including for equality)
+            left, right = _match_bv_sorts(solver, left, right)
+            result = solver.mkTerm(kind, left, right)
+            # Comparisons return Bool; wrap as bv1 for use in BV expressions
+            if val in ('<', '>', '<=', '>=') and result.getSort().isBoolean():
+                result = _bool_to_bv1(result)
+            left = result
+        return left
+
+    def parse_primary():
+        typ, val = peek()
+        if typ == '(':
+            advance()
+            expr = parse_expr(0)
+            expect(')')
+            # Check for array select: expr[index]
+            if peek()[0] == '[':
+                advance()
+                idx = parse_expr(0)
+                expect(']')
+                return solver.mkTerm(Kind.SELECT, expr, idx)
+            return expr
+        elif typ == 'ID' and val == 'STORE':
+            advance()
+            expect('(')
+            arr = parse_expr(0)
+            expect(',')
+            idx = parse_expr(0)
+            expect(',')
+            v = parse_expr(0)
+            expect(')')
+            return solver.mkTerm(Kind.STORE, arr, idx, v)
+        elif typ == 'ID':
+            advance()
+            term = state_cache.cvc5_var(val)
+            if term is None:
+                raise ValueError(f"Unknown variable: {val}")
+            # Check for array select: var[index]
+            if peek()[0] == '[':
+                advance()
+                idx = parse_expr(0)
+                expect(']')
+                return solver.mkTerm(Kind.SELECT, term, idx)
+            return term
+        elif typ == 'NUM':
+            advance()
+            # Default 64-bit bitvector; caller may need to adjust
+            return solver.mkBitVector(64, int(val))
+        elif typ == 'OP' and val == '~':
+            advance()
+            operand = parse_primary()
+            return solver.mkTerm(Kind.BITVECTOR_NOT, operand)
+        else:
+            raise ValueError(f"Unexpected token: {typ}={val} at pos {pos[0]}")
+
+    def _match_bv_sorts(solver, a, b):
+        """Ensure two bitvector terms have matching widths via zero-extension."""
+        try:
+            as_ = a.getSort()
+            bs_ = b.getSort()
+            if not as_.isBitVector() or not bs_.isBitVector():
+                return a, b
+            aw = as_.getBitVectorSize()
+            bw = bs_.getBitVectorSize()
+            if aw != bw:
+                if a.isBitVectorValue():
+                    a = solver.mkBitVector(bw, int(a.getBitVectorValue(10)))
+                elif b.isBitVectorValue():
+                    b = solver.mkBitVector(aw, int(b.getBitVectorValue(10)))
+                elif aw < bw:
+                    op = solver.solver.mkOp(Kind.BITVECTOR_ZERO_EXTEND, bw - aw)
+                    a = solver.solver.mkTerm(op, a)
+                elif bw < aw:
+                    op = solver.solver.mkOp(Kind.BITVECTOR_ZERO_EXTEND, aw - bw)
+                    b = solver.solver.mkTerm(op, b)
+        except Exception:
+            pass
+        return a, b
+
+    return parse_expr(0)
+
 
 def _parse_smt_term(s, ae, state_cache):
     """Parse an smt-lib s-expression string into a cvc5 Term."""
@@ -1387,7 +1569,9 @@ def str_to_key(str_key, ae, state_cache):
         else:
             lhs_var = state_cache.cvc5_var(lhs_name)
             rhs_var = state_cache.cvc5_var(rhs_name)
-            
+
+            # Sort mismatch (e.g., i64 == i32.shadow after zext removal)
+            lhs_var, rhs_var = _coerce_bv_sorts(state_cache.solver, lhs_var, rhs_var)
             eq_term = state_cache.solver.mkTerm(Kind.EQUAL, lhs_var, rhs_var)
             ret_term = Predicate(eq_term)
             ret_term.eq_predicate = True
@@ -1465,8 +1649,18 @@ def str_to_key(str_key, ae, state_cache):
         select_term = state_cache.solver.mkTerm(Kind.SELECT, mem_map_var, index_var)
         ret_term = ae.EQ_CONST(select_term, [x["constant"]])
 
+    elif x["type"] == "unknown":
+        # Fallback: parse the full infix body with the general parser
+        body = x.get("raw_body", "")
+        cvc5_term = _parse_infix_expr(body, state_cache)
+        if cvc5_term.getKind() == Kind.EQUAL:
+            ret_term = Predicate(cvc5_term)
+            ret_term.eq_predicate = True
+        else:
+            ret_term = Predicate(cvc5_term)
+
     else:
         raise ValueError(f"Unsupported constraint type '{x['type']}' for: {str_key}")
-    
+
     state_key = (pc, ret_term)
     return state_key

@@ -6,6 +6,7 @@ from interpreter.utils.utils import extract_boogie_variables
 from collections import defaultdict
 from pathlib import Path
 import pickle
+import struct
 import os
 
 
@@ -169,6 +170,47 @@ class Environment:
         }
         with open(self._compact_path, 'wb') as f:
             pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
+        self.flush_compact_bin()
+
+    def flush_compact_bin(self):
+        """Write compact trace in streaming binary format with zstd compression.
+
+        Format: SWTR(4) + version(1) + total(8) + 5 category sections + DONE(4)
+        Each section: cat_id(1) + num_keys(4) + [key_len(2) + key + num_members(4) + [member_len(2) + member]*]*
+        Wrapped in zstd streaming compression.
+        """
+        if self._agg_total == 0:
+            return
+
+        import zstandard as zstd
+
+        bin_path = str(self._compact_path).replace('.compact.pkl', '.compact.bin.zst')
+
+        categories = [
+            (0, self._agg_pc_values,    lambda k: f"positive_examples_{k[0]}_{k[1]}"),
+            (1, self._agg_block_values, lambda k: f"positive_examples_{k[0]}_{k[1]}"),
+            (2, self._agg_op_values,    lambda k: f"positive_examples_to_op_type_{k[0]}_{k[1]}_{k[2]}"),
+            (3, self._agg_pc_registry,  lambda k: f"positive_examples_to_pc_{k}"),
+            (4, self._agg_block_registry, lambda k: f"positive_examples_to_block_{k}"),
+        ]
+
+        cctx = zstd.ZstdCompressor(level=3, threads=-1)
+        with open(bin_path, 'wb') as fh:
+            with cctx.stream_writer(fh) as writer:
+                writer.write(b"SWTR")
+                writer.write(struct.pack('<BQ', 1, self._agg_total))
+                for cat_id, agg_dict, key_fn in categories:
+                    writer.write(struct.pack('<BI', cat_id, len(agg_dict)))
+                    for raw_key, vals in agg_dict.items():
+                        key_str = key_fn(raw_key).encode()
+                        members = [pickle.dumps(v) for v in vals]
+                        writer.write(struct.pack('<H', len(key_str)))
+                        writer.write(key_str)
+                        writer.write(struct.pack('<I', len(members)))
+                        for m in members:
+                            writer.write(struct.pack('<H', len(m)))
+                            writer.write(m)
+                writer.write(b"DONE")
 
     # Kept for backward compatibility
     def debug_print_set_value(self, key, value, op_type):

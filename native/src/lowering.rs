@@ -451,6 +451,12 @@ fn lower_call(py: Python<'_>, stmt: &Bound<'_, PyAny>, intern: &mut InternTable)
     let proc = stmt.getattr("procedure")?;
     let proc_name: String = proc.getattr("name")?.extract()?;
 
+    // Printf calls get their own statement so the VM can execute them
+    if is_printf_call(&proc_name) {
+        let args = lower_call_args(py, stmt, intern)?;
+        return Ok(Stmt::CallPrintf { args });
+    }
+
     // Check ignore patterns (simplified — match the Python regex patterns)
     if is_ignored_call(&proc_name) {
         return Ok(Stmt::CallIgnored);
@@ -508,6 +514,11 @@ fn lower_call_assignments(
     Ok(result)
 }
 
+/// Check if a call is a printf call (matches Python's RE_PRINTF).
+fn is_printf_call(name: &str) -> bool {
+    name.starts_with("printf.ref") || name == "printf"
+}
+
 /// Check if a call should be ignored (matches Python's CALL_IGNORE_FN_PATTERNS).
 fn is_ignored_call(name: &str) -> bool {
     // __VERIFIER_nondet_*
@@ -530,10 +541,7 @@ fn is_ignored_call(name: &str) -> bool {
     if name.starts_with("corral_atomic_") {
         return true;
     }
-    // printf.*
-    if name.starts_with("printf.ref") || name == "printf" {
-        return true;
-    }
+    // printf.* — handled by is_printf_call / CallPrintf, not ignored
     // __SMACK_value*
     if name.starts_with("__SMACK_value") || name.starts_with("__SMACK_values") {
         return true;

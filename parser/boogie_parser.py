@@ -499,65 +499,24 @@ class BoogieToObjectTransformer(Transformer):
         stmt_lst = items[4]
         return WhileStatement(condition=guard, blocks=stmt_lst)
 
-    def binary_expr_iff(self, items):
-        lhs, rhs = items[0], items[1]
-        return BinaryExpression(lhs=lhs, op="<==>", rhs=rhs)
-    
-    def binary_expr_implies(self, items):
-        lhs, rhs = items[0], items[1]
-        return BinaryExpression(lhs=lhs, op="==>", rhs=rhs)
-    
-    def binary_expr_or(self, items):
-        lhs, rhs = items[0], items[1]
-        return BinaryExpression(lhs=lhs, op="||", rhs=rhs)
-    
-    def binary_expr_and(self, items):
-        lhs, rhs = items[0], items[1]
-        return BinaryExpression(lhs=lhs, op="&&", rhs=rhs)
-    
-    def binary_expr_eq(self, items):
-        lhs, rhs = items[0], items[1]
-        return BinaryExpression(lhs=lhs, op="==", rhs=rhs)
-    
-    def binary_expr_neq(self, items):
-        lhs, rhs = items[0], items[1]
-        return BinaryExpression(lhs=lhs, op="!=", rhs=rhs)
-    
-    def binary_expr_lt(self, items):
-        lhs, rhs = items[0], items[1]
-        return BinaryExpression(lhs=lhs, op="<", rhs=rhs)
-    
-    def binary_expr_gt(self, items):
-        lhs, rhs = items[0], items[1]
-        return BinaryExpression(lhs=lhs, op=">", rhs=rhs)
-    
-    def binary_expr_le(self, items):
-        lhs, rhs = items[0], items[1]
-        return BinaryExpression(lhs=lhs, op="<=", rhs=rhs)
-    
-    def binary_expr_ge(self, items):
-        lhs, rhs = items[0], items[1]
-        return BinaryExpression(lhs=lhs, op=">=", rhs=rhs)
-    
-    def binary_expr_plus(self, items):
-        lhs, rhs = items[0], items[1]
-        return BinaryExpression(lhs=lhs, op="+", rhs=rhs)
-    
-    def binary_expr_minus(self, items):
-        lhs, rhs = items[0], items[1]
-        return BinaryExpression(lhs=lhs, op="-", rhs=rhs)
-    
-    def binary_expr_times(self, items):
-        lhs, rhs = items[0], items[1]
-        return BinaryExpression(lhs=lhs, op="*", rhs=rhs)
-    
-    def binary_expr_div(self, items):
-        lhs, rhs = items[0], items[1]
-        return BinaryExpression(lhs=lhs, op="/", rhs=rhs)
-    
-    def binary_expr_mod(self, items):
-        lhs, rhs = items[0], items[1]
-        return BinaryExpression(lhs=lhs, op="%", rhs=rhs)
+    def _binary(self, items, op):
+        return BinaryExpression(lhs=items[0], op=op, rhs=items[1])
+
+    def binary_expr_iff(self, items):     return self._binary(items, "<==>")
+    def binary_expr_implies(self, items): return self._binary(items, "==>")
+    def binary_expr_or(self, items):      return self._binary(items, "||")
+    def binary_expr_and(self, items):     return self._binary(items, "&&")
+    def binary_expr_eq(self, items):      return self._binary(items, "==")
+    def binary_expr_neq(self, items):     return self._binary(items, "!=")
+    def binary_expr_lt(self, items):      return self._binary(items, "<")
+    def binary_expr_gt(self, items):      return self._binary(items, ">")
+    def binary_expr_le(self, items):      return self._binary(items, "<=")
+    def binary_expr_ge(self, items):      return self._binary(items, ">=")
+    def binary_expr_plus(self, items):    return self._binary(items, "+")
+    def binary_expr_minus(self, items):   return self._binary(items, "-")
+    def binary_expr_times(self, items):   return self._binary(items, "*")
+    def binary_expr_div(self, items):     return self._binary(items, "/")
+    def binary_expr_mod(self, items):     return self._binary(items, "%")
     
     def func_expr(self, items):
         id = FunctionIdentifier(**items[0])
@@ -693,6 +652,9 @@ class BoogieToObjectTransformer(Transformer):
     def nat(self, token):
         assert(len(token) == 1)
         return IntegerLiteral(int(token[0]))
+
+    def bv_lit(self, items):
+        return BitvectorLiteral(int(items[0]), int(items[1]))
 
     def DIGITS(self, token):
         return int(token)

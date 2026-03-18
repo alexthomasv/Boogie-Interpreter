@@ -1,6 +1,7 @@
 """Program input parsing and array/field metadata extraction."""
 
-import json
+import os
+import re
 from collections import defaultdict
 from dataclasses import dataclass, replace
 
@@ -8,6 +9,37 @@ from interpreter.parser.declaration import ImplementationDeclaration
 from interpreter.parser.statement import CallStatement
 
 from interpreter.utils.program import extract_boogie_variables, RE_SMACK
+
+# ---------------------------------------------------------------------------
+# Value helpers — expand shorthand in buffer contents / struct field values
+# ---------------------------------------------------------------------------
+
+_HELPER_RE = re.compile(r'^(zeros|ones|random)\((\d+)\)$')
+
+
+def _expand_contents(value):
+    """Expand value helper syntax in buffer/field contents.
+
+    Supported:
+      "zeros(N)"      -> "0x" + "00" * N
+      "ones(N)"       -> "0x" + "ff" * N
+      "random(N)"     -> "0x" + <N random bytes as hex>
+      [0x00, 0x01, …] -> "0x" + hex-encoded bytes (C-style array)
+      "0x..."         -> pass through unchanged
+    """
+    if isinstance(value, list):
+        return "0x" + "".join(f"{b & 0xff:02x}" for b in value)
+    if isinstance(value, str):
+        m = _HELPER_RE.match(value.strip())
+        if m:
+            func, n = m.group(1), int(m.group(2))
+            if func == "zeros":
+                return "0x" + "00" * n
+            elif func == "ones":
+                return "0x" + "ff" * n
+            elif func == "random":
+                return "0x" + os.urandom(n).hex()
+    return value
 
 
 @dataclass
@@ -52,7 +84,7 @@ class Input:
 
 
 class ProgramInputs:
-    """Parsed program inputs from a JSON file."""
+    """Parsed program inputs from a .input file."""
 
     def __init__(self, variables: dict[str, Input], extra_data: bytes | None = None):
         self.variables = variables
@@ -65,31 +97,6 @@ class ProgramInputs:
             if not inp.private:
                 result[f"{name}.shadow"] = replace(inp, name=f"{name}.shadow")
         return result
-
-
-def parse_inputs(input_json) -> ProgramInputs:
-    with open(input_json, 'r') as f:
-        raw = json.load(f)
-
-    variables = {}
-    extra_data = None
-
-    for entry in raw:
-        if 'extra_data' in entry:
-            extra_data = bytes.fromhex(entry['extra_data'])
-            continue
-
-        name = entry['var']
-        inp = Input(
-            name=name,
-            private=entry['private'],
-            value=entry.get('value'),
-            buffers=entry.get('buffers'),
-            struct=entry.get('struct'),
-        )
-        variables[name] = inp
-
-    return ProgramInputs(variables=variables, extra_data=extra_data)
 
 
 # ── Array / field metadata ───────────────────────────────────────────────

@@ -144,8 +144,10 @@ pub enum Stmt {
     Goto { targets: Vec<BlockId> },
     /// return
     Return,
-    /// Calls that are ignored (printf, verifier_nondet, etc.)
+    /// Calls that are ignored (verifier_nondet, etc.)
     CallIgnored,
+    /// call printf.ref.* — read format string from $M.0, format args, print
+    CallPrintf { args: Vec<Expr> },
     /// call time.cross_product
     CallTime {
         assignments: Vec<VarId>,
