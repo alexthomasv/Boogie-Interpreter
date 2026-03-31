@@ -303,6 +303,9 @@ def convert_type_to_cvc5(solver, type_, mono_mem = True) -> Sort:
             return solver.mkBitVectorSort(64)
         elif type_.name == "i128":
             return solver.mkBitVectorSort(128)
+        elif type_.name.startswith("bv") and type_.name[2:].isdigit():
+            # Boogie native bitvector types: bv32, bv64, etc.
+            return solver.mkBitVectorSort(int(type_.name[2:]))
         elif type_.name == "bool":
             return solver.getBooleanSort()
         elif type_.name == "ref":
@@ -863,6 +866,13 @@ def to_boogie(cvc5_term: Term):
         memory_map = to_boogie(cvc5_term[0])
         load_addr = to_boogie(cvc5_term[1])
         return MapSelect(map=memory_map, indexes=[load_addr])
+    elif cvc5_term.getKind() == Kind.STORE:
+        memory_map = to_boogie(cvc5_term[0])
+        store_addr = to_boogie(cvc5_term[1])
+        store_val = to_boogie(cvc5_term[2])
+        # Boogie syntax: M[addr := val]
+        from interpreter.parser.expression import MapUpdate
+        return MapUpdate(map=memory_map, indexes=[store_addr], value=store_val)
     elif cvc5_term.getKind() == Kind.EQUAL:
         lhs = to_boogie(cvc5_term[0])
         rhs = to_boogie(cvc5_term[1])
