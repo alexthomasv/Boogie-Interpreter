@@ -922,7 +922,7 @@ def to_boogie(cvc5_term: Term):
     elif cvc5_term.getKind() == Kind.BITVECTOR_ULT:
         lhs = to_boogie(cvc5_term[0])
         rhs = to_boogie(cvc5_term[1])
-        return BinaryExpression(lhs=lhs, op="<=", rhs=rhs)
+        return BinaryExpression(lhs=lhs, op="<", rhs=rhs)
     elif cvc5_term.getKind() == Kind.BITVECTOR_SLT:
         lhs = to_boogie(cvc5_term[0])
         rhs = to_boogie(cvc5_term[1])
