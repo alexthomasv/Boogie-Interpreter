@@ -51,6 +51,11 @@ class Environment:
         self._agg_total = 0
         self.full_trace = False
 
+        # Iteration counter for loop-aware co-occurrence tracking.
+        # Increments each time a variable is written in the same block,
+        # giving each loop iteration a unique ID per (var, block).
+        self._write_counter = defaultdict(int)  # (var, block) → count
+
         # Direct reference to the single frame's var_store for fast access
         self._var_store = self.stackFrames[0].var_store
 
@@ -108,8 +113,17 @@ class Environment:
 
         # Compact accumulation — raw values, pickled only at flush time
         # Uses tuple keys to avoid per-entry string formatting
-        raw_val = (value, "")
         pc = self.pc
+
+        # Track iteration ID for loop-aware co-occurrence
+        if op_type == "W":
+            iter_key = (key, cb)
+            self._write_counter[iter_key] += 1
+            iteration_id = self._write_counter[iter_key]
+        else:
+            # Reads use the current iteration of the most recent write
+            iteration_id = self._write_counter.get((key, cb), 0)
+        raw_val = (value, iteration_id)
         self._agg_pc_values[(key, pc)].add(raw_val)
         self._agg_block_values[(key, cb)].add(raw_val)
         self._agg_op_values[(key, pc, op_type)].add(raw_val)
@@ -173,11 +187,12 @@ class Environment:
         self.flush_compact_bin()
 
     def flush_compact_bin(self):
-        """Write compact trace in streaming binary format with zstd compression.
+        """Write compact trace in v2 streaming binary format with zstd compression.
 
-        Format: SWTR(4) + version(1) + total(8) + 5 category sections + DONE(4)
-        Each section: cat_id(1) + num_keys(4) + [key_len(2) + key + num_members(4) + [member_len(2) + member]*]*
-        Wrapped in zstd streaming compression.
+        Format: SWTR(4) + version(1,=2) + total(8) + 5 category sections + DONE(4)
+        Value categories: enc_flag(1,=1) + num_members(4) + num_members*8 raw LE bytes
+        PC registry: enc_flag(1,=2) + num_members(4) + num_members*4 raw LE bytes
+        Block registry: enc_flag(1,=0) + num_members(4) + [member_len(2) + member]*
         """
         if self._agg_total == 0:
             return
@@ -186,30 +201,60 @@ class Environment:
 
         bin_path = str(self._compact_path).replace('.compact.pkl', '.compact.bin.zst')
 
-        categories = [
+        value_categories = [
             (0, self._agg_pc_values,    lambda k: f"positive_examples_{k[0]}_{k[1]}"),
             (1, self._agg_block_values, lambda k: f"positive_examples_{k[0]}_{k[1]}"),
             (2, self._agg_op_values,    lambda k: f"positive_examples_to_op_type_{k[0]}_{k[1]}_{k[2]}"),
-            (3, self._agg_pc_registry,  lambda k: f"positive_examples_to_pc_{k}"),
-            (4, self._agg_block_registry, lambda k: f"positive_examples_to_block_{k}"),
         ]
 
         cctx = zstd.ZstdCompressor(level=3, threads=-1)
         with open(bin_path, 'wb') as fh:
             with cctx.stream_writer(fh) as writer:
                 writer.write(b"SWTR")
-                writer.write(struct.pack('<BQ', 1, self._agg_total))
-                for cat_id, agg_dict, key_fn in categories:
+                writer.write(struct.pack('<BQ', 3, self._agg_total))  # v3: with iteration IDs
+
+                # Value categories (enc_flag=3, pairs of 8-byte value + 4-byte iteration_id)
+                for cat_id, agg_dict, key_fn in value_categories:
                     writer.write(struct.pack('<BI', cat_id, len(agg_dict)))
                     for raw_key, vals in agg_dict.items():
                         key_str = key_fn(raw_key).encode()
-                        members = [pickle.dumps(v) for v in vals]
                         writer.write(struct.pack('<H', len(key_str)))
                         writer.write(key_str)
-                        writer.write(struct.pack('<I', len(members)))
-                        for m in members:
-                            writer.write(struct.pack('<H', len(m)))
-                            writer.write(m)
+                        # Extract (value, iteration_id) pairs
+                        pairs = [(v[0] if isinstance(v, tuple) else v,
+                                  v[1] if isinstance(v, tuple) and isinstance(v[1], int) else 0)
+                                 for v in vals]
+                        writer.write(struct.pack('<BI', 3, len(pairs)))  # enc_flag=3
+                        buf = bytearray(len(pairs) * 12)  # 8 bytes value + 4 bytes iter_id
+                        for i, (val, iter_id) in enumerate(pairs):
+                            struct.pack_into('<QI', buf, i * 12, val & ((1 << 64) - 1), iter_id)
+                        writer.write(buf)
+
+                # PC registry (enc_flag=2, 4-byte raw ints)
+                writer.write(struct.pack('<BI', 3, len(self._agg_pc_registry)))
+                for raw_key, pcs in self._agg_pc_registry.items():
+                    key_str = f"positive_examples_to_pc_{raw_key}".encode()
+                    writer.write(struct.pack('<H', len(key_str)))
+                    writer.write(key_str)
+                    pc_list = list(pcs)
+                    writer.write(struct.pack('<BI', 2, len(pc_list)))
+                    buf = bytearray(len(pc_list) * 4)
+                    for i, pc in enumerate(pc_list):
+                        struct.pack_into('<I', buf, i * 4, pc)
+                    writer.write(buf)
+
+                # Block registry (enc_flag=0, pickle)
+                writer.write(struct.pack('<BI', 4, len(self._agg_block_registry)))
+                for raw_key, blks in self._agg_block_registry.items():
+                    key_str = f"positive_examples_to_block_{raw_key}".encode()
+                    writer.write(struct.pack('<H', len(key_str)))
+                    writer.write(key_str)
+                    members = [pickle.dumps(b) for b in blks]
+                    writer.write(struct.pack('<BI', 0, len(members)))
+                    for m in members:
+                        writer.write(struct.pack('<H', len(m)))
+                        writer.write(m)
+
                 writer.write(b"DONE")
 
     # Kept for backward compatibility
