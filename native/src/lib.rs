@@ -289,8 +289,8 @@ fn build_compact_trace_pickled(
             for (composite_key, values) in $iter {
                 let key = $key_fmt(composite_key);
                 let pset = PySet::empty_bound(py)?;
-                for &val in values {
-                    let pickled = pickle_int_tuple(val);
+                for tv in values {
+                    let pickled = pickle_int_tuple(tv.value);
                     pset.add(PyBytes::new_bound(py, &pickled))?;
                 }
                 section.set_item(key, pset)?;
@@ -360,12 +360,20 @@ fn build_compact_trace_raw(
 ) -> PyResult<PyObject> {
     let compact = PyDict::new_bound(py);
 
+    // Encode TracedValue as 12-byte (8B value LE + 4B iteration_id LE) for v3 format
+    fn traced_value_bytes(tv: &trace::TracedValue) -> [u8; 12] {
+        let mut buf = [0u8; 12];
+        buf[..8].copy_from_slice(&(tv.value as u64).to_le_bytes());
+        buf[8..].copy_from_slice(&tv.iteration_id.to_le_bytes());
+        buf
+    }
+
     let pc_values = PyDict::new_bound(py);
     for (&(var_id, pc), values) in &trace.pc_values {
         let key = format!("positive_examples_{}_{}", var_names[var_id as usize], pc);
         let pset = PySet::empty_bound(py)?;
-        for &val in values {
-            pset.add(to_py_int(py, val))?;
+        for tv in values {
+            pset.add(PyBytes::new_bound(py, &traced_value_bytes(tv)))?;
         }
         pc_values.set_item(key, pset)?;
     }
@@ -379,8 +387,8 @@ fn build_compact_trace_raw(
             var_names[var_id as usize], block_name
         );
         let pset = PySet::empty_bound(py)?;
-        for &val in values {
-            pset.add(to_py_int(py, val))?;
+        for tv in values {
+            pset.add(PyBytes::new_bound(py, &traced_value_bytes(tv)))?;
         }
         block_values.set_item(key, pset)?;
     }
@@ -394,8 +402,8 @@ fn build_compact_trace_raw(
             var_names[var_id as usize], pc, op_char
         );
         let pset = PySet::empty_bound(py)?;
-        for &val in values {
-            pset.add(to_py_int(py, val))?;
+        for tv in values {
+            pset.add(PyBytes::new_bound(py, &traced_value_bytes(tv)))?;
         }
         op_values.set_item(key, pset)?;
     }
