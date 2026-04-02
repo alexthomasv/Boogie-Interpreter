@@ -153,6 +153,138 @@ fn_to_cvc5_op = {
     "/": (Kind.DIVISION, 2, None, None),
 }
 
+# Reverse mapping: cvc5 Kind → SMACK function name (prefer i32 for BV32)
+_CVC5_KIND_TO_BOOGIE = {}
+for _name, (_kind, _nargs, _width, _out) in fn_to_cvc5_op.items():
+    if _name.startswith("$") and _width == 32 and _kind is not None:
+        if _kind not in _CVC5_KIND_TO_BOOGIE:
+            _CVC5_KIND_TO_BOOGIE[_kind] = _name
+
+
+def cvc5_to_boogie(term, depth=0) -> str:
+    """Convert a cvc5 term to Boogie/SMACK syntax.
+
+    Unlike term_to_string (display-oriented), this produces syntax the LLM
+    can parse back: $mul.i32($i6, $sub.i32($i6, 1)) instead of $i6 * ($i6 - 1).
+    Handles cvc5 simplification artifacts (CONCAT→MUL, ITE→bool, etc.).
+    """
+    if depth > 30:
+        return "..."
+    if term is None:
+        return "EMPTY"
+
+    # Base case: leaf nodes
+    if term.getNumChildren() == 0:
+        if term.isBitVectorValue():
+            return str(int(term.getBitVectorValue(), 2))
+        if term.isBooleanValue():
+            return "true" if term.getBooleanValue() else "false"
+        try:
+            return term.getSymbol()
+        except Exception:
+            return str(term)
+
+    kind = term.getKind()
+
+    # --- Handle cvc5 simplification artifacts ---
+
+    # CONCAT patterns (cvc5 simplification artifacts)
+    if kind == Kind.BITVECTOR_CONCAT and term.getNumChildren() == 2:
+        hi, lo = term[0], term[1]
+        # CONCAT(EXTRACT(N-1,0,x), #b0...0) → $mul.i32(2^K, x)  (left-shift)
+        if lo.isBitVectorValue() and int(lo.getBitVectorValue(), 2) == 0:
+            n_zeros = lo.getSort().getBitVectorSize()
+            if hi.getKind() == Kind.BITVECTOR_EXTRACT:
+                inner = cvc5_to_boogie(hi[0], depth + 1)
+                return f"$mul.i32({1 << n_zeros}, {inner})"
+        # CONCAT(#b0...0, x) → x  (zero-extension, transparent in Boogie)
+        if hi.isBitVectorValue() and int(hi.getBitVectorValue(), 2) == 0:
+            return cvc5_to_boogie(lo, depth + 1)
+
+    # ITE(cond, bv(1), bv(0)) → cond  (Bool-to-BV cast)
+    if kind == Kind.ITE and term.getNumChildren() == 3:
+        t_val, f_val = term[1], term[2]
+        if (t_val.isBitVectorValue() and int(t_val.getBitVectorValue(), 2) == 1
+                and f_val.isBitVectorValue() and int(f_val.getBitVectorValue(), 2) == 0):
+            return cvc5_to_boogie(term[0], depth + 1)
+
+    # --- Standard mappings ---
+
+    if kind == Kind.EQUAL:
+        lhs = cvc5_to_boogie(term[0], depth + 1)
+        rhs = cvc5_to_boogie(term[1], depth + 1)
+        return f"{lhs} == {rhs}"
+
+    if kind == Kind.DISTINCT:
+        lhs = cvc5_to_boogie(term[0], depth + 1)
+        rhs = cvc5_to_boogie(term[1], depth + 1)
+        return f"{lhs} != {rhs}"
+
+    if kind == Kind.NOT:
+        inner = cvc5_to_boogie(term[0], depth + 1)
+        return f"!({inner})"
+
+    # bvneg($x) → $sub.i32(0, $x) (SMACK has no $neg.i32)
+    if kind == Kind.BITVECTOR_NEG:
+        inner = cvc5_to_boogie(term[0], depth + 1)
+        width = term.getSort().getBitVectorSize()
+        return f"$sub.i{width}(0, {inner})"
+
+    if kind == Kind.AND:
+        parts = [cvc5_to_boogie(term[i], depth + 1) for i in range(term.getNumChildren())]
+        return " && ".join(parts)
+
+    if kind == Kind.OR:
+        parts = [cvc5_to_boogie(term[i], depth + 1) for i in range(term.getNumChildren())]
+        return " || ".join(parts)
+
+    if kind == Kind.SELECT:
+        arr = cvc5_to_boogie(term[0], depth + 1)
+        idx = cvc5_to_boogie(term[1], depth + 1)
+        return f"{arr}[{idx}]"
+
+    if kind == Kind.STORE:
+        arr = cvc5_to_boogie(term[0], depth + 1)
+        idx = cvc5_to_boogie(term[1], depth + 1)
+        val = cvc5_to_boogie(term[2], depth + 1)
+        return f"STORE({arr}, {idx}, {val})"
+
+    if kind == Kind.IMPLIES:
+        lhs = cvc5_to_boogie(term[0], depth + 1)
+        rhs = cvc5_to_boogie(term[1], depth + 1)
+        return f"({lhs}) ==> ({rhs})"
+
+    # Refactor cvc5 simplification artifacts back to readable Boogie:
+    # ADD(MULT(X, X), NEG(X)) → $mul.i32(X, $sub.i32(X, 1))  [x² - x = x*(x-1)]
+    # ADD(MULT(X, X), X)      → $mul.i32(X, $add.i32(X, 1))  [x² + x = x*(x+1)]
+    if kind == Kind.BITVECTOR_ADD and term.getNumChildren() == 2:
+        a, b = term[0], term[1]
+        # Pattern: X² - X → X*(X-1)
+        if (a.getKind() == Kind.BITVECTOR_MULT and a.getNumChildren() == 2
+                and b.getKind() == Kind.BITVECTOR_NEG):
+            if str(a[0]) == str(a[1]) == str(b[0]):
+                x = cvc5_to_boogie(a[0], depth + 1)
+                w = term.getSort().getBitVectorSize()
+                return f"$mul.i32({x}, $sub.i{w}({x}, 1))"
+        # Pattern: X² + X → X*(X+1)
+        if (a.getKind() == Kind.BITVECTOR_MULT and a.getNumChildren() == 2
+                and b.getKind() == Kind.CONSTANT and b.getSort().isBitVector()):
+            if str(a[0]) == str(a[1]) == str(b):
+                x = cvc5_to_boogie(a[0], depth + 1)
+                w = term.getSort().getBitVectorSize()
+                return f"$mul.i32({x}, $add.i{w}({x}, 1))"
+
+    # SMACK function call: Kind → $op.i32(args)
+    if kind in _CVC5_KIND_TO_BOOGIE:
+        fn = _CVC5_KIND_TO_BOOGIE[kind]
+        args = ", ".join(cvc5_to_boogie(term[i], depth + 1)
+                        for i in range(term.getNumChildren()))
+        return f"{fn}({args})"
+
+    # Fallback: use term_to_string for unknown kinds
+    return term_to_string(term)
+
+
 def generate_cvc5_function_map(solver: Solver):
     """
     Returns a lazily initialized more_func_map using the provided stateful solver.

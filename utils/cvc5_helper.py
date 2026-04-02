@@ -37,7 +37,7 @@ KIND_TRANSLATIONS = {
     Kind.BITVECTOR_SHL: "<<",
     Kind.BITVECTOR_XOR: "^",
     Kind.BITVECTOR_SUB: "-",
-    Kind.BITVECTOR_CONCAT: "|",
+    Kind.BITVECTOR_CONCAT: "++",  # Bit concatenation (NOT bitwise OR)
     Kind.BITVECTOR_NOT: "~",
     Kind.BITVECTOR_SLT: "<",
     Kind.BITVECTOR_SREM: "%",
@@ -119,8 +119,13 @@ def term_to_string(term, id_to_cexpr=None, depth=0, indent=0):
                 return f"{prefix}{term.getBitVectorValue(10)}"
             elif term.isBooleanValue():
                 return f"{prefix}{term.getBooleanValue()}"
+            elif term.isIntegerValue():
+                return f"{prefix}{term.getIntegerValue()}"
             else:
-                return f"{prefix}{term.getSymbol()}"
+                try:
+                    return f"{prefix}{term.getSymbol()}"
+                except Exception:
+                    return f"{prefix}{term}"
 
     # Get the kind of the current term
     current_kind = term.getKind()
@@ -137,6 +142,10 @@ def term_to_string(term, id_to_cexpr=None, depth=0, indent=0):
         if current_kind == Kind.NOT:
             expr = term_to_string(term[0], id_to_cexpr, depth + 1)
             return f"{prefix}~({expr})"
+
+        if current_kind == Kind.BITVECTOR_NEG:
+            expr = term_to_string(term[0], id_to_cexpr, depth + 1)
+            return f"{prefix}(-{expr})"
 
         if current_kind == Kind.IMPLIES:
             lhs = term_to_string(term[0], id_to_cexpr, depth + 1, indent)
@@ -176,6 +185,18 @@ def term_to_string(term, id_to_cexpr=None, depth=0, indent=0):
             rhs = term_to_string(term[1], id_to_cexpr, depth + 1)
             return f"{prefix}({lhs}) == ({rhs})"
 
+        # Special case: concat(extract(N-1,0,x), #b0...0) is x << K (i.e. x * 2^K)
+        if current_kind == Kind.BITVECTOR_CONCAT:
+            if term.getNumChildren() == 2:
+                hi = term[0]
+                lo = term[1]
+                if lo.isBitVectorValue() and int(lo.getBitVectorValue(), 2) == 0:
+                    n_zeros = lo.getSort().getBitVectorSize()
+                    if hi.getKind() == Kind.BITVECTOR_EXTRACT:
+                        inner = term_to_string(hi[0], id_to_cexpr, depth + 1, indent)
+                        multiplier = 1 << n_zeros
+                        return f"{prefix}{multiplier} * {inner}"
+
         # Binary/n-ary operators (ADD, MULT, AND, OR, etc.)
         children = [term_to_string(term[i], id_to_cexpr, depth + 1, indent) for i in range(term.getNumChildren())]
         expression = f" {operator} ".join(children)
@@ -198,6 +219,12 @@ def term_to_string(term, id_to_cexpr=None, depth=0, indent=0):
             
         if current_kind == Kind.LAMBDA:
             return term.__str__()
-        print("unknown kind", current_kind)
-        assert False
+        if current_kind == Kind.BITVECTOR_TO_NAT:
+            inner = term_to_string(term[0], id_to_cexpr, depth + 1)
+            return f"nat({inner})"
+        if current_kind == Kind.INT_TO_BITVECTOR:
+            inner = term_to_string(term[0], id_to_cexpr, depth + 1)
+            return f"bv({inner})"
+        # Unknown kinds: use cvc5's built-in string representation
+        return str(term)
 
