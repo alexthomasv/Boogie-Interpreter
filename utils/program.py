@@ -36,6 +36,7 @@ RE_PRINTF = re.compile(
     r'(?:\.cross_product)?$'
 )
 RE_SMACK     = re.compile(r'^__SMACK_values?[^ ]*$')
+RE_SMACK_NONDET = re.compile(r'^__SMACK_nondet_[A-Za-z0-9_]+$')
 RE_SMACK_VALUE  = re.compile(r"__SMACK_value\.(?:ref|i\d+)\b")
 RE_LLVM_LIFETIME = re.compile(r'@?llvm\.lifetime\.(?:start|end)\.[^\s(]+')
 RE_LLVM_STACK    = re.compile(r'@?llvm\.stack(?:save|restore)\b[^\s(]*')
@@ -48,6 +49,7 @@ CALL_IGNORE_FN_PATTERNS = (
     RE_ATOMIC,
     RE_PRINTF,
     RE_SMACK,
+    RE_SMACK_NONDET,
     RE_LLVM_LIFETIME,
     RE_LLVM_STACK,
 )
