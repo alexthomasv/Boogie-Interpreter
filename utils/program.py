@@ -38,6 +38,7 @@ RE_PRINTF = re.compile(
 RE_SMACK     = re.compile(r'^__SMACK_values?[^ ]*$')
 RE_SMACK_VALUE  = re.compile(r"__SMACK_value\.(?:ref|i\d+)\b")
 RE_LLVM_LIFETIME = re.compile(r'@?llvm\.lifetime\.(?:start|end)\.[^\s(]+')
+RE_LLVM_STACK    = re.compile(r'@?llvm\.stack(?:save|restore)\b[^\s(]*')
 
 CALL_IGNORE_FN_PATTERNS = (
     RE_VERIFIER,
@@ -48,6 +49,7 @@ CALL_IGNORE_FN_PATTERNS = (
     RE_PRINTF,
     RE_SMACK,
     RE_LLVM_LIFETIME,
+    RE_LLVM_STACK,
 )
 
 CALL_IGNORE_LIST = set(
@@ -177,7 +179,7 @@ def initialize_code_metadata(proc):
     pc_to_stmt = {}
     label_to_pc = {}
     pc_to_block = {}
-    pc = 0
+    pc = 1  # Reserve PC 0 as virtual entry (no statement)
     for block in proc.body.blocks:
         label_to_pc[block.name] = pc
         for stmt in block.statements:
