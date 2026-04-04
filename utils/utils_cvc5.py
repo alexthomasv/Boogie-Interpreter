@@ -475,6 +475,16 @@ def convert_expr_cvc5(cvc5_fn_map, state_cache, solver, expr, mono_mem: bool) ->
 
             lhs, rhs = assign_fix_type(solver, lhs, rhs)
             return solver.mkTerm(cvc5_op, lhs, rhs)
+        elif expr.op == "==":
+            lhs = convert_expr_cvc5(cvc5_fn_map, state_cache, solver, expr.lhs, mono_mem)
+            rhs = convert_expr_cvc5(cvc5_fn_map, state_cache, solver, expr.rhs, mono_mem)
+            lhs, rhs = assign_fix_type(solver, lhs, rhs)
+            return solver.mkTerm(Kind.EQUAL, lhs, rhs)
+        elif expr.op == "!=":
+            lhs = convert_expr_cvc5(cvc5_fn_map, state_cache, solver, expr.lhs, mono_mem)
+            rhs = convert_expr_cvc5(cvc5_fn_map, state_cache, solver, expr.rhs, mono_mem)
+            lhs, rhs = assign_fix_type(solver, lhs, rhs)
+            return solver.mkTerm(Kind.DISTINCT, lhs, rhs)
         else:
             assert False, f"unknown binary operator {expr.op}"
     elif isinstance(expr, MapSelect):
@@ -585,6 +595,9 @@ def convert_expr_cvc5(cvc5_fn_map, state_cache, solver, expr, mono_mem: bool) ->
         if isinstance(expr, OldExpression):
             assert False
         elif isinstance(expr, LogicalNegation):
+            # If inner is BV1, convert to Bool before NOT
+            if unary_expr.getSort().isBitVector() and unary_expr.getSort().getBitVectorSize() == 1:
+                unary_expr = solver.mkTerm(Kind.EQUAL, unary_expr, solver.mkBitVector(1, 1))
             return solver.mkTerm(Kind.NOT, unary_expr)
         else:
             assert False, f"unsupported unary operator {expr.op}"
