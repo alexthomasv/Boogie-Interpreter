@@ -1065,11 +1065,14 @@ def to_boogie(cvc5_term: Term):
         return IfExpression(**combined)
     elif cvc5_term.getKind() == Kind.NOT:
         child = to_boogie(cvc5_term[0])
-        # In Boogie, ! only works on bool. If child is a function call
-        # returning i1 (e.g. $slt.i32), use == 0 instead of !.
-        if isinstance(child, FunctionApplication):
-            return BinaryExpression(lhs=child, op="==", rhs=IntegerLiteral(value=0))
-        return LogicalNegation(expression=child)
+        # In Boogie, ! only works on bool. If the child might return i1
+        # (function calls like $slt.i32, or any non-bool expression),
+        # use == 0 instead of !. BinaryExpression with <,>,<=,>= returns
+        # bool in Boogie so ! is safe for those.
+        if isinstance(child, BinaryExpression) and child.op in ("<", ">", "<=", ">=", "==", "!="):
+            return LogicalNegation(expression=child)
+        # For everything else (function calls, identifiers), use == 0
+        return BinaryExpression(lhs=child, op="==", rhs=IntegerLiteral(value=0))
     elif cvc5_term.getKind() == Kind.BITVECTOR_SGT:
         lhs = to_boogie(cvc5_term[0])
         rhs = to_boogie(cvc5_term[1])
