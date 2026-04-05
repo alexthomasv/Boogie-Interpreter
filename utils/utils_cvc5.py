@@ -551,6 +551,10 @@ _INT_ENC_FN_MAP = {
     "+":  (Kind.ADD, 2, None, None),
     "-":  (Kind.SUB, 2, None, None),
     "*":  (Kind.MULT, 2, None, None),
+    "/":  (Kind.DIVISION, 2, None, None),
+    "&&": (Kind.AND, 2, bool, bool),
+    "||": (Kind.OR, 2, bool, bool),
+    "==>": (Kind.IMPLIES, 2, None, None),
 }
 
 def get_fn_map():
@@ -893,6 +897,15 @@ KIND_TO_NUM = {
     Kind.SET_INSERT: 51,
     Kind.SET_EMPTY: 52,
     Kind.CONST_INTEGER: 53,
+    Kind.INTS_MODULUS: 54,
+    Kind.INTS_DIVISION: 55,
+    Kind.NEG: 56,
+    Kind.INTS_MODULUS_TOTAL: 57,
+    Kind.INTS_DIVISION_TOTAL: 58,
+    Kind.DIVISION: 59,
+    Kind.DIVISION_TOTAL: 60,
+    Kind.TO_INTEGER: 61,
+    Kind.IS_INTEGER: 62,
 }
 
 NUM_TO_KIND = {num: kind for kind, num in KIND_TO_NUM.items()}
