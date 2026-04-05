@@ -289,6 +289,18 @@ def generate_cvc5_function_map(solver: Solver):
     """
     Returns a lazily initialized more_func_map using the provided stateful solver.
     """
+    if _INTEGER_ENCODING:
+        # In integer encoding, sext/zext/trunc are identity (integers have no width)
+        int_cast_map = {}
+        for name in ["$sext.i32.i64", "$sext.i8.i32", "$sext.i16.i32",
+                      "$zext.i32.i64", "$zext.i8.i32", "$zext.i8.i64",
+                      "$zext.i1.i32", "$zext.i1.i64", "$zext.i16.i32", "$zext.i16.i64",
+                      "$trunc.i32.i8", "$trunc.i32.i16", "$trunc.i64.i8",
+                      "$trunc.i64.i16", "$trunc.i64.i32", "$trunc.i32.i1", "$trunc.i64.i1",
+                      "$p2i.ref.i64", "$i2p.i64.ref", "$bitcast.ref.ref"]:
+            int_cast_map[name] = (None, 1, None, None)
+        return int_cast_map | get_fn_map()
+
     return {
         # Sign extend
         "$sext.i32.i64": (solver.mkOp(Kind.BITVECTOR_SIGN_EXTEND, 64), 1, 32, 64),
@@ -304,7 +316,7 @@ def generate_cvc5_function_map(solver: Solver):
         "$zext.i1.i64": (solver.mkOp(Kind.BITVECTOR_ZERO_EXTEND, 64), 1, 1, 64),
         "$zext.i16.i32": (solver.mkOp(Kind.BITVECTOR_ZERO_EXTEND, 32), 1, 16, 32),
         "$zext.i16.i64": (solver.mkOp(Kind.BITVECTOR_ZERO_EXTEND, 64), 1, 16, 64),
-        
+
         # Truncate
         "$trunc.i32.i8": (solver.mkOp(Kind.BITVECTOR_EXTRACT, 8, 0), 1, 32, 8),
         "$trunc.i32.i16": (solver.mkOp(Kind.BITVECTOR_EXTRACT, 16, 0), 1, 32, 16),
@@ -313,7 +325,7 @@ def generate_cvc5_function_map(solver: Solver):
         "$trunc.i64.i32": (solver.mkOp(Kind.BITVECTOR_EXTRACT, 32, 0), 1, 64, 32),
         "$trunc.i32.i1": (solver.mkOp(Kind.BITVECTOR_EXTRACT, 1, 0), 1, 32, 1),
         "$trunc.i64.i1": (solver.mkOp(Kind.BITVECTOR_EXTRACT, 1, 0), 1, 64, 1),
-    } | fn_to_cvc5_op
+    } | get_fn_map()
 
 def extract_variable_terms(term) -> set[Term]:
     variables = set()
@@ -417,12 +429,178 @@ def cvc5_cast_to_bool(solver, expr):
     else:
         return expr
     
+# When True, SMACK integer encoding is active (type i32 = int).
+# All iN types map to integer sort instead of bitvector sort.
+_INTEGER_ENCODING = False
+
+# Integer encoding function map: arithmetic uses integer ops, comparisons
+# use integer comparisons returning ITE(cond, 1, 0).  'int_cmp' tag means
+# the convert_expr_cvc5 path should wrap the result in ITE → int.
+_INT_ENC_FN_MAP = {
+    # Arithmetic → integer ops
+    "$mul.ref": (Kind.MULT, 2, None, None),
+    "$mul.i64": (Kind.MULT, 2, None, None),
+    "$mul.i32": (Kind.MULT, 2, None, None),
+    "$mul.i8":  (Kind.MULT, 2, None, None),
+    "$add.ref": (Kind.ADD, 2, None, None),
+    "$add.i64": (Kind.ADD, 2, None, None),
+    "$add.i32": (Kind.ADD, 2, None, None),
+    "$add.i8":  (Kind.ADD, 2, None, None),
+    "$sub.ref": (Kind.SUB, 2, None, None),
+    "$sub.i64": (Kind.SUB, 2, None, None),
+    "$sub.i32": (Kind.SUB, 2, None, None),
+    "$sub.i16": (Kind.SUB, 2, None, None),
+    "$sub.i8":  (Kind.SUB, 2, None, None),
+    # Equality / inequality (already sort-polymorphic)
+    "$eq.ref": (Kind.EQUAL, 2, None, "int_cmp"),
+    "$eq.i64": (Kind.EQUAL, 2, None, "int_cmp"),
+    "$eq.i32": (Kind.EQUAL, 2, None, "int_cmp"),
+    "$eq.i8":  (Kind.EQUAL, 2, None, "int_cmp"),
+    "$eq.i1":  (Kind.EQUAL, 2, None, "int_cmp"),
+    "$ne.ref": (Kind.DISTINCT, 2, None, "int_cmp"),
+    "$ne.i64": (Kind.DISTINCT, 2, None, "int_cmp"),
+    "$ne.i32": (Kind.DISTINCT, 2, None, "int_cmp"),
+    "$ne.i8":  (Kind.DISTINCT, 2, None, "int_cmp"),
+    # Signed comparisons → integer comparisons
+    "$slt.i32": (Kind.LT, 2, None, "int_cmp"),
+    "$slt.i64": (Kind.LT, 2, None, "int_cmp"),
+    "$slt.i8":  (Kind.LT, 2, None, "int_cmp"),
+    "$slt.ref.bool": (Kind.LT, 2, None, bool),
+    "$sle.i32": (Kind.LEQ, 2, None, "int_cmp"),
+    "$sle.i64": (Kind.LEQ, 2, None, "int_cmp"),
+    "$sle.i8":  (Kind.LEQ, 2, None, "int_cmp"),
+    "$sle.ref.bool": (Kind.LEQ, 2, None, bool),
+    "$sgt.i32": (Kind.GT, 2, None, "int_cmp"),
+    "$sgt.i64": (Kind.GT, 2, None, "int_cmp"),
+    "$sgt.i8":  (Kind.GT, 2, None, "int_cmp"),
+    "$sgt.ref.bool": (Kind.GT, 2, None, bool),
+    "$sge.i32": (Kind.GEQ, 2, None, "int_cmp"),
+    "$sge.i64": (Kind.GEQ, 2, None, "int_cmp"),
+    "$sge.i8":  (Kind.GEQ, 2, None, "int_cmp"),
+    "$sge.ref.bool": (Kind.GEQ, 2, None, bool),
+    # Unsigned comparisons → same as signed in integer mode (no wraparound)
+    "$ult.i32": (Kind.LT, 2, None, "int_cmp"),
+    "$ult.i64": (Kind.LT, 2, None, "int_cmp"),
+    "$ult.i8":  (Kind.LT, 2, None, "int_cmp"),
+    "$ult.ref":  (Kind.LT, 2, None, "int_cmp"),
+    "$ule.i32": (Kind.LEQ, 2, None, "int_cmp"),
+    "$ule.i64": (Kind.LEQ, 2, None, "int_cmp"),
+    "$ule.i8":  (Kind.LEQ, 2, None, "int_cmp"),
+    "$ugt.i32": (Kind.GT, 2, None, "int_cmp"),
+    "$ugt.i64": (Kind.GT, 2, None, "int_cmp"),
+    "$ugt.i8":  (Kind.GT, 2, None, "int_cmp"),
+    "$uge.i32": (Kind.GEQ, 2, None, "int_cmp"),
+    "$uge.i64": (Kind.GEQ, 2, None, "int_cmp"),
+    "$uge.i8":  (Kind.GEQ, 2, None, "int_cmp"),
+    # Division / remainder → integer ops
+    "$sdiv.i32": (Kind.INTS_DIVISION, 2, None, None),
+    "$sdiv.i64": (Kind.INTS_DIVISION, 2, None, None),
+    "$udiv.i32": (Kind.INTS_DIVISION, 2, None, None),
+    "$udiv.i64": (Kind.INTS_DIVISION, 2, None, None),
+    "$srem.i32": (Kind.INTS_MODULUS, 2, None, None),
+    "$srem.i64": (Kind.INTS_MODULUS, 2, None, None),
+    "$urem.i32": (Kind.INTS_MODULUS, 2, None, None),
+    "$urem.i64": (Kind.INTS_MODULUS, 2, None, None),
+    # Bitwise ops — in integer encoding these are defined by SMACK axioms
+    # (e.g., 0 & 0 == 0, 0 & 1 == 0, etc.). We keep them as MULT/ADD
+    # approximations where safe, but mostly they appear in axioms only.
+    # For now, map to uninterpreted via None (identity) for single-arg,
+    # or just let them pass through the axiom system.
+    "$and.i32": (Kind.MULT, 2, None, None),  # approx: AND as multiply (both 0/1)
+    "$and.i64": (Kind.MULT, 2, None, None),
+    "$and.i8":  (Kind.MULT, 2, None, None),
+    "$and.i1":  (Kind.MULT, 2, None, None),
+    "$and.ref":  (Kind.MULT, 2, None, None),
+    "$or.i32":  (Kind.ADD, 2, None, None),  # approx for axiom constants
+    "$or.i64":  (Kind.ADD, 2, None, None),
+    "$or.i8":   (Kind.ADD, 2, None, None),
+    "$or.i1":   (Kind.ADD, 2, None, None),
+    "$or.ref":   (Kind.ADD, 2, None, None),
+    "$xor.i32": (Kind.SUB, 2, None, None),  # approx for axiom constants
+    "$xor.i64": (Kind.SUB, 2, None, None),
+    "$xor.i8":  (Kind.SUB, 2, None, None),
+    "$xor.i1":  (Kind.SUB, 2, None, None),
+    "$xor.ref":  (Kind.SUB, 2, None, None),
+    "$not.i1":  (Kind.SUB, 2, None, None),  # approx
+    "$not.i8":  (Kind.SUB, 2, None, None),
+    "$not.i32": (Kind.SUB, 2, None, None),
+    "$not.i64": (Kind.SUB, 2, None, None),
+    "$not.ref": (Kind.SUB, 2, None, None),
+    # Shift — integer approx
+    "$shl.i32":  (Kind.MULT, 2, None, None),
+    "$shl.i64":  (Kind.MULT, 2, None, None),
+    "$lshr.i32": (Kind.INTS_DIVISION, 2, None, None),
+    "$lshr.i64": (Kind.INTS_DIVISION, 2, None, None),
+    "$ashr.i32": (Kind.INTS_DIVISION, 2, None, None),
+    "$ashr.i64": (Kind.INTS_DIVISION, 2, None, None),
+    # Casts — identity in integer mode
+    "$bitcast.ref.ref": (None, 1, None, None),
+    "$p2i.ref.i64": (None, 1, None, None),
+    "$i2p.i64.ref": (None, 1, None, None),
+    # Mul.ref
+    "$mul.ref": (Kind.MULT, 2, None, None),
+    "$add.ref": (Kind.ADD, 2, None, None),
+    "$sub.ref": (Kind.SUB, 2, None, None),
+    # Binary expressions
+    "==": (Kind.EQUAL, 2, None, None),
+    "!=": (Kind.DISTINCT, 2, None, None),
+    "<":  (Kind.LT, 2, None, None),
+    "<=": (Kind.LEQ, 2, None, None),
+    ">":  (Kind.GT, 2, None, None),
+    ">=": (Kind.GEQ, 2, None, None),
+    "+":  (Kind.ADD, 2, None, None),
+    "-":  (Kind.SUB, 2, None, None),
+    "*":  (Kind.MULT, 2, None, None),
+}
+
+def get_fn_map():
+    """Return the appropriate function map for current encoding mode."""
+    return _INT_ENC_FN_MAP if _INTEGER_ENCODING else fn_to_cvc5_op
+
+
+def mk_const_like(solver, var_or_sort, value: int):
+    """Create a constant matching the sort of var_or_sort.
+    Works in both BV and integer encoding modes."""
+    from cvc5 import Kind as _K
+    sort = var_or_sort if hasattr(var_or_sort, 'isInteger') and not hasattr(var_or_sort, 'getKind') else var_or_sort.getSort()
+    if sort.isInteger():
+        return solver.mkInteger(str(value))
+    elif sort.isBitVector():
+        return solver.mkBitVector(sort.getBitVectorSize(), value)
+    elif sort.isBoolean():
+        return solver.mkBoolean(bool(value))
+    else:
+        # Fallback: integer if encoding is on, BV32 otherwise
+        if _INTEGER_ENCODING:
+            return solver.mkInteger(str(value))
+        return solver.mkBitVector(32, value)
+
+def set_integer_encoding(enabled: bool):
+    """Set whether the program uses SMACK integer encoding (type i32 = int)."""
+    global _INTEGER_ENCODING
+    _INTEGER_ENCODING = enabled
+
+def detect_integer_encoding(program):
+    """Detect if program uses SMACK integer encoding (type i32 = int).
+    Returns True if i32 is aliased to int."""
+    from interpreter.parser.declaration import TypeDeclaration
+    from interpreter.parser.type import IntegerType
+    for d in program.declarations:
+        if isinstance(d, TypeDeclaration):
+            if hasattr(d, 'names') and 'i32' in d.names:
+                if hasattr(d, 'type') and isinstance(d.type, IntegerType):
+                    return True
+    return False
+
 def convert_type_to_cvc5(solver, type_, mono_mem = True) -> Sort:
     if isinstance(type_, BooleanType):
         return solver.getBooleanSort()
     elif isinstance(type_, IntegerType):
         return solver.getIntegerSort()
     elif isinstance(type_, CustomType):
+        # In SMACK integer encoding, iN and ref types are just int (no BV semantics)
+        if _INTEGER_ENCODING and type_.name in ("i1", "i8", "i16", "i32", "i64", "i128", "ref"):
+            return solver.getIntegerSort()
         if type_.name == "i1":
             return solver.mkBitVectorSort(1)
         elif type_.name == "i8":
@@ -466,7 +644,7 @@ def convert_expr_cvc5(cvc5_fn_map, state_cache, solver, expr, mono_mem: bool) ->
         if expr.op in cvc5_fn_map:
             lhs = convert_expr_cvc5(cvc5_fn_map, state_cache, solver, expr.lhs, mono_mem)
             rhs = convert_expr_cvc5(cvc5_fn_map, state_cache, solver, expr.rhs, mono_mem)
-            if rhs.isBitVectorValue():
+            if not _INTEGER_ENCODING and rhs.isBitVectorValue():
                 rhs = sign_extend(solver, rhs, lhs.getSort().getBitVectorSize())
             cvc5_op, _, op_type, out_type = cvc5_fn_map[expr.op]
             if op_type == bool:
@@ -520,6 +698,39 @@ def convert_expr_cvc5(cvc5_fn_map, state_cache, solver, expr, mono_mem: bool) ->
         if expr.function.name in cvc5_fn_map:
             cvc5_op, _, op_bit_width, output_type = cvc5_fn_map[expr.function.name]
             arg_exprs = [convert_expr_cvc5(cvc5_fn_map, state_cache, solver, arg, mono_mem) for arg in expr.arguments]
+            if _INTEGER_ENCODING and op_bit_width is None:
+                # Integer encoding: no BV casts needed.
+                # Convert boolean args to integer (0/1) for arithmetic ops.
+                for idx, a in enumerate(arg_exprs):
+                    if a.getSort().isBoolean():
+                        arg_exprs[idx] = solver.mkTerm(
+                            Kind.ITE, a, solver.mkInteger(1), solver.mkInteger(0))
+                if output_type == bool:
+                    ret = solver.mkTerm(cvc5_op, *arg_exprs)
+                    # Ensure boolean sort
+                    if not ret.getSort().isBoolean():
+                        ret = cvc5_cast_to_bool(solver, ret)
+                elif output_type == "int_cmp":
+                    # Comparison returning integer 0/1: ITE(cond, 1, 0)
+                    cond = solver.mkTerm(cvc5_op, *arg_exprs)
+                    if not cond.getSort().isBoolean():
+                        cond = cvc5_cast_to_bool(solver, cond)
+                    ret = solver.mkTerm(Kind.ITE, cond,
+                                        solver.mkInteger(1), solver.mkInteger(0))
+                elif cvc5_op is None:
+                    assert len(arg_exprs) == 1
+                    ret = arg_exprs[0]
+                else:
+                    try:
+                        ret = solver.mkTerm(cvc5_op, *arg_exprs)
+                    except RuntimeError as e:
+                        import logging as _log
+                        _log.warning("[INT-ENC] mkTerm failed: op=%s func=%s args=%s sorts=%s err=%s",
+                                     cvc5_op, expr.function.name, arg_exprs,
+                                     [a.getSort() for a in arg_exprs], e)
+                        raise
+                return ret
+            # BV encoding path (original)
             arg_exprs = [cvc5_cast_to_bv(solver, arg, op_bit_width) for arg in arg_exprs]
             if output_type == bool:
                 ret = cvc5_cast_to_bool(solver, solver.mkTerm(cvc5_op, *arg_exprs))
@@ -602,10 +813,12 @@ def convert_expr_cvc5(cvc5_fn_map, state_cache, solver, expr, mono_mem: bool) ->
         else:
             assert False, f"unsupported unary operator {expr.op}"
     elif isinstance(expr, IntegerLiteral):
+        if _INTEGER_ENCODING:
+            return solver.mkInteger(str(expr.value))
         assert expr.value >= 0
         if expr.value == 0:
             return solver.mkBitVector(32, 0)
-        
+
         bits_needed = math.ceil(math.log2(expr.value))
         if bits_needed <= 32:
             bits_needed = 32
@@ -613,7 +826,7 @@ def convert_expr_cvc5(cvc5_fn_map, state_cache, solver, expr, mono_mem: bool) ->
             bits_needed = 64
         else:
             assert False, f"Requires more than 64 bits: {expr.value}"
-                
+
         return solver.mkBitVector(bits_needed, expr.value)
     elif isinstance(expr, BooleanLiteral):
         if expr.value:
@@ -679,6 +892,7 @@ KIND_TO_NUM = {
     Kind.SET_MEMBER: 50,
     Kind.SET_INSERT: 51,
     Kind.SET_EMPTY: 52,
+    Kind.CONST_INTEGER: 53,
 }
 
 NUM_TO_KIND = {num: kind for kind, num in KIND_TO_NUM.items()}
@@ -775,6 +989,11 @@ def deserialize_cvc5_term(state_cache, root_term):
             stack.pop()
             continue
 
+        if op_kind == Kind.CONST_INTEGER:
+            memo[term] = solver.mkInteger(str(term.value))
+            stack.pop()
+            continue
+
         if op_kind == Kind.SET_EMPTY:
             bv_sort = solver.mkBitVectorSort(term.bitwidth)
             memo[term] = mkEmptySet(mkSetSort(bv_sort))
@@ -815,7 +1034,58 @@ def deserialize_cvc5_term(state_cache, root_term):
             elems = child_terms[:-1]
             res = mkTerm(Kind.SET_INSERT, *elems, _set)
         else:
-            res = mkTerm(op_kind, *child_terms)
+            try:
+                res = mkTerm(op_kind, *child_terms)
+            except RuntimeError:
+                # Sort mismatch (e.g. BV op on integer children) — cast children
+                # to match. In integer encoding, BV ops become integer ops.
+                if _INTEGER_ENCODING:
+                    _int_kind_map = {
+                        Kind.BITVECTOR_ADD: Kind.ADD, Kind.BITVECTOR_SUB: Kind.SUB,
+                        Kind.BITVECTOR_MULT: Kind.MULT,
+                        Kind.BITVECTOR_SGE: Kind.GEQ, Kind.BITVECTOR_SGT: Kind.GT,
+                        Kind.BITVECTOR_SLE: Kind.LEQ, Kind.BITVECTOR_SLT: Kind.LT,
+                        Kind.BITVECTOR_UGE: Kind.GEQ, Kind.BITVECTOR_UGT: Kind.GT,
+                        Kind.BITVECTOR_ULE: Kind.LEQ, Kind.BITVECTOR_ULT: Kind.LT,
+                        Kind.BITVECTOR_SDIV: Kind.INTS_DIVISION,
+                        Kind.BITVECTOR_UDIV: Kind.INTS_DIVISION,
+                        Kind.BITVECTOR_SREM: Kind.INTS_MODULUS,
+                        Kind.BITVECTOR_UREM: Kind.INTS_MODULUS,
+                        Kind.BITVECTOR_AND: Kind.MULT,
+                        Kind.BITVECTOR_OR: Kind.ADD,
+                        Kind.BITVECTOR_XOR: Kind.SUB,
+                    }
+                    int_kind = _int_kind_map.get(op_kind)
+                    if int_kind:
+                        # Cast non-integer children to integer
+                        fixed = []
+                        for c in child_terms:
+                            if c.getSort().isBoolean():
+                                c = solver.mkTerm(Kind.ITE, c,
+                                                  solver.mkInteger(1), solver.mkInteger(0))
+                            elif c.getSort().isBitVector():
+                                # BV constant → integer
+                                if c.isBitVectorValue():
+                                    c = solver.mkInteger(str(int(c.getBitVectorValue(), 2)))
+                                else:
+                                    # BV variable — recreate as integer
+                                    try:
+                                        name = str(c)
+                                        c = solver.mkConst(solver.getIntegerSort(), name)
+                                    except Exception:
+                                        pass
+                            fixed.append(c)
+                        try:
+                            res = mkTerm(int_kind, *fixed)
+                        except RuntimeError:
+                            import logging as _log2
+                            _log2.warning("[DESER] int_kind=%s fixed_sorts=%s",
+                                          int_kind, [f.getSort() for f in fixed])
+                            raise
+                    else:
+                        raise
+                else:
+                    raise
 
         memo[term] = res
 
@@ -847,7 +1117,7 @@ def serialize_cvc5_term(term: Term):
         kind = parent.getKind()
 
         # 2. LEAF HANDLING: Memoize and pop immediately
-        if kind == Kind.CONSTANT or kind == Kind.CONST_BITVECTOR or kind == Kind.CONST_BOOLEAN:
+        if kind == Kind.CONSTANT or kind == Kind.CONST_BITVECTOR or kind == Kind.CONST_BOOLEAN or kind == Kind.CONST_INTEGER:
             done[parent] = HollowCvc5Term(parent)
             stack_pop()
             continue
@@ -915,6 +1185,8 @@ class HollowCvc5Term:
             self.var_name = f"{term}"
         elif kind == Kind.CONST_BITVECTOR:
             self.value = int(term.getBitVectorValue(10))
+        elif kind == Kind.CONST_INTEGER:
+            self.value = int(term.getIntegerValue())
         elif kind == Kind.CONST_BOOLEAN:
             self.value = bool(term.getBooleanValue())
         elif kind == Kind.BITVECTOR_EXTRACT:
@@ -938,8 +1210,10 @@ class HollowCvc5Term:
         if sort.isBitVector():
             self.bitwidth = sort.getBitVectorSize()
         if sort.isArray():
-            self.array_element_width = sort.getArrayElementSort().getBitVectorSize()
-            self.array_index_width = sort.getArrayIndexSort().getBitVectorSize()
+            elem_sort = sort.getArrayElementSort()
+            idx_sort = sort.getArrayIndexSort()
+            self.array_element_width = elem_sort.getBitVectorSize() if elem_sort.isBitVector() else 0
+            self.array_index_width = idx_sort.getBitVectorSize() if idx_sort.isBitVector() else 0
 
         self.op = KIND_TO_NUM[kind]
         self.children = []
@@ -1007,6 +1281,41 @@ def to_boogie(cvc5_term: Term):
         assert cvc5_term.isBitVectorValue(), f"Constant is not a bitvector: {cvc5_term}"
         value = int(cvc5_term.getBitVectorValue(), 2)
         return IntegerLiteral(value)
+    elif cvc5_term.getKind() == Kind.CONST_INTEGER:
+        return IntegerLiteral(int(cvc5_term.getIntegerValue()))
+    # Integer arithmetic ops (from integer encoding mode)
+    elif cvc5_term.getKind() == Kind.ADD:
+        lhs = to_boogie(cvc5_term[0])
+        rhs = to_boogie(cvc5_term[1])
+        return BinaryExpression(lhs=lhs, op="+", rhs=rhs)
+    elif cvc5_term.getKind() == Kind.SUB:
+        lhs = to_boogie(cvc5_term[0])
+        rhs = to_boogie(cvc5_term[1])
+        return BinaryExpression(lhs=lhs, op="-", rhs=rhs)
+    elif cvc5_term.getKind() == Kind.MULT:
+        lhs = to_boogie(cvc5_term[0])
+        rhs = to_boogie(cvc5_term[1])
+        return BinaryExpression(lhs=lhs, op="*", rhs=rhs)
+    elif cvc5_term.getKind() == Kind.GEQ:
+        lhs = to_boogie(cvc5_term[0])
+        rhs = to_boogie(cvc5_term[1])
+        return BinaryExpression(lhs=lhs, op=">=", rhs=rhs)
+    elif cvc5_term.getKind() == Kind.LEQ:
+        lhs = to_boogie(cvc5_term[0])
+        rhs = to_boogie(cvc5_term[1])
+        return BinaryExpression(lhs=lhs, op="<=", rhs=rhs)
+    elif cvc5_term.getKind() == Kind.LT:
+        lhs = to_boogie(cvc5_term[0])
+        rhs = to_boogie(cvc5_term[1])
+        return BinaryExpression(lhs=lhs, op="<", rhs=rhs)
+    elif cvc5_term.getKind() == Kind.GT:
+        lhs = to_boogie(cvc5_term[0])
+        rhs = to_boogie(cvc5_term[1])
+        return BinaryExpression(lhs=lhs, op=">", rhs=rhs)
+    elif cvc5_term.getKind() == Kind.NEG:
+        child = to_boogie(cvc5_term[0])
+        from interpreter.parser.expression import ArithmeticNegation
+        return ArithmeticNegation(expression=child)
     elif cvc5_term.getKind() == Kind.SELECT:
         memory_map = to_boogie(cvc5_term[0])
         load_addr = to_boogie(cvc5_term[1])
@@ -1019,8 +1328,28 @@ def to_boogie(cvc5_term: Term):
         from interpreter.parser.expression import MapUpdate
         return MapUpdate(map=memory_map, indexes=[store_addr], value=store_val)
     elif cvc5_term.getKind() == Kind.EQUAL:
-        lhs = to_boogie(cvc5_term[0])
-        rhs = to_boogie(cvc5_term[1])
+        lhs_term = cvc5_term[0]
+        rhs_term = cvc5_term[1]
+        lhs = to_boogie(lhs_term)
+        rhs = to_boogie(rhs_term)
+        # In integer encoding, fix bool/int mismatches in EQUAL:
+        # - bool == 1 → bool, bool == 0 → !bool
+        # - int == bool → int == (if bool then 1 else 0)
+        if _INTEGER_ENCODING:
+            def _is_bool_expr(e):
+                return isinstance(e, BinaryExpression) and e.op in ("<", ">", "<=", ">=", "==", "!=") or isinstance(e, LogicalNegation) or isinstance(e, BooleanLiteral)
+            for (a, b) in [(lhs, rhs), (rhs, lhs)]:
+                if isinstance(b, IntegerLiteral) and _is_bool_expr(a):
+                    if b.value == 1:
+                        return a
+                    elif b.value == 0:
+                        return LogicalNegation(expression=a)
+            # If one side is bool-typed (comparison) and the other is int-typed (variable),
+            # wrap the bool side in if-then-else to produce int
+            if _is_bool_expr(lhs) and not _is_bool_expr(rhs):
+                lhs = IfExpression(condition=lhs, then=IntegerLiteral(value=1), else_=IntegerLiteral(value=0))
+            elif _is_bool_expr(rhs) and not _is_bool_expr(lhs):
+                rhs = IfExpression(condition=rhs, then=IntegerLiteral(value=1), else_=IntegerLiteral(value=0))
         return BinaryExpression(lhs=lhs, op="==", rhs=rhs)
     elif cvc5_term.getKind() == Kind.AND:
         lhs = to_boogie(cvc5_term[0])
@@ -1058,6 +1387,18 @@ def to_boogie(cvc5_term: Term):
         zero_extend_expr = to_boogie(cvc5_term[0])
         return zero_extend_expr
     elif cvc5_term.getKind() == Kind.ITE:
+        # In integer encoding, ITE(cond, 1, 0) is how comparisons return int.
+        # For Boogie output, simplify back to the condition (bool in Boogie).
+        t, f = cvc5_term[1], cvc5_term[2]
+        if _INTEGER_ENCODING:
+            t_is_1 = (t.getKind() == Kind.CONST_INTEGER and int(t.getIntegerValue()) == 1)
+            f_is_0 = (f.getKind() == Kind.CONST_INTEGER and int(f.getIntegerValue()) == 0)
+            t_is_0 = (t.getKind() == Kind.CONST_INTEGER and int(t.getIntegerValue()) == 0)
+            f_is_1 = (f.getKind() == Kind.CONST_INTEGER and int(f.getIntegerValue()) == 1)
+            if t_is_1 and f_is_0:
+                return to_boogie(cvc5_term[0])  # ITE(cond, 1, 0) → cond
+            if t_is_0 and f_is_1:
+                return LogicalNegation(expression=to_boogie(cvc5_term[0]))  # ITE(cond, 0, 1) → !cond
         condition = to_boogie(cvc5_term[0])
         then_expr = to_boogie(cvc5_term[1])
         else_expr = to_boogie(cvc5_term[2])
