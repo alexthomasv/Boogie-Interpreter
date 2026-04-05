@@ -383,7 +383,8 @@ def cvc5_cast_to_int(solver, expr):
         zero = solver.mkInteger(0)
         one = solver.mkInteger(1)
         return solver.mkTerm(Kind.ITE, expr, one, zero)
-    # BV→Int: return as-is (caller should handle sort mismatch)
+    if expr.getSort().isBitVector():
+        return solver.mkTerm(Kind.BITVECTOR_UBV_TO_INT, expr)
     return expr
 
 def cvc5_cast_to_bv(solver, expr, bitwidth, zext=False) -> Term:
@@ -1044,6 +1045,19 @@ def deserialize_cvc5_term(state_cache, root_term):
             res = mkTerm(op, *child_terms)
         elif op_kind == Kind.SET_MEMBER:
             res = mkTerm(Kind.SET_MEMBER, *child_terms)
+        elif op_kind == Kind.INT_TO_BITVECTOR:
+            # INT_TO_BITVECTOR needs bitwidth index. Use the stored bitwidth.
+            bw = term.bitwidth if term.bitwidth > 0 else 64
+            op = mkOp(Kind.INT_TO_BITVECTOR, bw)
+            res = mkTerm(op, *child_terms)
+        elif op_kind in (Kind.BITVECTOR_UBV_TO_INT, Kind.BITVECTOR_SBV_TO_INT):
+            # Unary BV→Int conversion. If child is already Int (integer encoding
+            # deserialized it), just return the child directly.
+            c = child_terms[0]
+            if c.getSort() == solver.getIntegerSort():
+                res = c
+            else:
+                res = mkTerm(op_kind, c)
         elif op_kind == Kind.SET_INSERT:
             _set = child_terms[-1]
             elems = child_terms[:-1]
