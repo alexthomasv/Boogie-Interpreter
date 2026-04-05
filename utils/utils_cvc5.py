@@ -630,9 +630,8 @@ def convert_type_to_cvc5(solver, type_, mono_mem = True) -> Sort:
     elif isinstance(type_, MapType):
         domain = [convert_type_to_cvc5(solver, t) for t in type_.domain]
         if mono_mem:
-            elementSort = solver.mkBitVectorSort(64)
+            elementSort = solver.getIntegerSort() if _INTEGER_ENCODING else solver.mkBitVectorSort(64)
         else:
-            # For all memory maps, we assume 64-bit elements
             elementSort = convert_type_to_cvc5(solver, type_.range)
             
 
@@ -983,9 +982,11 @@ def deserialize_cvc5_term(state_cache, root_term):
                     res = mkConst(bool_sort, term.var_name)
                 elif sort_kind == SortKind.BITVECTOR_SORT:
                     res = mkConst(solver.mkBitVectorSort(term.bitwidth), term.var_name)
+                elif sort_kind == SortKind.INTEGER_SORT:
+                    res = mkConst(solver.getIntegerSort(), term.var_name)
                 elif sort_kind == SortKind.ARRAY_SORT:
-                    idx_sort = solver.mkBitVectorSort(term.array_index_width)
-                    elem_sort = solver.mkBitVectorSort(term.array_element_width)
+                    idx_sort = solver.mkBitVectorSort(term.array_index_width) if term.array_index_width > 0 else solver.getIntegerSort()
+                    elem_sort = solver.mkBitVectorSort(term.array_element_width) if term.array_element_width > 0 else solver.getIntegerSort()
                     res = mkConst(solver.mkArraySort(idx_sort, elem_sort), term.var_name)
                 else:
                     raise ValueError(f"Unknown sort: {sort_kind}")
