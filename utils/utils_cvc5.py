@@ -383,8 +383,6 @@ def cvc5_cast_to_int(solver, expr):
         zero = solver.mkInteger(0)
         one = solver.mkInteger(1)
         return solver.mkTerm(Kind.ITE, expr, one, zero)
-    if expr.getSort().isBitVector():
-        return solver.mkTerm(Kind.BITVECTOR_UBV_TO_INT, expr)
     return expr
 
 def cvc5_cast_to_bv(solver, expr, bitwidth, zext=False) -> Term:
