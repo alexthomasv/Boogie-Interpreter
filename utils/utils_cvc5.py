@@ -383,6 +383,8 @@ def cvc5_cast_to_int(solver, expr):
         zero = solver.mkInteger(0)
         one = solver.mkInteger(1)
         return solver.mkTerm(Kind.ITE, expr, one, zero)
+    # BV→Int: not supported (causes solver hangs on ubv_to_int terms).
+    # Integer encoding + BV memory arrays need SMACK-level fix.
     return expr
 
 def cvc5_cast_to_bv(solver, expr, bitwidth, zext=False) -> Term:
