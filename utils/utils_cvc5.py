@@ -377,14 +377,15 @@ def dump_solver_assertions(solver, logger=None):
             IndentLogger.debug(f"  - {term_to_string(a)}")
 
 def cvc5_cast_to_int(solver, expr):
+    if expr.getSort() == solver.getIntegerSort():
+        return expr
     if expr.getSort() == solver.getBooleanSort():
-        # Create terms for 0 and 1
         zero = solver.mkInteger(0)
         one = solver.mkInteger(1)
-        # Use an ITE (if-then-else) term to cast the boolean to an integer
         return solver.mkTerm(Kind.ITE, expr, one, zero)
-    else:
-        return expr
+    if expr.getSort().isBitVector():
+        return solver.mkTerm(Kind.BITVECTOR_UBV_TO_INT, expr)
+    return expr
 
 def cvc5_cast_to_bv(solver, expr, bitwidth, zext=False) -> Term:
     extend_fn = zero_extend if zext else sign_extend
@@ -906,6 +907,8 @@ KIND_TO_NUM = {
     Kind.DIVISION_TOTAL: 60,
     Kind.TO_INTEGER: 61,
     Kind.IS_INTEGER: 62,
+    Kind.BITVECTOR_UBV_TO_INT: 63,
+    Kind.BITVECTOR_SBV_TO_INT: 64,
 }
 
 NUM_TO_KIND = {num: kind for kind, num in KIND_TO_NUM.items()}
