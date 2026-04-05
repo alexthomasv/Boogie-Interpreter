@@ -1121,7 +1121,10 @@ def deserialize_cvc5_term(state_cache, root_term):
 
     # Write all newly resolved terms back to the global LRU cache
     for k, v in memo.items():
-        global_cache[k] = v
+        try:
+            global_cache[k] = v
+        except RuntimeError:
+            pass  # LRU eviction race — safe to skip
 
     return memo[root_term]
 
