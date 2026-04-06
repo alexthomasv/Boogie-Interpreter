@@ -466,6 +466,42 @@ fn lower_call(py: Python<'_>, stmt: &Bound<'_, PyAny>, intern: &mut InternTable)
         return Ok(Stmt::CallIgnored);
     }
 
+    // HACL* memzero — safe to ignore in concrete execution
+    if proc_name.contains("Lib_Memzero0_memzero") {
+        return Ok(Stmt::CallIgnored);
+    }
+
+    // $free — safe to ignore in concrete execution
+    if proc_name == "$free" {
+        return Ok(Stmt::CallIgnored);
+    }
+
+    // External library calls that can't be interpreted concretely.
+    // Treating as no-ops lets the scaffolding code around them execute.
+    if proc_name == "memset.cross_product"
+        || proc_name == "mbedtls_aesni_has_support.cross_product"
+        || proc_name == "generic_chacha.cross_product"
+        || proc_name == "br_i31_decode_mod.cross_product"
+        || proc_name.starts_with("CRYPTO_")
+        || proc_name.starts_with("EVP_")
+        || proc_name.starts_with("EC_KEY_")
+        || proc_name.starts_with("ECDSA_")
+        || proc_name.starts_with("RSA_")
+        || proc_name.starts_with("BN_")
+        || proc_name.starts_with("i2d_")
+        || proc_name.starts_with("OSSL_")
+        || proc_name.starts_with("mbedtls_")
+        || proc_name.starts_with("br_i31_")
+        || proc_name.starts_with("br_i15_")
+        || proc_name.starts_with("br_ecdsa_")
+        || proc_name.starts_with("br_hmac_")
+        || proc_name.starts_with("br_sha")
+        || proc_name.starts_with("llvm.bswap")
+        || proc_name == "__SMACK_nondet_int"
+    {
+        return Ok(Stmt::CallIgnored);
+    }
+
     if proc_name == "time.cross_product" {
         let args = lower_call_args(py, stmt, intern)?;
         let assignments = lower_call_assignments(stmt, intern)?;
@@ -550,6 +586,10 @@ fn is_ignored_call(name: &str) -> bool {
     if name.contains("llvm.lifetime.") {
         return true;
     }
+    // llvm.stacksave / llvm.stackrestore
+    if name.contains("llvm.stacksave") || name.contains("llvm.stackrestore") {
+        return true;
+    }
     false
 }
 
@@ -629,8 +669,18 @@ fn lower_memset_assume(
         }
         "==>" => {
             let lhs = expression.getattr("lhs")?;
-            let fn_obj = lhs.getattr("function")?;
-            let fn_name: String = fn_obj.getattr("name")?.extract()?;
+            let fn_name: String = if let Ok(fn_obj) = lhs.getattr("function") {
+                fn_obj.getattr("name")?.extract()?
+            } else if let Ok(op) = lhs.getattr("op") {
+                let op_str: String = op.extract()?;
+                match op_str.as_str() {
+                    "<" => "$slt_binary".to_string(),
+                    "<=" => "$sle_binary".to_string(),
+                    _ => format!("__binary_{}", op_str),
+                }
+            } else {
+                "__unknown".to_string()
+            };
 
             if fn_name.starts_with("$slt") {
                 let m_ret = find_var_by_suffix_ref(&free_vars, "M.ret");
@@ -649,7 +699,9 @@ fn lower_memset_assume(
                     len,
                 })
             } else {
-                panic!("Unknown memset quantified expression fn: {}", fn_name);
+                // Unknown quantified pattern (e.g. integer encoding binary ops)
+                // Treat as assume true (no-op) — the Python interpreter handles these
+                Ok(Stmt::AssumeTrue)
             }
         }
         _ => panic!("Unknown memset quantified expression op: {}", op),
@@ -681,8 +733,18 @@ fn lower_memcpy_assume(
         }
         "==>" => {
             let lhs = expression.getattr("lhs")?;
-            let fn_obj = lhs.getattr("function")?;
-            let fn_name: String = fn_obj.getattr("name")?.extract()?;
+            let fn_name: String = if let Ok(fn_obj) = lhs.getattr("function") {
+                fn_obj.getattr("name")?.extract()?
+            } else if let Ok(op) = lhs.getattr("op") {
+                let op_str: String = op.extract()?;
+                match op_str.as_str() {
+                    "<" => "$slt_binary".to_string(),
+                    "<=" => "$sle_binary".to_string(),
+                    _ => format!("__binary_{}", op_str),
+                }
+            } else {
+                "__unknown".to_string()
+            };
 
             if fn_name.starts_with("$slt") {
                 let m_ret = find_var_by_suffix_slice(var_names, "$M.ret");
@@ -701,7 +763,7 @@ fn lower_memcpy_assume(
                     len,
                 })
             } else {
-                panic!("Unknown memcpy quantified expression fn: {}", fn_name);
+                Ok(Stmt::AssumeTrue)
             }
         }
         _ => panic!("Unknown memcpy quantified expression op: {}", op),
@@ -781,7 +843,7 @@ fn lower_expr(py: Python<'_>, expr: &Bound<'_, PyAny>, intern: &mut InternTable)
             // Store functions
             if matches!(
                 f_name.as_str(),
-                "$store.i8" | "$store.i16" | "$store.i32" | "$store.i64" | "$store.ref"
+                "$store.i8" | "$store.i16" | "$store.i32" | "$store.i64" | "$store.i128" | "$store.ref"
             ) {
                 let bw = store_load_bitwidth(&f_name);
                 let map = lower_expr(py, &args_list.get_item(0)?, intern)?;
@@ -798,7 +860,7 @@ fn lower_expr(py: Python<'_>, expr: &Bound<'_, PyAny>, intern: &mut InternTable)
             // Load functions
             if matches!(
                 f_name.as_str(),
-                "$load.i8" | "$load.i16" | "$load.i32" | "$load.i64" | "$load.ref"
+                "$load.i8" | "$load.i16" | "$load.i32" | "$load.i64" | "$load.i128" | "$load.ref"
             ) {
                 let bw = store_load_bitwidth(&f_name);
                 let map = lower_expr(py, &args_list.get_item(0)?, intern)?;
@@ -891,6 +953,7 @@ fn store_load_bitwidth(name: &str) -> u8 {
         "i16" => 16,
         "i32" => 32,
         "i64" | "ref" => 64,
+        "i128" => 128,
         s => panic!("Unknown store/load type: {}", s),
     }
 }
@@ -903,17 +966,20 @@ fn resolve_builtin(name: &str) -> Option<BuiltinFn> {
         "$mul.ref" | "$mul.i64" => BuiltinFn::Mul { bits: 64 },
         "$mul.i32" => BuiltinFn::Mul { bits: 32 },
         "$mul.i8" => BuiltinFn::Mul { bits: 8 },
+        "$mul.i128" => BuiltinFn::Mul { bits: 128 },
 
         // Add
         "$add.ref" | "$add.i64" => BuiltinFn::Add { bits: 64 },
         "$add.i32" => BuiltinFn::Add { bits: 32 },
         "$add.i8" => BuiltinFn::Add { bits: 8 },
+        "$add.i128" => BuiltinFn::Add { bits: 128 },
 
         // Sub
         "$sub.ref" | "$sub.i64" => BuiltinFn::Sub { bits: 64 },
         "$sub.i32" => BuiltinFn::Sub { bits: 32 },
         "$sub.i16" => BuiltinFn::Sub { bits: 16 },
         "$sub.i8" => BuiltinFn::Sub { bits: 8 },
+        "$sub.i128" => BuiltinFn::Sub { bits: 128 },
 
         // Not (unary)
         "$not.i1" => BuiltinFn::Not { bits: 1 },
@@ -927,18 +993,21 @@ fn resolve_builtin(name: &str) -> Option<BuiltinFn> {
         "$and.i32" => BuiltinFn::And { bits: 32 },
         "$and.i8" => BuiltinFn::And { bits: 8 },
         "$and.i1" => BuiltinFn::And { bits: 1 },
+        "$and.i128" => BuiltinFn::And { bits: 128 },
 
         // Or
         "$or.ref" | "$or.i64" => BuiltinFn::Or { bits: 64 },
         "$or.i32" => BuiltinFn::Or { bits: 32 },
         "$or.i8" => BuiltinFn::Or { bits: 8 },
         "$or.i1" => BuiltinFn::Or { bits: 1 },
+        "$or.i128" => BuiltinFn::Or { bits: 128 },
 
         // Xor
         "$xor.ref" | "$xor.i64" => BuiltinFn::Xor { bits: 64 },
         "$xor.i32" => BuiltinFn::Xor { bits: 32 },
         "$xor.i8" => BuiltinFn::Xor { bits: 8 },
         "$xor.i1" => BuiltinFn::Xor { bits: 1 },
+        "$xor.i128" => BuiltinFn::Xor { bits: 128 },
 
         // Equality
         "$ne.ref" | "$ne.i64" => BuiltinFn::BvNe { bits: 64 },
@@ -963,11 +1032,11 @@ fn resolve_builtin(name: &str) -> Option<BuiltinFn> {
         "$ult.i32" => BuiltinFn::Ult { bits: 32 },
         "$ult.i8" => BuiltinFn::Ult { bits: 8 },
 
-        "$ugt.i64" => BuiltinFn::Ugt { bits: 64 },
+        "$ugt.ref" | "$ugt.i64" => BuiltinFn::Ugt { bits: 64 },
         "$ugt.i32" => BuiltinFn::Ugt { bits: 32 },
         "$ugt.i8" => BuiltinFn::Ugt { bits: 8 },
 
-        "$uge.i64" => BuiltinFn::Uge { bits: 64 },
+        "$uge.ref" | "$uge.i64" => BuiltinFn::Uge { bits: 64 },
         "$uge.i32" => BuiltinFn::Uge { bits: 32 },
         "$uge.i8" => BuiltinFn::Uge { bits: 8 },
 
@@ -992,7 +1061,7 @@ fn resolve_builtin(name: &str) -> Option<BuiltinFn> {
         "$slt.i32" => BuiltinFn::Slt { bits: 32 },
         "$slt.i8" => BuiltinFn::Slt { bits: 8 },
 
-        "$ule.i64" => BuiltinFn::Ule { bits: 64 },
+        "$ule.ref" | "$ule.i64" => BuiltinFn::Ule { bits: 64 },
         "$ule.i32" => BuiltinFn::Ule { bits: 32 },
         "$ule.i8" => BuiltinFn::Ule { bits: 8 },
 
@@ -1009,14 +1078,17 @@ fn resolve_builtin(name: &str) -> Option<BuiltinFn> {
         "$shl.i64" => BuiltinFn::Shl { bits: 64 },
         "$shl.i32" => BuiltinFn::Shl { bits: 32 },
         "$shl.i8" => BuiltinFn::Shl { bits: 8 },
+        "$shl.i128" => BuiltinFn::Shl { bits: 128 },
 
         "$lshr.i64" => BuiltinFn::Lshr { bits: 64 },
         "$lshr.i32" => BuiltinFn::Lshr { bits: 32 },
         "$lshr.i8" => BuiltinFn::Lshr { bits: 8 },
+        "$lshr.i128" => BuiltinFn::Lshr { bits: 128 },
 
         "$ashr.i64" => BuiltinFn::Ashr { bits: 64 },
         "$ashr.i32" => BuiltinFn::Ashr { bits: 32 },
         "$ashr.i8" => BuiltinFn::Ashr { bits: 8 },
+        "$ashr.i128" => BuiltinFn::Ashr { bits: 128 },
 
         // Casts
         "$bitcast.ref.ref" => BuiltinFn::Bitcast,
@@ -1036,6 +1108,11 @@ fn resolve_builtin(name: &str) -> Option<BuiltinFn> {
         "$zext.i1.i64" => BuiltinFn::Zext { src: 1, dst: 64 },
         "$zext.i16.i32" => BuiltinFn::Zext { src: 16, dst: 32 },
         "$zext.i16.i64" => BuiltinFn::Zext { src: 16, dst: 64 },
+        "$zext.i32.i128" => BuiltinFn::Zext { src: 32, dst: 128 },
+        "$zext.i64.i128" => BuiltinFn::Zext { src: 64, dst: 128 },
+
+        // Sign extension (i128)
+        "$sext.i64.i128" => BuiltinFn::Sext { src: 64, dst: 128 },
 
         // Truncation
         "$trunc.i32.i8" => BuiltinFn::Trunc { dst: 8 },
@@ -1045,6 +1122,8 @@ fn resolve_builtin(name: &str) -> Option<BuiltinFn> {
         "$trunc.i64.i32" => BuiltinFn::Trunc { dst: 32 },
         "$trunc.i32.i1" => BuiltinFn::Trunc { dst: 1 },
         "$trunc.i64.i1" => BuiltinFn::Trunc { dst: 1 },
+        "$trunc.i128.i64" => BuiltinFn::Trunc { dst: 64 },
+        "$trunc.i128.i32" => BuiltinFn::Trunc { dst: 32 },
 
         _ => return None,
     };
