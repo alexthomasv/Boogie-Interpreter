@@ -16,6 +16,10 @@ class Environment:
         self.stackFrames = [Context()]
         self.alloc_addr = 0
         self.alloc_addr_shadow = 0
+        # Type-aware trace: store values matching declared types.
+        # Built by interpreter from program declarations.
+        self._var_types = {}       # var_name → Type object
+        self._int_type_names = set()  # type names that alias to int (e.g. {"i32", "i8", ...})
 
         # Traces all variables
         self.watch_all_vars = True
@@ -99,6 +103,23 @@ class Environment:
         # Skip shadow variables — consumer (init_positive_examples) skips them
         if key[-7:] == '.shadow':
             return
+
+        # Store value consistent with variable's declared type.
+        # Integer-typed vars → signed. Bitvector-typed vars → unsigned.
+        vtype = self._var_types.get(key)
+        if vtype is not None:
+            from interpreter.parser.type import IntegerType, CustomType
+            if isinstance(vtype, IntegerType):
+                if value >= (1 << 63):
+                    value = value - (1 << 64)
+            elif isinstance(vtype, CustomType):
+                if vtype.name.startswith('bv'):
+                    width = int(vtype.name[2:])
+                    value = value & ((1 << width) - 1)
+                elif vtype.name in self._int_type_names:
+                    # Type aliases to int (e.g. type i32 = int)
+                    if value >= (1 << 63):
+                        value = value - (1 << 64)
 
         cb = self.curr_block or 'GLOBAL'
 
@@ -227,7 +248,8 @@ class Environment:
                         writer.write(struct.pack('<BI', 3, len(pairs)))  # enc_flag=3
                         buf = bytearray(len(pairs) * 12)  # 8 bytes value + 4 bytes iter_id
                         for i, (val, iter_id) in enumerate(pairs):
-                            struct.pack_into('<QI', buf, i * 12, val & ((1 << 64) - 1), iter_id)
+                            # Use signed packing for negative values (integer-typed vars)
+                            struct.pack_into('<qI', buf, i * 12, val, iter_id)
                         writer.write(buf)
 
                 # PC registry (enc_flag=2, 4-byte raw ints)

@@ -159,7 +159,17 @@ class BoogieInterpreter:
     def _initialize_vars(self, declarations, kind="global"):
         """Initialize variables from declarations (works for both global and local)."""
         for decl in declarations:
-            if isinstance(decl, StorageDeclaration):
+            # Check ConstantDeclaration BEFORE StorageDeclaration (it's a subclass)
+            if isinstance(decl, ConstantDeclaration):
+                # Use input value for nondet constants ($u0, $u1, etc.) if provided
+                name = decl.names[0]
+                init_val = 0
+                if self.inputs and hasattr(self.inputs, 'variables'):
+                    inp = self.inputs.variables.get(name)
+                    if inp and hasattr(inp, 'value'):
+                        init_val = inp.value
+                self.env.set_value(name, init_val, silent=True)
+            elif isinstance(decl, StorageDeclaration):
                 if isinstance(decl.type, MapType):
                     assert len(decl.names) == 1
                     if kind == "global":
@@ -172,10 +182,6 @@ class BoogieInterpreter:
                     )
                 else:
                     self.env.set_value(decl.names[0], 0, silent=True)
-            elif isinstance(decl, ConstantDeclaration):
-                if kind == "global":
-                    log.debug(f"Initializing global constant: {decl.names[0]} {type(decl.names[0])}")
-                self.env.set_value(decl.names[0], 0, silent=True)
             elif kind == "local":
                 assert False, f"Unknown declaration type: {decl}"
 
@@ -198,7 +204,9 @@ class BoogieInterpreter:
                 log.debug(f"Concretizing procedure input: {name} to {self.program_inputs[name]}")
                 self.env.set_value(name, self.program_inputs[name].value)
             else:
-                log.debug(f"No value for {name}")
+                log.warning(f"No concrete value found for parameter {name} — "
+                            f"defaulting to 0. Check @params mapping in input file "
+                            f"(expected {name}, available: {list(self.program_inputs.keys())})")
                 self.env.set_value(name, 0, silent=True)
 
     # ----------------------------------------------------------
@@ -593,6 +601,12 @@ class BoogieInterpreter:
             self._handle_printf(stmt)
             return
         if any(pat.match(proc) for pat in CALL_IGNORE_FN_PATTERNS):
+            # For nondet functions, assign return value from input if available
+            if stmt.assignments and self.inputs and hasattr(self.inputs, 'variables'):
+                for v in stmt.assignments:
+                    inp = self.inputs.variables.get(str(v.name))
+                    if inp and hasattr(inp, 'value'):
+                        self._set_value(v.name, inp.value)
             return
         if proc == "putc.cross_product":
             return
@@ -1003,6 +1017,28 @@ def process_single_input(input_file, test_name, test_path, force=False, full_tra
         environment.full_trace = full_trace
         if no_read_trace:
             environment.LOG_READ = False
+
+        # Build type map for type-aware trace values
+        from interpreter.parser.declaration import TypeDeclaration, StorageDeclaration
+        from interpreter.parser.type import IntegerType
+        # Find type names that alias to int (e.g. type i32 = int)
+        for d in program.declarations:
+            if isinstance(d, TypeDeclaration) and hasattr(d, 'type') and isinstance(d.type, IntegerType):
+                for n in d.names:
+                    environment._int_type_names.add(n)
+        # Map variable names to their declared types
+        for d in program.declarations:
+            if isinstance(d, StorageDeclaration):
+                for n in d.names:
+                    environment._var_types[n] = d.type
+        # Also add locals from the entry procedure
+        entry = find_entry_point(program)
+        if entry and entry.body:
+            for local_decl in entry.body.locals:
+                if isinstance(local_decl, StorageDeclaration):
+                    for n in local_decl.names:
+                        environment._var_types[n] = local_decl.type
+
         interp = BoogieInterpreter(environment, program_inputs, input_name)
         interp.preprocess(program)
 
