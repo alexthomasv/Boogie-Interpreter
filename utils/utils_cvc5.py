@@ -1,6 +1,6 @@
 from cvc5 import Kind, Term, Sort, Solver, SortKind
 import math
-from interpreter.parser.expression import FunctionApplication, MapSelect, StorageIdentifier, ProcedureIdentifier, BinaryExpression, UnaryExpression, BooleanLiteral, IntegerLiteral, OldExpression, LogicalNegation, QuantifiedExpression, IfExpression, Identifier
+from interpreter.parser.expression import FunctionApplication, MapSelect, StorageIdentifier, ProcedureIdentifier, BinaryExpression, UnaryExpression, BooleanLiteral, IntegerLiteral, OldExpression, LogicalNegation, ArithmeticNegation, QuantifiedExpression, IfExpression, Identifier
 from interpreter.parser.statement import AssertStatement, AssumeStatement, AssignStatement, Block, CallStatement, GotoStatement, HavocStatement
 from interpreter.parser.declaration import StorageDeclaration, ImplementationDeclaration, ProcedureDeclaration
 from interpreter.parser.type import BooleanType, IntegerType, CustomType, MapType
@@ -643,7 +643,10 @@ def convert_type_to_cvc5(solver, type_, mono_mem = True) -> Sort:
 
 def convert_expr_cvc5(cvc5_fn_map, state_cache, solver, expr, mono_mem: bool) -> Term:
     if isinstance(expr, StorageIdentifier) or isinstance(expr, ProcedureIdentifier):
-        return state_cache.cvc5_var(expr.name)
+        result = state_cache.cvc5_var(expr.name)
+        if result is None:
+            raise ValueError(f"cvc5_var returned None for '{expr.name}'")
+        return result
     elif isinstance(expr, BinaryExpression):
         if expr.op in cvc5_fn_map:
             lhs = convert_expr_cvc5(cvc5_fn_map, state_cache, solver, expr.lhs, mono_mem)
@@ -814,8 +817,13 @@ def convert_expr_cvc5(cvc5_fn_map, state_cache, solver, expr, mono_mem: bool) ->
             if unary_expr.getSort().isBitVector() and unary_expr.getSort().getBitVectorSize() == 1:
                 unary_expr = solver.mkTerm(Kind.EQUAL, unary_expr, solver.mkBitVector(1, 1))
             return solver.mkTerm(Kind.NOT, unary_expr)
+        elif isinstance(expr, ArithmeticNegation):
+            if _INTEGER_ENCODING or unary_expr.getSort().isInteger():
+                return solver.mkTerm(Kind.NEG, unary_expr)
+            else:
+                return solver.mkTerm(Kind.BITVECTOR_NEG, unary_expr)
         else:
-            assert False, f"unsupported unary operator {expr.op}"
+            assert False, f"unsupported unary expression {type(expr).__name__}"
     elif isinstance(expr, IntegerLiteral):
         if _INTEGER_ENCODING:
             return solver.mkInteger(str(expr.value))
@@ -908,6 +916,9 @@ KIND_TO_NUM = {
     Kind.IS_INTEGER: 62,
     Kind.BITVECTOR_UBV_TO_INT: 63,
     Kind.BITVECTOR_SBV_TO_INT: 64,
+    Kind.FORALL: 65,
+    Kind.VARIABLE_LIST: 66,
+    Kind.VARIABLE: 67,
 }
 
 NUM_TO_KIND = {num: kind for kind, num in KIND_TO_NUM.items()}
@@ -992,6 +1003,25 @@ def deserialize_cvc5_term(state_cache, root_term):
                     raise ValueError(f"Unknown sort: {sort_kind}")
                 from AbductUtils import put_cvc5_var
                 put_cvc5_var(state_cache.redis, term.var_name, res)
+            memo[term] = res
+            stack.pop()
+            continue
+
+        if op_kind == Kind.VARIABLE:
+            # Bound variable (e.g. quantified x in forall) — always create fresh
+            sort_kind = NUM_TO_SORT[term.type]
+            if sort_kind == SortKind.BOOLEAN_SORT:
+                res = solver.mkVar(bool_sort, term.var_name)
+            elif sort_kind == SortKind.BITVECTOR_SORT:
+                res = solver.mkVar(solver.mkBitVectorSort(term.bitwidth), term.var_name)
+            elif sort_kind == SortKind.INTEGER_SORT:
+                res = solver.mkVar(solver.getIntegerSort(), term.var_name)
+            elif sort_kind == SortKind.ARRAY_SORT:
+                idx_s = solver.mkBitVectorSort(term.array_index_width) if term.array_index_width > 0 else solver.getIntegerSort()
+                elem_s = solver.mkBitVectorSort(term.array_element_width) if term.array_element_width > 0 else solver.getIntegerSort()
+                res = solver.mkVar(solver.mkArraySort(idx_s, elem_s), term.var_name)
+            else:
+                raise ValueError(f"Unknown sort for VARIABLE: {sort_kind}")
             memo[term] = res
             stack.pop()
             continue
@@ -1150,7 +1180,7 @@ def serialize_cvc5_term(term: Term):
         kind = parent.getKind()
 
         # 2. LEAF HANDLING: Memoize and pop immediately
-        if kind == Kind.CONSTANT or kind == Kind.CONST_BITVECTOR or kind == Kind.CONST_BOOLEAN or kind == Kind.CONST_INTEGER:
+        if kind == Kind.CONSTANT or kind == Kind.VARIABLE or kind == Kind.CONST_BITVECTOR or kind == Kind.CONST_BOOLEAN or kind == Kind.CONST_INTEGER:
             done[parent] = HollowCvc5Term(parent)
             stack_pop()
             continue
@@ -1214,7 +1244,7 @@ class HollowCvc5Term:
         self._hash = None
 
         kind = term.getKind()
-        if kind == Kind.CONSTANT:
+        if kind == Kind.CONSTANT or kind == Kind.VARIABLE:
             self.var_name = f"{term}"
         elif kind == Kind.CONST_BITVECTOR:
             self.value = int(term.getBitVectorValue(10))
