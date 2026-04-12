@@ -1153,8 +1153,13 @@ def deserialize_cvc5_term(state_cache, root_term):
     for k, v in memo.items():
         try:
             global_cache[k] = v
-        except RuntimeError:
-            pass  # LRU eviction race — safe to skip
+        except (RuntimeError, KeyError) as e:
+            import logging as _log
+            _log.error("[DESER-CACHE] LRU cache corrupt on insert: %s(%s) term=%r hash=%s cache_size=%d/%d",
+                       type(e).__name__, e, k, hash(k), len(global_cache), global_cache.maxsize)
+            # Drain the corrupt cache to prevent cascading failures
+            global_cache.clear()
+            global_cache[k] = v
 
     return memo[root_term]
 
