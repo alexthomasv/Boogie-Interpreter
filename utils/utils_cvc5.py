@@ -1155,9 +1155,17 @@ def deserialize_cvc5_term(state_cache, root_term):
             global_cache[k] = v
         except (RuntimeError, KeyError) as e:
             import logging as _log
-            _log.error("[DESER-CACHE] LRU cache corrupt on insert: %s(%s) term=%r hash=%s cache_size=%d/%d",
-                       type(e).__name__, e, k, hash(k), len(global_cache), global_cache.maxsize)
-            # Drain the corrupt cache to prevent cascading failures
+            # Inspect cache inconsistency: find keys in __order but not __data
+            try:
+                order_keys = list(global_cache._LRUCache__order.keys())
+                data_keys = set(global_cache._Cache__data.keys())
+                orphans = [(ok, hash(ok)) for ok in order_keys if ok not in data_keys]
+                _log.error("[DESER-CACHE] LRU corrupt: %s term=%r hash=%d size=%d/%d orphans=%d %s",
+                           type(e).__name__, k, hash(k), len(global_cache), global_cache.maxsize,
+                           len(orphans), orphans[:3])
+            except Exception:
+                _log.error("[DESER-CACHE] LRU corrupt: %s term=%r", type(e).__name__, k)
+            # Drain the corrupt cache and retry
             global_cache.clear()
             global_cache[k] = v
 
