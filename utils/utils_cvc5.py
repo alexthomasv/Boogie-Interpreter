@@ -502,32 +502,30 @@ _INT_ENC_FN_MAP = {
     "$srem.i64": (Kind.INTS_MODULUS, 2, None, None),
     "$urem.i32": (Kind.INTS_MODULUS, 2, None, None),
     "$urem.i64": (Kind.INTS_MODULUS, 2, None, None),
-    # Bitwise ops — in integer encoding these are defined by SMACK axioms
-    # (e.g., 0 & 0 == 0, 0 & 1 == 0, etc.). We keep them as MULT/ADD
-    # approximations where safe, but mostly they appear in axioms only.
-    # For now, map to uninterpreted via None (identity) for single-arg,
-    # or just let them pass through the axiom system.
-    "$and.i32": (Kind.MULT, 2, None, None),  # approx: AND as multiply (both 0/1)
+    # Bitwise ops — handled by _INT_ENC_BITWISE_OPS in convert_expr_cvc5
+    # (int→bv→op→nat wrapping for exact semantics). These entries are
+    # kept as placeholders so the fn_map lookup succeeds; the actual
+    # cvc5_op value is ignored because the bitwise path runs first.
+    "$and.i32": (Kind.MULT, 2, None, None),
     "$and.i64": (Kind.MULT, 2, None, None),
     "$and.i8":  (Kind.MULT, 2, None, None),
     "$and.i1":  (Kind.MULT, 2, None, None),
     "$and.ref":  (Kind.MULT, 2, None, None),
-    "$or.i32":  (Kind.ADD, 2, None, None),  # approx for axiom constants
+    "$or.i32":  (Kind.ADD, 2, None, None),
     "$or.i64":  (Kind.ADD, 2, None, None),
     "$or.i8":   (Kind.ADD, 2, None, None),
     "$or.i1":   (Kind.ADD, 2, None, None),
     "$or.ref":   (Kind.ADD, 2, None, None),
-    "$xor.i32": (Kind.SUB, 2, None, None),  # approx for axiom constants
+    "$xor.i32": (Kind.SUB, 2, None, None),
     "$xor.i64": (Kind.SUB, 2, None, None),
     "$xor.i8":  (Kind.SUB, 2, None, None),
     "$xor.i1":  (Kind.SUB, 2, None, None),
     "$xor.ref":  (Kind.SUB, 2, None, None),
-    "$not.i1":  (Kind.SUB, 2, None, None),  # approx
+    "$not.i1":  (Kind.SUB, 2, None, None),
     "$not.i8":  (Kind.SUB, 2, None, None),
     "$not.i32": (Kind.SUB, 2, None, None),
     "$not.i64": (Kind.SUB, 2, None, None),
     "$not.ref": (Kind.SUB, 2, None, None),
-    # Shift — integer approx
     "$shl.i32":  (Kind.MULT, 2, None, None),
     "$shl.i64":  (Kind.MULT, 2, None, None),
     "$lshr.i32": (Kind.INTS_DIVISION, 2, None, None),
@@ -653,7 +651,10 @@ def convert_expr_cvc5(cvc5_fn_map, state_cache, solver, expr, mono_mem: bool) ->
             rhs = convert_expr_cvc5(cvc5_fn_map, state_cache, solver, expr.rhs, mono_mem)
             if not _INTEGER_ENCODING and rhs.isBitVectorValue():
                 rhs = sign_extend(solver, rhs, lhs.getSort().getBitVectorSize())
-            cvc5_op, _, op_type, out_type = cvc5_fn_map[expr.op]
+            fn_entry = cvc5_fn_map[expr.op]
+            cvc5_op = fn_entry[0]
+
+            _, _, op_type, out_type = fn_entry[:4]
             if op_type == bool:
                 lhs = cvc5_cast_to_bool(solver, lhs)
                 rhs = cvc5_cast_to_bool(solver, rhs)
@@ -703,8 +704,11 @@ def convert_expr_cvc5(cvc5_fn_map, state_cache, solver, expr, mono_mem: bool) ->
         return solver.mkTerm(Kind.ITE, cond, then_branch, else_branch)
     elif isinstance(expr, FunctionApplication):
         if expr.function.name in cvc5_fn_map:
-            cvc5_op, _, op_bit_width, output_type = cvc5_fn_map[expr.function.name]
+            fn_entry = cvc5_fn_map[expr.function.name]
+            cvc5_op = fn_entry[0]
             arg_exprs = [convert_expr_cvc5(cvc5_fn_map, state_cache, solver, arg, mono_mem) for arg in expr.arguments]
+
+            _, _, op_bit_width, output_type = fn_entry[:4]
             if _INTEGER_ENCODING and op_bit_width is None:
                 # Integer encoding: no BV casts needed.
                 # Convert boolean args to integer (0/1) for arithmetic ops.
@@ -1155,18 +1159,14 @@ def deserialize_cvc5_term(state_cache, root_term):
             global_cache[k] = v
         except (RuntimeError, KeyError) as e:
             import logging as _log
-            # Inspect cache inconsistency: find keys in __order but not __data
-            try:
-                order_keys = list(global_cache._LRUCache__order.keys())
-                data_keys = set(global_cache._Cache__data.keys())
-                orphans = [(ok, hash(ok)) for ok in order_keys if ok not in data_keys]
-                _log.error("[DESER-CACHE] LRU corrupt: %s term=%r hash=%d size=%d/%d orphans=%d %s",
-                           type(e).__name__, k, hash(k), len(global_cache), global_cache.maxsize,
-                           len(orphans), orphans[:3])
-            except Exception:
-                _log.error("[DESER-CACHE] LRU corrupt: %s term=%r", type(e).__name__, k)
-            # Drain the corrupt cache and retry
-            global_cache.clear()
+            _log.error("[DESER-CACHE] LRU corrupt: %s term=%r — replacing cache", type(e).__name__, k)
+            # The cache's internal OrderedDict is inconsistent.
+            # .clear() itself can crash (iterates the corrupt dict),
+            # so replace the entire cache object instead.
+            from cachetools import LRUCache
+            new_cache = LRUCache(maxsize=global_cache.maxsize)
+            state_cache.cvc5_term_cache = new_cache
+            global_cache = new_cache
             global_cache[k] = v
 
     return memo[root_term]
@@ -1346,6 +1346,127 @@ def deserialize_state_key(state_cache, state_key):
     inter_key = pickle.loads(state_key)
     inter_key[1].predicate = deserialize_cvc5_term(state_cache, inter_key[1].predicate)
     return inter_key
+
+
+_HOLLOW_INFIX = {
+    0: "==", 1: "!=",
+    5: "+", 6: "*", 7: "-", 8: "/",
+    10: "<=", 11: ">=", 12: "<", 13: ">",
+    14: "=>",
+    18: "+", 19: "*", 22: "<u", 25: "&", 26: ">>u", 27: "|",
+    28: "<<", 29: "^", 30: "-",
+    33: "<s", 34: "srem", 35: "<=u", 36: ">=s", 37: ">=u",
+    39: "/u", 40: ">u", 41: ">s", 42: ">>a", 43: "%u",
+    44: "<=s", 45: "/s",
+    54: "%i", 55: "/i", 57: "%it", 58: "/it", 60: "/t",
+}
+_HOLLOW_PREFIX = {4: "!", 32: "~", 38: "-", 56: "-"}
+
+
+def hollow_to_str(term, max_depth=8):
+    """Pretty-print a HollowCvc5Term tree without cvc5 context."""
+    if term is None:
+        return "<None>"
+    if max_depth <= 0:
+        return "..."
+    op = term.op
+    # Leaves
+    if op in (49, 67):  # CONSTANT, VARIABLE
+        return term.var_name or f"<var_op={op}>"
+    if op == 47:  # CONST_BITVECTOR
+        return f"{term.value}bv{term.bitwidth}"
+    if op == 53:  # CONST_INTEGER
+        return str(term.value)
+    if op == 48:  # CONST_BOOLEAN
+        return "true" if term.value else "false"
+    if op == 52:  # SET_EMPTY
+        return "{}"
+
+    nd = max_depth - 1
+    kids = [hollow_to_str(c, nd) for c in term.children]
+
+    if op == 15 and len(kids) == 2:  # SELECT
+        return f"{kids[0]}[{kids[1]}]"
+    if op == 16 and len(kids) == 3:  # STORE
+        return f"store({kids[0]}, {kids[1]}, {kids[2]})"
+    if op == 9 and len(kids) == 3:  # ITE
+        return f"ite({kids[0]}, {kids[1]}, {kids[2]})"
+    if op == 23 and len(kids) == 1:  # BITVECTOR_EXTRACT
+        return f"({kids[0]})[{term.bv_extract_end}:{term.bv_extract_start}]"
+    if op == 21 and len(kids) == 1:  # SIGN_EXTEND
+        return f"sext{term.bv_sign_extend_bitwidth}({kids[0]})"
+    if op == 24 and len(kids) == 1:  # ZERO_EXTEND
+        return f"zext{term.bv_zero_extend_bitwidth}({kids[0]})"
+    if op == 20 and len(kids) == 1:  # INT_TO_BITVECTOR
+        return f"int2bv({kids[0]})"
+    if op == 61 and len(kids) == 1:  # TO_INTEGER
+        return f"to_int({kids[0]})"
+    if op == 62 and len(kids) == 1:  # IS_INTEGER
+        return f"is_int({kids[0]})"
+    if op == 63 and len(kids) == 1:  # BITVECTOR_UBV_TO_INT
+        return f"bv2nat({kids[0]})"
+    if op == 64 and len(kids) == 1:  # BITVECTOR_SBV_TO_INT
+        return f"sbv2int({kids[0]})"
+    if op == 31:  # BITVECTOR_CONCAT
+        return "concat(" + ", ".join(kids) + ")"
+    if op == 17 and kids:  # APPLY_UF
+        return f"{kids[0]}({', '.join(kids[1:])})"
+    if op == 2:  # AND
+        return "(" + " && ".join(kids) + ")" if len(kids) > 1 else (kids[0] if kids else "true")
+    if op == 3:  # OR
+        return "(" + " || ".join(kids) + ")" if len(kids) > 1 else (kids[0] if kids else "false")
+    if op == 46:  # XOR
+        return "(" + " xor ".join(kids) + ")"
+    if op == 50 and len(kids) == 2:  # SET_MEMBER
+        return f"({kids[0]} in {kids[1]})"
+    if op == 51:  # SET_INSERT
+        return "insert(" + ", ".join(kids) + ")"
+    if op == 65 and len(kids) >= 2:  # FORALL
+        return f"forall({kids[0]}. {kids[1]})"
+    if op == 66:  # VARIABLE_LIST
+        return "[" + ", ".join(kids) + "]"
+
+    if op in _HOLLOW_PREFIX and len(kids) == 1:
+        return f"{_HOLLOW_PREFIX[op]}({kids[0]})"
+    if op in _HOLLOW_INFIX and len(kids) == 2:
+        return f"({kids[0]} {_HOLLOW_INFIX[op]} {kids[1]})"
+
+    return f"<op={op}>({', '.join(kids)})"
+
+
+def classify_hollow(predicate):
+    """Classify a pickle-loaded Predicate by origin / structural type.
+
+    Mirrors StateIterator._classify_predicate but operates on the HollowCvc5Term
+    form so it works without a live cvc5 solver context.
+    """
+    origin = getattr(predicate, "origin", None)
+    if origin in ("reach", "df-guard", "custom"):
+        return origin
+
+    hollow = predicate.predicate
+    if hollow is None:
+        return "non-mem"
+
+    if getattr(predicate, "eq_predicate", False) and hollow.op == 0 and len(hollow.children) == 2:
+        l, r = hollow.children
+        if l.op == 15 and r.op == 15:
+            return "mem-partial"
+        if l.type == 4 and r.type == 4:
+            return "mem-full"
+
+    if getattr(predicate, "eq_const_predicate", False):
+        def _has_select(t, d=8):
+            if t is None or d == 0:
+                return False
+            if t.op == 15:
+                return True
+            return any(_has_select(c, d - 1) for c in t.children)
+        if _has_select(hollow):
+            return "mem-partial"
+
+    return "non-mem"
+
 
 def to_boogie(cvc5_term: Term):
     if cvc5_term.getKind() == Kind.CONSTANT:
