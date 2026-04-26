@@ -1343,9 +1343,10 @@ class HollowCvc5Term:
         object.__setattr__(self, '_hash', None)
 
 def deserialize_state_key(state_cache, state_key):
-    inter_key = pickle.loads(state_key)
-    inter_key[1].predicate = deserialize_cvc5_term(state_cache, inter_key[1].predicate)
-    return inter_key
+    from src.proof_obligation import ProofObligation
+    pc, predicate = pickle.loads(state_key)
+    predicate.predicate = deserialize_cvc5_term(state_cache, predicate.predicate)
+    return ProofObligation(pc, predicate)
 
 
 _HOLLOW_INFIX = {
@@ -2205,6 +2206,7 @@ def _is_smt_body(body):
 
 def str_to_key(str_key, ae, state_cache):
     from predicate import Predicate
+    from src.proof_obligation import ProofObligation
     from cvc5 import Kind
 
     # Try to parse as (pc, smt-lib-expr)
@@ -2251,7 +2253,7 @@ def str_to_key(str_key, ae, state_cache):
                 ret_term.eq_predicate = True
         else:
             ret_term = Predicate(cvc5_term)
-        return (pc, ret_term)
+        return ProofObligation(pc, ret_term)
 
     x = parse_constraint_tuple(str_key)
     pc = x["id"]
@@ -2362,5 +2364,4 @@ def str_to_key(str_key, ae, state_cache):
     else:
         raise ValueError(f"Unsupported constraint type '{x['type']}' for: {str_key}")
 
-    state_key = (pc, ret_term)
-    return state_key
+    return ProofObligation(pc, ret_term)
