@@ -1,10 +1,13 @@
-"""Generate input template JSON from a compiled Boogie program package.
+"""Generate input templates and deterministic seeds from a compiled package.
 
 Primary source: the C harness file (has param names, types, struct fields, buffer sizes).
 Fallback: BPL annotations ({:array}, {:field}) when no C source is found.
 """
 
+import copy
+import hashlib
 import pickle
+import random
 import re
 from collections import defaultdict
 from pathlib import Path
@@ -16,7 +19,7 @@ from interpreter.parser.statement import CallStatement
 from interpreter.utils.inputs import (
     preprocess_external_inputs, process_field_stmt, process_array_stmt,
 )
-from interpreter.utils.program import RE_SMACK
+from interpreter.utils.program import RE_SMACK, RE_SMACK_NONDET, RE_VERIFIER
 
 
 # ---------------------------------------------------------------------------
@@ -336,6 +339,49 @@ def _get_bpl_param_names(program):
     return names, impl_decl, proc_decl
 
 
+def _safe_c_name(name):
+    """Return a declaration-safe C-ish name for generated .input files."""
+    out = re.sub(r'[^A-Za-z0-9_$]', '_', str(name).lstrip('$'))
+    if not out:
+        out = "input"
+    if out[0].isdigit():
+        out = f"v_{out}"
+    return out
+
+
+def _find_havoc_vars(program):
+    """Find source-level nondet vars that can be driven by int_seq inputs.
+
+    SMACK-heavy crypto packages contain thousands of compiler-internal
+    ``__SMACK_nondet_*`` temporaries.  Exposing all of them makes templates
+    unusable and does not help target user-controlled paths.  Keep only the
+    inline source-level nondet names, such as Code2Inv's
+    ``inline$__VERIFIER_nondet_int$...`` variables.
+    """
+    names = []
+    seen = set()
+    for decl in getattr(program, "declarations", []):
+        if isinstance(decl, ImplementationDeclaration):
+            for block in getattr(decl.body, "blocks", []):
+                for stmt in getattr(block, "statements", []):
+                    if not isinstance(stmt, CallStatement):
+                        continue
+                    proc_name = getattr(getattr(stmt, "procedure", None),
+                                        "name", "")
+                    if not (RE_VERIFIER.match(proc_name)
+                            or RE_SMACK_NONDET.match(proc_name)):
+                        continue
+                    for ident in getattr(stmt, "assignments", []) or []:
+                        name = str(getattr(ident, "name", ident))
+                        if ".shadow" in name or name in seen:
+                            continue
+                        if "__VERIFIER_nondet" not in name and "__SMACK_nondet" not in name:
+                            continue
+                        seen.add(name)
+                        names.append(name)
+    return names
+
+
 def _gather_struct_layout(proc, param_name):
     """BPL fallback: determine struct field layout from {:field}/{:array} annotations."""
     layout = []
@@ -460,27 +506,21 @@ def generate_template(pkg_path):
     return _generate_bpl_fallback(program, bpl_param_names, impl_decl, proc_decl)
 
 
-def generate_c_template(pkg_path):
-    """Generate a C-style .input template from a compiled package.
-
-    Returns the template as a string.
-    """
+def _load_template_context(pkg_path):
+    """Load template plus enough metadata to render C-style .input files."""
     pkg_path = Path(pkg_path)
     name = pkg_path.name.removesuffix("_pkg")
-
-    # Get JSON template first (reuses all the C harness parsing logic)
     json_template = generate_template(pkg_path)
 
     program_pkl = pkg_path / f"{name}.pkl"
     with open(program_pkl, 'rb') as f:
         program = pickle.load(f)
-    bpl_param_names, impl_decl, proc_decl = _get_bpl_param_names(program)
+    _bpl_param_names, impl_decl, _proc_decl = _get_bpl_param_names(program)
     entry_name = impl_decl.name.rsplit('.cross_product', 1)[0]
 
-    # Try to get C param info for type names
     examples_dir = pkg_path.parent.parent / "examples"
     c_file = _find_c_harness(entry_name, examples_dir)
-    c_params = {}  # c_name -> c_type
+    c_params = {}
     c_name_order = []
     if c_file:
         params, _ = _parse_c_harness(c_file, entry_name)
@@ -488,23 +528,90 @@ def generate_c_template(pkg_path):
             c_params[c_name] = c_type
             c_name_order.append(c_name)
 
-    # Build @params mapping
     params_map = []
+    seen_bpl = set()
     for i, entry in enumerate(json_template):
         bpl_name = entry['var']
         comment = entry.get('_comment', '')
-        # Extract C name from comment (format: "c_name — ...")
-        c_name = comment.split(' —')[0].split(' ')[0] if '—' in comment else \
-                 (c_name_order[i] if i < len(c_name_order) else bpl_name)
+        if '—' in comment:
+            c_name = comment.split('—', 1)[0].strip().split(' ')[0]
+        elif ' - ' in comment:
+            c_name = comment.split(' - ', 1)[0].strip().split(' ')[0]
+        else:
+            c_name = c_name_order[i] if i < len(c_name_order) else bpl_name
         params_map.append((c_name, bpl_name))
+        seen_bpl.add(bpl_name)
 
+    havoc_vars = [v for v in _find_havoc_vars(program) if v not in seen_bpl]
+    for var in havoc_vars:
+        params_map.append((_safe_c_name(var), var))
+
+    return {
+        "name": name,
+        "json_template": json_template,
+        "params_map": params_map,
+        "c_params": c_params,
+        "havoc_vars": havoc_vars,
+    }
+
+
+def _with_havoc_entries(json_template, havoc_vars):
+    """Return template entries plus explicit int_seq entries for havoc vars."""
+    entries = copy.deepcopy(json_template)
+    for var in havoc_vars:
+        entries.append({
+            'var': var,
+            'private': False,
+            '_comment': f'{var} - havoc sequence',
+            'havoc_seq': [0],
+        })
+    return entries
+
+
+def _lookup_c_name(params_map, bpl_name, index):
+    if index < len(params_map) and params_map[index][1] == bpl_name:
+        return params_map[index][0]
+    for c_name, mapped in params_map:
+        if mapped == bpl_name:
+            return c_name
+    return _safe_c_name(bpl_name)
+
+
+def _buffer_expr(contents, size):
+    contents = str(contents or f'zeros({size})')
+    if (contents.startswith("zeros(") or contents.startswith("ones(")
+            or contents.startswith("random(") or contents.startswith("bytes(")
+            or contents.startswith("{") or contents.startswith('"')):
+        return contents
+    if contents.startswith("0x"):
+        return f'bytes("{contents}", {size})'
+    return contents
+
+
+def _scalar_text(value, size=None):
+    if isinstance(value, str):
+        try:
+            return str(int(value, 16)) if value.startswith("0x") else str(int(value, 0))
+        except (TypeError, ValueError):
+            return value
+    try:
+        val = int(value)
+    except (TypeError, ValueError):
+        val = 0
+    if size is not None and size > 0:
+        val &= (1 << (size * 8)) - 1
+    return str(val)
+
+
+def _render_c_input(pkg_name, json_template, params_map, c_params):
     lines = []
-    lines.append(f"// Auto-generated by: swoosh gen-input {name}")
+    lines.append(f"// Auto-generated by: swoosh gen-input {pkg_name}")
     lines.append(f"// @params {' '.join(f'{c}:{b}' for c, b in params_map)}")
     lines.append("")
 
     for i, entry in enumerate(json_template):
-        c_name = params_map[i][0]
+        bpl_name = entry['var']
+        c_name = _lookup_c_name(params_map, bpl_name, i)
         c_type = c_params.get(c_name, '')
         is_private = entry.get('private', False)
         comment = entry.get('_comment', '')
@@ -513,7 +620,6 @@ def generate_c_template(pkg_path):
             lines.append("// @private")
 
         if entry.get('struct'):
-            # Struct declaration
             struct_type = c_type.replace('const ', '').replace(' *', '').replace('*', '').strip()
             if not struct_type:
                 struct_type = f"struct_{c_name}"
@@ -523,34 +629,141 @@ def generate_c_template(pkg_path):
                 fname = field['name']
                 if 'buffer' in field:
                     buf = field['buffer']
-                    lines.append(f"    .{fname} = zeros({buf['size']}),")
+                    size = int(buf.get('size', 0) or 0)
+                    expr = _buffer_expr(buf.get('contents'), size)
+                    lines.append(f"    .{fname} = {expr},")
                 else:
-                    # Scalar — convert hex value to int for readability
-                    hex_val = field.get('value', '0x0')
-                    try:
-                        int_val = int(hex_val, 16)
-                        lines.append(f"    .{fname} = {int_val},")
-                    except (ValueError, TypeError):
-                        lines.append(f"    .{fname} = {hex_val},")
+                    lines.append(
+                        f"    .{fname} = "
+                        f"{_scalar_text(field.get('value', 0), field.get('size'))},")
             lines.append("};")
 
         elif entry.get('buffers'):
             buf = entry['buffers'][0]
-            size = buf['size']
+            size = int(buf.get('size', 0) or 0)
             c_type_str = c_type if c_type else 'unsigned char'
-            # Clean up type for declaration
             c_type_str = c_type_str.replace('const ', '').replace('*', '').strip()
             if not c_type_str or c_type_str in ('ref',):
                 c_type_str = 'unsigned char'
             lines.append(f"// {comment}")
-            lines.append(f"{c_type_str} {c_name}[{size}] = zeros({size});")
+            lines.append(
+                f"{c_type_str} {c_name}[{size}] = "
+                f"{_buffer_expr(buf.get('contents'), size)};")
+
+        elif 'havoc_seq' in entry:
+            seq = ", ".join(str(int(v)) for v in entry.get('havoc_seq', []))
+            lines.append(f"// {comment or bpl_name + ' - havoc sequence'}")
+            lines.append(f"int_seq {c_name} = {{{seq}}};")
 
         elif 'value' in entry:
             c_type_str = c_type if c_type else 'size_t'
             c_type_str = c_type_str.replace('const ', '').strip()
             lines.append(f"// {comment}")
-            lines.append(f"{c_type_str} {c_name} = {entry['value']};")
+            lines.append(f"{c_type_str} {c_name} = {_scalar_text(entry['value'])};")
 
         lines.append("")
 
     return '\n'.join(lines)
+
+
+def _repeat_hex(size, pattern):
+    if size <= 0:
+        return "0x"
+    data = bytes(pattern[i % len(pattern)] for i in range(size))
+    return "0x" + data.hex()
+
+
+def _random_hex(size, salt):
+    rng = random.Random(int(hashlib.sha256(salt.encode()).hexdigest()[:16], 16))
+    return "0x" + bytes(rng.randrange(0, 256) for _ in range(size)).hex()
+
+
+def _set_buffer(buf, variant, salt):
+    size = int(buf.get('size', 0) or 0)
+    if variant == "zeros":
+        buf['contents'] = f'zeros({size})'
+    elif variant == "ones":
+        buf['contents'] = f'ones({size})'
+    elif variant == "boundaries":
+        buf['contents'] = _repeat_hex(size, [0x00, 0x01, 0x7f, 0x80, 0xfe, 0xff])
+    elif variant == "alternating":
+        buf['contents'] = _repeat_hex(size, [0xaa, 0x55])
+    elif variant == "random":
+        buf['contents'] = _random_hex(size, salt)
+
+
+def _set_scalar(container, key, variant, index, size=None):
+    values = {
+        "zeros": 0,
+        "ones": 1,
+        "boundaries": [0, 1, 127, 128, 255, 256, 65535][index % 7],
+        "alternating": 0xaa if index % 2 == 0 else 0x55,
+        "random": random.Random(index + 0x51A7).randrange(0, 1 << 32),
+    }
+    value = values.get(variant, 0)
+    if size is not None and size > 0:
+        value &= (1 << (size * 8)) - 1
+        container[key] = '0x' + f"{value:0{size * 2}x}"
+    else:
+        container[key] = value
+
+
+def _apply_seed_variant(entries, variant):
+    scalar_idx = 0
+    for entry in entries:
+        if entry.get('buffers'):
+            for buf_idx, buf in enumerate(entry['buffers']):
+                _set_buffer(buf, variant, f"{variant}:{entry['var']}:{buf_idx}")
+        elif entry.get('struct'):
+            for field_idx, field in enumerate(entry['struct']):
+                if 'buffer' in field:
+                    _set_buffer(field['buffer'], variant,
+                                f"{variant}:{entry['var']}:{field_idx}")
+                elif 'value' in field:
+                    _set_scalar(field, 'value', variant, scalar_idx,
+                                size=field.get('size'))
+                    scalar_idx += 1
+        elif 'havoc_seq' in entry:
+            entry['havoc_seq'] = {
+                "zeros": [0],
+                "ones": [1, 0],
+                "boundaries": [1, 1, 0],
+                "alternating": [1, 0, 1, 0],
+                "random": [1, 1, 1, 0],
+            }.get(variant, [0])
+        elif 'value' in entry:
+            _set_scalar(entry, 'value', variant, scalar_idx)
+            scalar_idx += 1
+
+
+def generate_seed_inputs(pkg_path):
+    """Return deterministic seed .input contents keyed by filename."""
+    ctx = _load_template_context(pkg_path)
+    base_entries = _with_havoc_entries(
+        ctx["json_template"], ctx["havoc_vars"])
+
+    variants = [
+        ("seed_00_zeros.input", "zeros"),
+        ("seed_01_ones.input", "ones"),
+        ("seed_02_boundaries.input", "boundaries"),
+        ("seed_03_alternating.input", "alternating"),
+        ("seed_04_random.input", "random"),
+    ]
+    out = {}
+    for filename, variant in variants:
+        entries = copy.deepcopy(base_entries)
+        _apply_seed_variant(entries, variant)
+        out[filename] = _render_c_input(
+            ctx["name"], entries, ctx["params_map"], ctx["c_params"])
+    return out
+
+
+def generate_c_template(pkg_path):
+    """Generate a C-style .input template from a compiled package.
+
+    Returns the template as a string.
+    """
+    ctx = _load_template_context(pkg_path)
+    entries = _with_havoc_entries(ctx["json_template"], ctx["havoc_vars"])
+    return _render_c_input(
+        ctx["name"], entries, ctx["params_map"], ctx["c_params"])

@@ -47,18 +47,28 @@ def _expand_contents(value):
 class Input:
     """Program input variable.
 
-    Three kinds:
-      - Scalar:  value is set (int)
-      - Buffer:  buffers is a list of {"contents": "0x...", "size": N}
-      - Struct:  struct is an ordered list of fields, each either:
-                   {"name": ..., "size": N, "value": "0x..."}           — scalar field
-                   {"name": ..., "size": N, "buffer": {"contents":..}}  — pointer field
+    Four kinds:
+      - Scalar:    value is set (int)
+      - Buffer:    buffers is a list of {"contents": "0x...", "size": N}
+      - Struct:    struct is an ordered list of fields, each either:
+                     {"name": ..., "size": N, "value": "0x..."}           — scalar field
+                     {"name": ..., "size": N, "buffer": {"contents":..}}  — pointer field
+      - Havoc seq: havoc_seq is a list[int] consumed in order by
+                   successive havocs of the named variable.  Used to
+                   pin SMACK-inlined ``__VERIFIER_nondet_int()``
+                   calls (e.g. ``inline$__VERIFIER_nondet_int$0$$i0``)
+                   so the interpreter can drive a specific concrete
+                   counterexample path through nondet-driven loops.
+                   When the sequence is exhausted, the interpreter
+                   falls back to 0 (which naturally exits
+                   ``while(__VERIFIER_nondet_int())`` loops).
     """
     name: str
     private: bool
     value: int | None = None
     buffers: list | None = None
     struct: list | None = None
+    havoc_seq: list | None = None
 
     def __str__(self):
         if self.value is not None:
@@ -67,6 +77,8 @@ class Input:
             return f"{self.name} <- {len(self.buffers)} buffer(s)"
         if self.struct:
             return f"{self.name} <- struct({len(self.struct)} fields)"
+        if self.havoc_seq is not None:
+            return f"{self.name} <- havoc_seq({len(self.havoc_seq)})"
         return f"{self.name} <- (empty)"
 
     @property
@@ -222,6 +234,30 @@ def preprocess_external_inputs(proc):
         field_info_shadow = process_field_stmt(stmt, True)
         field_map[field_info_shadow.var_name].append(field_info_shadow)
     return arr_map, field_map
+
+
+def gather_ptr_aliases(proc):
+    """Collect {:ptr_alias first, this} equivalences from BPL annotations.
+
+    Returns a dict {this_ptr: first_ptr} — both for base and .shadow variants.
+    """
+    aliases = {}
+    for block in proc.body.blocks:
+        for stmt in block.statements:
+            if not isinstance(stmt, CallStatement):
+                continue
+            if not RE_SMACK.match(stmt.procedure.name):
+                continue
+            alias_attr_list = stmt.attributes if hasattr(stmt, "attributes") else []
+            alias_attr = next((a for a in alias_attr_list if a.key == "ptr_alias"), None)
+            if alias_attr is None or len(alias_attr.values) < 2:
+                continue
+            first = alias_attr.values[0].name
+            this = alias_attr.values[1].name
+            if first != this:
+                aliases[this] = first
+                aliases[f"{this}.shadow"] = f"{first}.shadow"
+    return aliases
 
 
 # ── Legacy JSON input parsing ────────────────────────────────────────────

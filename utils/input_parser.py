@@ -87,11 +87,23 @@ def _parse_value_expr(expr):
 # Matches: type name = expr;  or  type name[size] = expr;
 _DECL_RE = re.compile(
     r'^(?:[\w\s\*]+?)\s+'       # type (e.g., "unsigned char", "size_t", "const unsigned char *")
-    r'(\w+)'                     # name
+    r'([\w$]+)'                  # name (allow $ for Boogie names like $u0)
     r'(?:\[(\d+)\])?'           # optional [size]
     r'\s*=\s*'                   # =
     r'(.+);'                     # value expression + semicolon
     r'\s*$'
+)
+
+# Matches: int_seq NAME = {a, b, c, ...};
+# Used to pin SMACK-inlined __VERIFIER_nondet_int() havocs to a
+# concrete sequence of values consumed in call order.  See
+# `Input.havoc_seq` for semantics.  NAME may contain $ (Boogie
+# inline-variable suffixes like inline$__VERIFIER_nondet_int$0$$i0).
+_HAVOC_SEQ_RE = re.compile(
+    r'^int_seq\s+'
+    r'([\w$]+)'                  # name
+    r'\s*=\s*'                   # =
+    r'\{\s*([^}]*)\s*\}\s*;\s*$' # { value-list }
 )
 
 # Matches: struct type_name name = {
@@ -201,6 +213,28 @@ def parse_input_file(path, field_sizes=None):
                 name=bpl_name,
                 private=private_next,
                 struct=fields,
+            )
+            variables[bpl_name] = inp
+            private_next = False
+            i += 1
+            continue
+
+        # int_seq NAME = {a, b, c, ...};  — havoc-call sequence
+        m = _HAVOC_SEQ_RE.match(line)
+        if m:
+            c_name = m.group(1)
+            inner = m.group(2).strip()
+            seq = []
+            if inner:
+                for s in inner.split(','):
+                    s = s.strip()
+                    if s:
+                        seq.append(int(s, 0))
+            bpl_name = name_map.get(c_name, c_name)
+            inp = Input(
+                name=bpl_name,
+                private=private_next,
+                havoc_seq=seq,
             )
             variables[bpl_name] = inp
             private_next = False
