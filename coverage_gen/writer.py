@@ -26,13 +26,16 @@ def write_input_file(program_inputs: ProgramInputs, params_line: str = "") -> st
     lines: list[str] = []
 
     if params_line:
-        lines.append(params_line)
+        lines.append(_params_with_missing(params_line, program_inputs.variables))
     else:
         pairs = " ".join(
             f"{_c_name(name)}:{name}"
             for name in program_inputs.variables
         )
         lines.append(f"// @params {pairs}")
+
+    if program_inputs.extra_data:
+        lines.append(f"// @extra_data 0x{program_inputs.extra_data.hex()}")
 
     lines.append("")
 
@@ -52,7 +55,20 @@ def write_input_file(program_inputs: ProgramInputs, params_line: str = "") -> st
 
 def _c_name(bpl_name: str) -> str:
     """Strip leading $ from a Boogie name to get a C-safe identifier."""
-    return bpl_name.lstrip("$")
+    return bpl_name.lstrip("$").replace(".", "_")
+
+
+def _params_with_missing(params_line: str, variables: dict[str, Input]) -> str:
+    mapped = set()
+    for pair in params_line.removeprefix("//").split():
+        if ":" in pair:
+            _c_name_part, bpl_name = pair.split(":", 1)
+            mapped.add(bpl_name.strip())
+    missing = [name for name in variables if name not in mapped]
+    if not missing:
+        return params_line
+    suffix = " ".join(f"{_c_name(name)}:{name}" for name in missing)
+    return f"{params_line.rstrip()} {suffix}"
 
 
 def _format_input(c_name: str, inp: Input) -> list[str]:

@@ -18,11 +18,90 @@ import struct
 import shutil
 import time
 from pathlib import Path
+import concurrent.futures
 from concurrent.futures import ProcessPoolExecutor
 import functools
 import os
 
 from interpreter.python.interpreter import BoogieInterpreter, find_entry_point
+
+
+def _build_loop_header_live(test_path):
+    """Load loop header → live variable names from compiled package metadata.
+
+    Returns dict {block_name: [var_name, ...]} suitable for swoosh_interp.lower().
+    """
+    pkg_dir = test_path.parent
+    name = test_path.stem
+    try:
+        live_in_path = pkg_dir / f"{name}_live_in.pkl"
+        loops_path = pkg_dir / f"{name}_loops.pkl"
+        if not live_in_path.exists() or not loops_path.exists():
+            return None
+        live_in = pickle.load(open(live_in_path, 'rb'))
+        loops = pickle.load(open(loops_path, 'rb'))
+        result = {}
+        for proc, proc_loops in loops.items():
+            proc_live = live_in.get(proc, {})
+            for header_block in proc_loops:
+                live_vars = proc_live.get(header_block, set())
+                if live_vars:
+                    result[header_block] = sorted(live_vars)
+        return result if result else None
+    except Exception:
+        return None
+
+
+def _build_loop_metadata(test_path):
+    """Load loop nesting metadata from the compiled package.
+
+    Returns a dict with three keys ready for ``swoosh_interp.lower``:
+
+      * ``is_loop_header``: list of block NAMES that are loop headers.
+      * ``block_innermost_header``: dict block_name -> innermost header name.
+      * ``loop_parent_header``: dict inner_header -> parent header name.
+
+    The Rust side resolves names to block ids via its own label map, so
+    no block-id numbering has to agree across the FFI boundary.
+    Returns None if any required .pkl is missing.
+    """
+    pkg_dir = test_path.parent
+    name = test_path.stem
+    try:
+        loops_path = pkg_dir / f"{name}_loops.pkl"
+        parents_path = pkg_dir / f"{name}_loop_parents.pkl"
+        btl_path = pkg_dir / f"{name}_block_to_loop.pkl"
+        for p in (loops_path, parents_path, btl_path):
+            if not p.exists():
+                return None
+        loops = pickle.load(open(loops_path, 'rb'))
+        parents = pickle.load(open(parents_path, 'rb'))
+        btl = pickle.load(open(btl_path, 'rb'))
+
+        # Flatten across procedures.  The package only ever has one
+        # entry procedure after inlining, but the dicts are still
+        # keyed by proc name, so we union them.
+        headers = set()
+        for proc_headers in loops.values():
+            headers.update(proc_headers)
+
+        block_to_header = {}
+        for proc_map in btl.values():
+            block_to_header.update(proc_map)
+
+        parent_map = {}
+        for proc_parents in parents.values():
+            for inner, outer in proc_parents.items():
+                if outer is not None:
+                    parent_map[inner] = outer
+
+        return {
+            "is_loop_header": sorted(headers),
+            "block_innermost_header": block_to_header,
+            "loop_parent_header": parent_map,
+        }
+    except Exception:
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -47,7 +126,10 @@ def _load_shared(test_path, engine):
     if engine in ('native', 'both'):
         try:
             import swoosh_interp
-            _SHARED_COMPILED = swoosh_interp.lower(_SHARED_PROGRAM)
+            lh_live = _build_loop_header_live(test_path)
+            loop_meta = _build_loop_metadata(test_path)
+            _SHARED_COMPILED = swoosh_interp.lower(
+                _SHARED_PROGRAM, lh_live, loop_meta)
         except ImportError:
             _SHARED_COMPILED = None
 
@@ -176,10 +258,12 @@ def run_python(program, program_inputs, test_name, input_name, full_trace=False,
 # Native engine — 2 phase: Python init → Rust execution
 # ---------------------------------------------------------------------------
 
-def _init_python_state(program, program_inputs, test_name, input_name, no_read_trace=False):
+def _init_python_state(program, program_inputs, test_name, input_name,
+                       no_read_trace=False, init_raw_log_path=None):
     """Phase 1: Python initialization + concretization.
     Returns initialized BoogieInterpreter (ready to execute, but not yet running)."""
     from interpreter.python.Environment import Environment
+    from interpreter.parser.declaration import StorageDeclaration, ConstantDeclaration
 
     environment = Environment(test_name, input_name)
     environment.full_trace = False
@@ -191,6 +275,59 @@ def _init_python_state(program, program_inputs, test_name, input_name, no_read_t
 
     entry = find_entry_point(program)
     assert entry is not None, "No entry point found"
+
+    # Warn about parameter mismatches before concretization
+    input_keys = set(program_inputs.keys()) if hasattr(program_inputs, 'keys') else set()
+    if not input_keys and hasattr(program_inputs, 'variables'):
+        input_keys = set(program_inputs.variables.keys())
+    expected_params = []
+    for param in entry.parameters:
+        assert len(param.names) == 1
+        name = param.names[0]
+        if not name.endswith('.shadow'):
+            expected_params.append(name)
+    missing = [p for p in expected_params if p not in input_keys]
+    if missing:
+        import sys
+        print(f"WARNING: input file '{input_name}' is missing parameters: {missing}. "
+              f"Available: {sorted(input_keys)}. "
+              f"Check @params mapping in the .input file (use BPL names like $p0, $i2).",
+              file=sys.stderr)
+
+    # Optionally stream the init-phase trace to a separate raw log. The
+    # driver loads this file alongside the main ``.trace.raw.zst`` at
+    # verify time.
+    if init_raw_log_path is not None:
+        var_names = []
+        seen = set()
+        def _add(n):
+            if n and not n.endswith('.shadow') and n not in seen:
+                seen.add(n)
+                var_names.append(n)
+        for d in program.declarations:
+            if isinstance(d, StorageDeclaration):
+                for n in d.names:
+                    _add(n)
+            elif isinstance(d, ConstantDeclaration):
+                for n in d.names:
+                    _add(n)
+        if entry.body:
+            for local_decl in entry.body.locals:
+                if isinstance(local_decl, StorageDeclaration):
+                    for n in local_decl.names:
+                        _add(n)
+        for p in entry.parameters:
+            for n in p.names:
+                _add(n)
+        block_names = ['GLOBAL']
+        seen_b = {'GLOBAL'}
+        if entry.body:
+            for b in entry.body.blocks:
+                if b.name not in seen_b:
+                    seen_b.add(b.name)
+                    block_names.append(b.name)
+        environment._raw_log_path = Path(init_raw_log_path)
+        environment.enable_raw_log(var_names, block_names)
 
     # Do all the initialization that execute_procedure does BEFORE the hot loop
     interp._initialize_vars(entry.body.locals, kind="local")
@@ -234,59 +371,82 @@ def _extract_state(interp):
     return var_store, memory_maps, mem_map_info
 
 
-def _extract_init_trace(interp):
-    """Extract trace entries accumulated during Python's init/concretization phase.
-    Returns dict in native trace format: {section: {key: set_of_raw_values}}."""
+def _extract_havoc_sequences(program_inputs):
+    if not hasattr(program_inputs, "variables"):
+        return {}
+    out = {}
+    for name, inp in program_inputs.variables.items():
+        seq = getattr(inp, "havoc_seq", None)
+        if seq is not None:
+            out[name] = [int(v) for v in seq]
+    return out
+
+
+
+
+def _validate_state_no_aliasing(interp):
+    """Defense-in-depth: verify no two buffers in the same memory map overlap.
+
+    Called after Python initialization, before handing state to Rust.
+    Re-derives ranges from interp.arr_inputs and current variable values.
+    Pointers declared equivalent via ``{:ptr_alias}`` are collapsed.
+    """
+    from collections import defaultdict
     env = interp.env
-    trace = {'pc_values': {}, 'block_values': {}, 'op_values': {},
-             'pc_registry': {}, 'block_registry': {}, 'total': env._agg_total}
+    aliases = getattr(interp, "ptr_aliases", {}) or {}
 
-    for (k, pc), vals in env._agg_pc_values.items():
-        key = f"positive_examples_{k}_{pc}"
-        trace['pc_values'][key] = {v[0] if isinstance(v, tuple) else v for v in vals}
-    for (k, blk), vals in env._agg_block_values.items():
-        key = f"positive_examples_{k}_{blk}"
-        trace['block_values'][key] = {v[0] if isinstance(v, tuple) else v for v in vals}
-    for (k, pc, op), vals in env._agg_op_values.items():
-        key = f"positive_examples_to_op_type_{k}_{pc}_{op}"
-        trace['op_values'][key] = {v[0] if isinstance(v, tuple) else v for v in vals}
-    for k, pcs in env._agg_pc_registry.items():
-        key = f"positive_examples_to_pc_{k}"
-        trace['pc_registry'][key] = set(pcs)
-    for k, blks in env._agg_block_registry.items():
-        key = f"positive_examples_to_block_{k}"
-        trace['block_registry'][key] = set(blks)
+    def canon(p):
+        seen = set()
+        while p in aliases and p not in seen:
+            seen.add(p)
+            p = aliases[p]
+        return p
 
-    return trace
+    # Build map: mem_map -> {canonical_ptr: (base_addr, size)}; keep the max
+    # size per canonical pointer so aliased pointers do not appear twice.
+    per_map = defaultdict(dict)
+    for var_name, arr_infos in interp.arr_inputs.items():
+        if '.shadow' in var_name:
+            continue
+        for arr_info in arr_infos:
+            if '.shadow' in arr_info.mem_map:
+                continue
+            base_addr = env.get_concrete_value(arr_info.base_ptr)
+            if base_addr is None:
+                continue
+            if not isinstance(base_addr, int):
+                continue
+            size = arr_info.elem_size * arr_info.num_elements
+            c_ptr = canon(arr_info.base_ptr)
+            existing = per_map[arr_info.mem_map].get(c_ptr)
+            if existing is None or size > existing[1]:
+                per_map[arr_info.mem_map][c_ptr] = (base_addr, size)
 
-
-def _merge_traces(init_trace, native_trace, pickled=False):
-    """Merge init-phase trace into native trace.
-    If pickled=True, convert init trace values to pickled bytes first."""
-    merged = {}
-    for section in ('pc_values', 'block_values', 'op_values', 'pc_registry', 'block_registry'):
-        merged[section] = dict(native_trace.get(section, {}))
-        for key, vals in init_trace.get(section, {}).items():
-            if pickled:
-                # Convert raw init trace values to pickled bytes
-                if section in ('pc_values', 'block_values', 'op_values'):
-                    vals = {pickle.dumps((v, "")) for v in vals}
-                elif section == 'pc_registry':
-                    vals = {pickle.dumps(v) for v in vals}
-                elif section == 'block_registry':
-                    vals = {pickle.dumps(v) for v in vals}
-            if key in merged[section]:
-                merged[section][key] = merged[section][key] | vals
-            else:
-                merged[section][key] = vals
-    merged['total'] = native_trace.get('total', 0) + init_trace.get('total', 0)
-    return merged
+    for mem_map, ptr_dict in per_map.items():
+        ranges = [(p, a, a + s) for p, (a, s) in ptr_dict.items()]
+        ranges.sort(key=lambda x: x[1])
+        for i in range(len(ranges) - 1):
+            ptr_a, _, end_a = ranges[i]
+            ptr_b, start_b, _ = ranges[i + 1]
+            assert end_a <= start_b, (
+                f"BUFFER ALIASING at Rust handoff in {mem_map}: "
+                f"{ptr_a}[..{end_a}) overlaps {ptr_b}[{start_b}..)"
+            )
 
 
-def run_native(program, program_inputs, test_name, input_name, extra_data=None, log_read=True, pickled=False, compiled=None):
-    """Run the Rust native interpreter. Returns (explored_blocks, compact_trace_dict).
-    If pickled=True, value sets contain pre-pickled bytes (ready for Redis/disk).
-    If compiled is provided, skips the lower() step (reuses pre-compiled bytecode)."""
+def run_native(program, program_inputs, test_name, input_name, raw_log_path,
+               extra_data=None, log_read=True, compiled=None, no_trace=False,
+               init_raw_log_path=None, return_status=False):
+    """Run the Rust native interpreter.
+
+    ``raw_log_path`` is the ``.trace.raw.zst`` the Rust VM writes its
+    execution records to.  ``init_raw_log_path`` (optional) is a second
+    ``.init.raw.zst`` file the Python init phase streams concretization
+    records to — the driver loads both files into Redis at verify time.
+
+    Returns ``explored_blocks`` by default. With ``return_status=True``, returns
+    the native result dict including ``status`` and any violation metadata.
+    """
     try:
         import swoosh_interp
     except ImportError:
@@ -295,12 +455,15 @@ def run_native(program, program_inputs, test_name, input_name, extra_data=None, 
         )
 
     # Phase 1: Python initialization + concretization
-    interp, entry = _init_python_state(program, program_inputs, test_name, input_name,
-                                        no_read_trace=not log_read)
+    interp, entry = _init_python_state(
+        program, program_inputs, test_name, input_name,
+        no_read_trace=not log_read,
+        init_raw_log_path=init_raw_log_path if not no_trace else None,
+    )
+    _validate_state_no_aliasing(interp)
     var_store, memory_maps, mem_map_info = _extract_state(interp)
-
-    # Capture init-phase trace before handing off to Rust
-    init_trace = _extract_init_trace(interp)
+    if not no_trace and init_raw_log_path is not None:
+        interp.env.flush_raw_log()
 
     # Phase 2: Lower AST to Rust bytecode (skip if pre-compiled)
     if compiled is None:
@@ -316,157 +479,39 @@ def run_native(program, program_inputs, test_name, input_name, extra_data=None, 
         var_store,
         memory_maps,
         mem_map_info,
+        str(raw_log_path),
         extra_data=ext_data,
         log_read=log_read,
-        pickled=pickled,
+        no_trace=no_trace,
+        havoc_sequences=_extract_havoc_sequences(program_inputs),
     )
 
-    # Merge init-phase trace with native execution trace
-    merged_trace = _merge_traces(init_trace, result['compact_trace'], pickled=pickled)
+    if return_status:
+        return result
 
-    return result['explored_blocks'], merged_trace
+    status = result.get('status', 'ok')
+    if status == 'assert_violation':
+        from interpreter.python.interpreter import AssertViolation
+        raise AssertViolation(
+            None,
+            pc=result.get('violation_pc'),
+            block=result.get('violation_block'),
+            expr_str='<native assertion>',
+        )
+    if status == 'assume_violation':
+        raise AssertionError(
+            "concrete assume failed at "
+            f"pc={result.get('violation_pc')} "
+            f"block={result.get('violation_block')!r}"
+        )
+
+    return result['explored_blocks']
 
 
 # ---------------------------------------------------------------------------
 # Comparison mode
 # ---------------------------------------------------------------------------
 
-def run_both(program, program_inputs, test_name, input_name, full_trace=False,
-             no_read_trace=False, extra_data=None):
-    """Run both interpreters and assert identical output."""
-    print(f"[both] Running Python interpreter...")
-    t0 = time.time()
-    py_blocks, py_trace_path = run_python(
-        program, program_inputs, test_name, input_name,
-        full_trace=full_trace, no_read_trace=no_read_trace
-    )
-    py_time = time.time() - t0
-    print(f"[both] Python done in {py_time:.1f}s, {len(py_blocks)} blocks explored")
-
-    print(f"[both] Running native interpreter...")
-    t0 = time.time()
-    native_blocks, native_trace = run_native(
-        program, program_inputs, test_name, input_name,
-        extra_data=extra_data, log_read=not no_read_trace
-    )
-    native_time = time.time() - t0
-    print(f"[both] Native done in {native_time:.1f}s, {len(native_blocks)} blocks explored")
-
-    # Compare explored blocks
-    if py_blocks != native_blocks:
-        py_only = py_blocks - native_blocks
-        native_only = native_blocks - py_blocks
-        msg = f"Explored blocks differ!\n  Python-only: {py_only}\n  Native-only: {native_only}"
-        raise AssertionError(msg)
-
-    # Compare compact traces
-    if py_trace_path.exists():
-        with open(py_trace_path, 'rb') as f:
-            py_compact = pickle.load(f)
-
-        py_pv = py_compact.get('pc_values', {})
-        nat_pv = native_trace.get('pc_values', {})
-        _compare_trace_dicts(py_pv, nat_pv, "pc_values")
-
-    speedup = py_time / native_time if native_time > 0 else float('inf')
-    print(f"[both] PASS — identical output. Speedup: {speedup:.1f}x")
-
-    return py_blocks, py_trace_path
-
-
-def write_trace_binary(path, compact_trace):
-    """Write a merged compact trace dict to the streaming binary format with zstd compression.
-
-    The dict has keys: pc_values, block_values, op_values, pc_registry, block_registry, total.
-    Each section maps string keys to sets of pre-pickled bytes.
-    """
-    import zstandard as zstd
-
-    categories = [
-        (0, 'pc_values'),
-        (1, 'block_values'),
-        (2, 'op_values'),
-        (3, 'pc_registry'),
-        (4, 'block_registry'),
-    ]
-
-    total = compact_trace.get('total', 0)
-    cctx = zstd.ZstdCompressor(level=3, threads=-1)
-    with open(path, 'wb') as fh:
-        with cctx.stream_writer(fh) as writer:
-            writer.write(b"SWTR")
-            writer.write(struct.pack('<BQ', 1, total))
-            for cat_id, section_name in categories:
-                section = compact_trace.get(section_name, {})
-                writer.write(struct.pack('<BI', cat_id, len(section)))
-                for key_str, members in section.items():
-                    key_bytes = key_str.encode() if isinstance(key_str, str) else key_str
-                    writer.write(struct.pack('<H', len(key_bytes)))
-                    writer.write(key_bytes)
-                    writer.write(struct.pack('<I', len(members)))
-                    for m in members:
-                        writer.write(struct.pack('<H', len(m)))
-                        writer.write(m)
-            writer.write(b"DONE")
-
-
-def _pickle_native_trace(native_trace):
-    """Convert native raw-value trace to pickled-bytes format for verifier compatibility.
-    Native returns {key: set_of_raw_values}; verifier expects {key: set_of_pickled_bytes}.
-    Value sections store (int, "") tuples; registry sections store raw ints/strings."""
-    result = {}
-    # Value sections: wrap each int as (value, "") tuple before pickling
-    for section in ('pc_values', 'block_values', 'op_values'):
-        d = native_trace.get(section, {})
-        result[section] = {
-            key: {pickle.dumps((v, "")) for v in vals}
-            for key, vals in d.items()
-        }
-    # Registry sections: pickle raw values directly (ints for pc, strings for block)
-    for section in ('pc_registry', 'block_registry'):
-        d = native_trace.get(section, {})
-        result[section] = {
-            key: {pickle.dumps(v) for v in vals}
-            for key, vals in d.items()
-        }
-    result['total'] = native_trace.get('total', 0)
-    return result
-
-
-def _unpickle_value_set(value_set):
-    """Convert a set of pickled (value, "") bytes to a set of raw ints."""
-    result = set()
-    for pickled_val in value_set:
-        val = pickle.loads(pickled_val)
-        if isinstance(val, tuple):
-            val = val[0]  # Extract int from (int, "") tuple
-        if isinstance(val, bool):
-            val = int(val)
-        result.add(val)
-    return result
-
-
-def _compare_trace_dicts(py_dict, native_dict, name):
-    """Compare two trace dictionaries for equality.
-    Python dict has pickled (value,"") bytes; native dict has raw ints."""
-    py_keys = set(py_dict.keys())
-    nat_keys = set(native_dict.keys())
-    if py_keys != nat_keys:
-        py_only = py_keys - nat_keys
-        nat_only = nat_keys - py_keys
-        if py_only:
-            print(f"[{name}] Python-only keys (first 5): {list(py_only)[:5]}")
-        if nat_only:
-            print(f"[{name}] Native-only keys (first 5): {list(nat_only)[:5]}")
-    for key in py_keys & nat_keys:
-        py_vals = _unpickle_value_set(py_dict[key])
-        nat_vals = native_dict[key]
-        if py_vals != nat_vals:
-            raise AssertionError(
-                f"[{name}] Value mismatch at key '{key}':\n"
-                f"  Python:  {py_vals}\n"
-                f"  Native: {nat_vals}"
-            )
 
 
 # ---------------------------------------------------------------------------
@@ -494,14 +539,12 @@ def process_single_input(input_file, test_name, test_path, engine='python',
         trace_dir = Path("positive_examples") / test_name
         trace_dir.mkdir(parents=True, exist_ok=True)
         explored_path = trace_dir / f"{input_name}.explored_blocks.txt"
-        compact_path = trace_dir / f"{input_name}.trace.compact.pkl"
-        bin_path = trace_dir / f"{input_name}.trace.compact.bin.zst"
+        raw_log_path = trace_dir / f"{input_name}.trace.raw.zst"
+        init_raw_log_path = trace_dir / f"{input_name}.init.raw.zst"
 
-        has_trace = (compact_path.exists() and compact_path.stat().st_size > 0) or \
-                    (bin_path.exists() and bin_path.stat().st_size > 0)
+        has_trace = raw_log_path.exists() and raw_log_path.stat().st_size > 0
         if not force and explored_path.exists() and has_trace:
             print(f"Skipping input file: {input_file} (already explored)")
-            # Still compute coverage from existing explored_blocks file
             with open(explored_path) as f:
                 explored = {line.strip() for line in f if line.strip()}
             cov = compute_coverage(program, explored)
@@ -512,32 +555,36 @@ def process_single_input(input_file, test_name, test_path, engine='python',
                       f"{cov['stmts_covered']}/{cov['stmts_total']} stmts ({cov['stmt_pct']}%)")
             return (input_name, cov, explored)
 
-        if compact_path.exists() and not explored_path.exists():
-            compact_path.unlink()
-        if bin_path.exists() and not explored_path.exists():
-            bin_path.unlink()
+        for p in (raw_log_path, init_raw_log_path):
+            if p.exists() and not explored_path.exists():
+                p.unlink()
 
-        if engine == 'python':
-            explored, _ = run_python(program, program_inputs, test_name, input_name,
-                                     full_trace=full_trace, no_read_trace=no_read_trace)
-        elif engine == 'native':
-            explored, compact_trace = run_native(
-                program, program_inputs, test_name, input_name,
-                extra_data=program_inputs.extra_data,
-                log_read=not no_read_trace,
-                pickled=True,  # Pre-pickled bytes, ready for verifier
-                compiled=compiled,
-            )
-            with open(compact_path, 'wb') as f:
-                pickle.dump(compact_trace, f, protocol=pickle.HIGHEST_PROTOCOL)
-            # Also write streaming binary format
-            write_trace_binary(bin_path, compact_trace)
-        elif engine == 'both':
-            explored, _ = run_both(program, program_inputs, test_name, input_name,
-                                   full_trace=full_trace, no_read_trace=no_read_trace,
-                                   extra_data=program_inputs.extra_data)
-        else:
-            raise ValueError(f"Unknown engine: {engine}")
+        from interpreter.python.interpreter import AssertViolation
+        try:
+            if engine == 'python':
+                explored, _ = run_python(program, program_inputs, test_name, input_name,
+                                         full_trace=full_trace, no_read_trace=no_read_trace)
+            elif engine == 'native':
+                explored = run_native(
+                    program, program_inputs, test_name, input_name,
+                    raw_log_path=raw_log_path,
+                    init_raw_log_path=init_raw_log_path,
+                    extra_data=program_inputs.extra_data,
+                    log_read=not no_read_trace,
+                    compiled=compiled,
+                )
+            else:
+                raise ValueError(f"Unknown engine: {engine}")
+        except AssertViolation as v:
+            # Structured line for agent_loop's subprocess parser.  The
+            # parent process reads child stdout to collect per-input
+            # violations; expression is JSON-quoted so embedded quotes
+            # / newlines in the Boogie expr don't break the line.
+            import json as _json
+            print(f"[ASSERT_VIOLATION] "
+                  f"input={input_name} pc={v.pc} block={v.block!r} "
+                  f"expr={_json.dumps(v.expr_str)}")
+            return (input_name, None, set())
 
         with open(explored_path, "w") as f:
             for block in explored:
@@ -695,23 +742,32 @@ def main():
         no_read_trace=args.no_read_trace,
     )
 
+    per_input_timeout = int(os.environ.get("SWOOSH_INTERP_TIMEOUT", "60"))
+    # A value of 0 (or negative) means "run until completion, no timeout".
+    if per_input_timeout <= 0:
+        per_input_timeout = None
     failed = False
+    skipped = 0
     results = []
-    with ProcessPoolExecutor(max_workers=max_workers, mp_context=mp_context) as executor:
-        results_iterator = executor.map(worker_func, input_files)
-        try:
-            for result in results_iterator:
-                if result is not None:
-                    results.append(result)
-        except Exception:
-            import traceback
-            print("A worker failed!")
-            traceback.print_exc()
+    for input_file in input_files:
+        input_name = os.path.basename(input_file) if isinstance(input_file, str) else str(input_file)
+        p = mp_context.Process(target=worker_func, args=(input_file,))
+        p.start()
+        p.join(timeout=per_input_timeout)
+        if p.is_alive():
+            print(f"TIMEOUT ({per_input_timeout}s) on {input_name} — killing (likely infinite loop)")
+            p.kill()
+            p.join(timeout=5)
+            skipped += 1
+        elif p.exitcode != 0 and p.exitcode is not None:
+            print(f"Worker failed on {input_name} (exit={p.exitcode})")
             failed = True
 
-    if failed:
+    if failed and not results:
         print("Interpretation did not complete — run again to resume")
         exit(1)
+    if skipped:
+        print(f"Skipped {skipped} non-terminating input(s)")
 
     # Coverage summary
     if results:

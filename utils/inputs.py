@@ -8,6 +8,7 @@ from dataclasses import dataclass, replace
 
 from interpreter.parser.declaration import ImplementationDeclaration
 from interpreter.parser.statement import CallStatement
+from interpreter.parser.specifications import RequiresClause
 
 from interpreter.utils.program import extract_boogie_variables, RE_SMACK
 
@@ -104,12 +105,66 @@ class ProgramInputs:
         self.extra_data = extra_data
 
     def with_shadows(self) -> dict[str, Input]:
-        """Return variables dict with shadow copies for public variables."""
+        """Return variables dict with legacy shadow copies for public variables."""
         result = dict(self.variables)
         for name, inp in self.variables.items():
+            if name.endswith(".shadow"):
+                continue
             if not inp.private:
                 result[f"{name}.shadow"] = replace(inp, name=f"{name}.shadow")
         return result
+
+
+def input_contract_from_requires(proc_decl, input_names=None) -> tuple[set[str], set[str]]:
+    """Extract annotation privacy metadata for input-template rendering.
+
+    This is not execution/precondition semantics.  Runtime input validity is
+    driven only by ordinary ``requires`` expressions; the compiler materializes
+    CT annotation specs such as ``public_in`` into those expressions in the
+    final cross-product BPL.
+    """
+    public: set[str] = set()
+    private: set[str] = set()
+    if proc_decl is None:
+        return public, private
+
+    known = None
+    if input_names is not None:
+        known = {
+            str(name) for name in input_names
+            if str(name) and not str(name).endswith(".shadow")
+        }
+
+    for spec in getattr(proc_decl, "specifications", []) or []:
+        if not isinstance(spec, RequiresClause):
+            continue
+        for attr in getattr(spec, "attributes", []) or []:
+            key = getattr(attr, "key", None)
+            if key not in {"public_in", "private_in"}:
+                continue
+            target = public if key == "public_in" else private
+            target.update(_input_names_from_attr_values(
+                getattr(attr, "values", []) or [], known))
+    return public, private
+
+
+def _input_names_from_attr_values(values, known: set[str] | None) -> set[str]:
+    if known is not None:
+        text = " ".join(str(v) for v in values)
+        return {
+            name for name in known
+            if re.search(rf"(?<![\w.$]){re.escape(name)}(?![\w.$])", text)
+        }
+
+    names = set()
+    for value in values:
+        name = getattr(value, "name", None)
+        if not name or str(name).endswith(".shadow"):
+            continue
+        if str(name).startswith("$M."):
+            continue
+        names.add(str(name))
+    return names
 
 
 # ── Array / field metadata ───────────────────────────────────────────────

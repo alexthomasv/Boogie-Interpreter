@@ -19,30 +19,93 @@ class CorpusEntry:
     covered_blocks: set
     params_line: str = ""
     energy: int = 1
+    source: str = "unknown"
+    interesting_reason: str = "coverage"
 
 
 class Corpus:
-    def __init__(self):
+    def __init__(self, max_trace_entries: int = 128):
         self.entries: list[CorpusEntry] = []
         self.covered: set = set()
         self.params_line: str = ""
+        self.max_trace_entries = max_trace_entries
+        self.trace_signatures: set = set()
+        self.loaded_inputs = 0
+        self.invalid_inputs = 0
+        self.duplicate_inputs = 0
+        self.coverage_inputs = 0
+        self.trace_interesting_inputs = 0
+        self.generated_trace_inputs = 0
+        self.assertion_inputs = 0
+        self.assertion_pcs = {}
+        self.seed_assertion_feedback_inputs = 0
+        self.seed_assertion_feedback_pcs = {}
+        self.assertion_signatures: set = set()
+        self.assertion_feedback_entries: list[CorpusEntry] = []
 
     def add(self, path, inputs: ProgramInputs, covered_blocks: set,
-            params_line: str = "") -> bool:
-        """Add an entry if it brings new coverage. Returns True if added."""
+            params_line: str = "", *, source: str = "unknown",
+            allow_trace: bool = False,
+            interesting_reason: str = "coverage") -> bool:
+        """Add an entry if it brings new coverage or useful trace diversity."""
         new_blocks = covered_blocks - self.covered
-        if not new_blocks and self.entries:
+        if new_blocks or not self.entries:
+            reason = interesting_reason if new_blocks else "initial"
+            energy = max(1, len(new_blocks))
+            self.coverage_inputs += 1
+            self.trace_signatures.add(self.trace_signature(inputs, covered_blocks))
+        elif allow_trace and self.should_add_trace(inputs, covered_blocks):
+            reason = "trace"
+            energy = 1
+            self.trace_interesting_inputs += 1
+            if source != "existing":
+                self.generated_trace_inputs += 1
+            self.trace_signatures.add(self.trace_signature(inputs, covered_blocks))
+        else:
+            self.duplicate_inputs += 1
             return False
-        # Energy = number of newly-found blocks (minimum 1)
-        energy = max(1, len(new_blocks))
+
         entry = CorpusEntry(path=path, inputs=inputs,
                             covered_blocks=covered_blocks,
-                            params_line=params_line, energy=energy)
+                            params_line=params_line, energy=energy,
+                            source=source, interesting_reason=reason)
         self.entries.append(entry)
         self.covered |= covered_blocks
         if params_line and not self.params_line:
             self.params_line = params_line
         return True
+
+    def add_assertion_feedback(self, path, inputs: ProgramInputs,
+                               covered_blocks: set, params_line: str = "",
+                               *, source: str = "unknown") -> None:
+        """Record a failing assert input for solver feedback only.
+
+        These entries are not valid concrete inputs and must not affect normal
+        coverage, trace, or fuzz corpus state.
+        """
+        entry = CorpusEntry(path=path, inputs=inputs,
+                            covered_blocks=covered_blocks,
+                            params_line=params_line, energy=1,
+                            source=source,
+                            interesting_reason="assertion-feedback")
+        self.assertion_feedback_entries.append(entry)
+        if params_line and not self.params_line:
+            self.params_line = params_line
+
+    def trace_signature(self, inputs: ProgramInputs, covered_blocks: set):
+        """Stable signature for no-new-coverage traces worth keeping."""
+        havoc = []
+        for name, inp in sorted(inputs.variables.items()):
+            if inp.havoc_seq is not None:
+                havoc.append((name, tuple(inp.havoc_seq)))
+        extra_len = len(inputs.extra_data or b"")
+        return (tuple(sorted(covered_blocks)), tuple(havoc), extra_len)
+
+    def should_add_trace(self, inputs: ProgramInputs, covered_blocks: set) -> bool:
+        if self.trace_interesting_inputs >= self.max_trace_entries:
+            return False
+        sig = self.trace_signature(inputs, covered_blocks)
+        return sig not in self.trace_signatures
 
     def pick(self) -> Optional[CorpusEntry]:
         """Pick a corpus entry weighted by energy (AFL-style power schedule)."""
@@ -74,10 +137,13 @@ class Corpus:
                 inputs = parse_input_file(p)
                 params_line = _extract_params_line(p)
                 covered = evaluator.run(inputs, p.stem)
-                self.add(p, inputs, covered, params_line=params_line)
+                self.add(p, inputs, covered, params_line=params_line,
+                         source="existing", allow_trace=True)
                 loaded += 1
             except Exception as exc:
+                self.invalid_inputs += 1
                 print(f"[corpus] Warning: could not load seed {p.name}: {exc}")
+        self.loaded_inputs += loaded
         return loaded
 
 

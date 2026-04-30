@@ -169,11 +169,17 @@ class WhileStatement(Statement):
     def declarations(self):
         return self.blocks
 
-    def show(self, blk):
-        body = Printing.braces('\n'.join(blk(b) for b in self.blocks))
-        invs = '\n'.join(blk(a) for a in self.invariants)
-        invs = f"\n{invs}\n" if invs else ""
-        return f"{blk('while')} ({blk(self.condition)}){invs} {body}"
+    def set_prefix(self, prefix, indent=1):
+        self.prefix = prefix
+        self.indent = "  " * indent
+        for b in self.blocks:
+            b.set_prefix(prefix, indent + 2)
+
+    def __repr__(self):
+        inv_lines = "\n".join(f"  {inv}" for inv in self.invariants)
+        inv_part = f"\n{inv_lines}\n" if self.invariants else " "
+        body = "\n".join(str(b) for b in self.blocks)
+        return f"while ({self.condition}){inv_part}{{\n{body}\n{self.indent}}}"
 
 class BreakStatement(Statement):
     def __init__(self, identifier=None):

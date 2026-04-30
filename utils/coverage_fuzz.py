@@ -27,7 +27,7 @@ from pathlib import Path
 from hypothesis import given, settings, target, HealthCheck, Phase, Verbosity
 from hypothesis import strategies as st
 
-from interpreter.runner import compute_coverage, run_python, find_entry_point
+from interpreter.runner import compute_coverage, run_python, run_native, find_entry_point
 from interpreter.utils.inputs import Input, ProgramInputs, preprocess_external_inputs
 from interpreter.utils.input_parser import get_bpl_field_sizes
 
@@ -124,64 +124,141 @@ def _extract_param_info(program):
                 "private": is_private,
             })
 
+    # Also detect nondet constants ($u0, $u1, ...) — these are
+    # uninitialized local variables in the C source that SMACK
+    # promotes to global constants.  They need fuzz values for
+    # coverage-guided input generation (Code2Inv / SV-COMP benchmarks).
+    from interpreter.parser.declaration import ConstantDeclaration
+    import re
+    for d in program.declarations:
+        if isinstance(d, ConstantDeclaration):
+            for name in d.names:
+                if re.match(r'\$u\d+$', name):
+                    result.append({
+                        "name": name, "kind": "scalar",
+                        "private": False,
+                    })
+
+    return result
+
+
+def _extract_param_info_from_seed(seed_path):
+    """Extract parameter metadata from a seed .input file.
+
+    Used for void-wrapper benchmarks where the entry point has no formal
+    parameters — the input file declares local buffers/scalars to initialize.
+    """
+    import re
+    text = Path(seed_path).read_text()
+    lines = text.split('\n')
+
+    # Parse @params line
+    params_line = None
+    for line in lines:
+        m = re.match(r'^//\s*@params\s+(.+)$', line.strip())
+        if m:
+            params_line = m.group(1)
+            break
+    if not params_line:
+        return []
+
+    # Build ordered list of (c_name, bpl_name)
+    param_pairs = []
+    for pair in params_line.split():
+        if ':' in pair:
+            c_name, bpl_name = pair.split(':', 1)
+            param_pairs.append((c_name.strip(), bpl_name.strip()))
+
+    # Parse declarations to get types and sizes
+    result = []
+    private_next = False
+    for line in lines:
+        stripped = line.strip()
+        if '@private' in stripped:
+            private_next = True
+            continue
+        if stripped.startswith('//') or not stripped:
+            continue
+
+        # Match buffer: unsigned char name[N] = ...;
+        m = re.match(r'unsigned\s+char\s+(\w+)\[(\d+)\]\s*=', stripped)
+        if m:
+            c_name, size = m.group(1), int(m.group(2))
+            bpl_name = None
+            for cn, bn in param_pairs:
+                if cn == c_name:
+                    bpl_name = bn
+                    break
+            if bpl_name:
+                result.append({
+                    "name": bpl_name, "kind": "buffer",
+                    "private": private_next,
+                    "buffers": [{"size": size}],
+                })
+            private_next = False
+            continue
+
+        # Match scalar: size_t name = N;
+        m = re.match(r'size_t\s+(\w+)\s*=\s*(\d+)', stripped)
+        if m:
+            c_name = m.group(1)
+            bpl_name = None
+            for cn, bn in param_pairs:
+                if cn == c_name:
+                    bpl_name = bn
+                    break
+            if bpl_name:
+                result.append({
+                    "name": bpl_name, "kind": "scalar",
+                    "private": private_next,
+                })
+            private_next = False
+            continue
+
+        # Match struct start: struct auto_name name = {
+        m = re.match(r'struct\s+\w+\s+(\w+)\s*=\s*\{', stripped)
+        if m:
+            c_name = m.group(1)
+            bpl_name = None
+            for cn, bn in param_pairs:
+                if cn == c_name:
+                    bpl_name = bn
+                    break
+            if bpl_name:
+                # For structs in seed files, mark as struct with empty fields
+                # (the seed corpus loader will parse the full struct)
+                result.append({
+                    "name": bpl_name, "kind": "struct",
+                    "private": private_next, "struct": [],
+                })
+            private_next = False
+
     return result
 
 
 # ---------------------------------------------------------------------------
-# Hypothesis strategies
+# Base Hypothesis strategies
 # ---------------------------------------------------------------------------
 
-def _scalar_strategy():
-    """Strategy for scalar values (integers)."""
+def _scalar_base_strategy():
+    """Strategy for scalar values — weighted toward small values."""
     return st.one_of(
-        st.just(0),
-        st.just(1),
+        st.sampled_from([0, 1, 2, 3, 4, 5, 6, 7, 8]),
         st.integers(min_value=0, max_value=255),
-        st.integers(min_value=0, max_value=65535),
+        st.integers(min_value=0, max_value=0xFFFF),
         st.integers(min_value=0, max_value=(1 << 32) - 1),
     )
 
 
-def _buffer_strategy(size, private=False):
-    """Strategy for byte buffers of a given size."""
-    return st.one_of(
-        # Common patterns
-        st.just(bytes(size)),                          # zeros
-        st.just(bytes([0xFF] * size)),                 # ones
-        st.just(bytes(range(size)) if size <= 256      # sequential
-                else bytes(i % 256 for i in range(size))),
-        # Random bytes
-        st.binary(min_size=size, max_size=size),
-    )
-
-
-def _struct_strategy(fields):
-    """Strategy for struct inputs."""
-    field_strats = {}
-    for i, field in enumerate(fields):
-        key = f"field_{i}"
-        if field["is_ptr"]:
-            # Pointer field — generate buffer data
-            field_strats[key] = _buffer_strategy(field["size"])
-        else:
-            # Scalar field
-            field_strats[key] = _scalar_strategy()
-    return st.fixed_dictionaries(field_strats)
-
-
-def _build_strategies(param_info):
-    """Build a dict of Hypothesis strategies from parameter metadata."""
-    strats = {}
-    for p in param_info:
-        name = p["name"]
-        if p["kind"] == "scalar":
-            strats[name] = _scalar_strategy()
-        elif p["kind"] == "buffer":
-            size = p["buffers"][0]["size"] if p["buffers"] else 64
-            strats[name] = _buffer_strategy(size, p["private"])
-        elif p["kind"] == "struct":
-            strats[name] = _struct_strategy(p["struct"])
-    return strats
+@st.composite
+def _mutate_buffer_strategy(draw, seed_buf, size):
+    """Flip 1-8 random bytes in a seed buffer."""
+    buf = bytearray(seed_buf)
+    n_mutations = draw(st.integers(1, min(8, size)))
+    for _ in range(n_mutations):
+        idx = draw(st.integers(0, size - 1))
+        buf[idx] = draw(st.integers(0, 255))
+    return bytes(buf)
 
 
 # ---------------------------------------------------------------------------
@@ -321,7 +398,7 @@ def _inputs_to_input_str(param_info, program_inputs):
 class CoverageFuzzer:
     """Coverage-guided input generator using Hypothesis target()."""
 
-    def __init__(self, name, max_examples=200, target_pct=100.0, engine='python'):
+    def __init__(self, name, max_examples=200, target_pct=100.0, engine='native'):
         self.name = name
         self.max_examples = max_examples
         self.target_pct = target_pct
@@ -341,8 +418,17 @@ class CoverageFuzzer:
         # Extract parameter metadata
         self.param_info = _extract_param_info(self.program)
 
-        # Build strategies
-        self.strategies = _build_strategies(self.param_info)
+        # Void-wrapper fallback: extract params from seed input file
+        if not self.param_info:
+            seed = self.output_dir / "input_0.input"
+            if seed.exists():
+                self.param_info = _extract_param_info_from_seed(seed)
+                if self.param_info:
+                    print(f"[coverage-fuzz] Void wrapper detected, "
+                          f"extracted {len(self.param_info)} params from {seed.name}")
+
+        # Seed corpus (populated after _seed_from_existing)
+        self.seed_corpus = []
 
         # Coverage state
         self.cumulative_blocks = set()
@@ -350,7 +436,21 @@ class CoverageFuzzer:
         self.best_pct = 0.0
         self.saved_count = 0
         self.run_count = 0
+        self._last_new_block_at = 0
         self.start_time = None
+
+        # Pre-compile bytecode for native engine (avoids re-lowering every run)
+        self._compiled = None
+        if self.engine == 'native':
+            try:
+                import swoosh_interp
+                self._compiled = swoosh_interp.lower(self.program)
+            except ImportError:
+                print("[coverage-fuzz] Native interpreter not available, falling back to Python")
+                self.engine = 'python'
+            except BaseException as e:
+                print(f"[coverage-fuzz] Native lowering failed ({e}), falling back to Python")
+                self.engine = 'python'
 
         # Compute total block count
         entry = find_entry_point(self.program)
@@ -361,11 +461,20 @@ class CoverageFuzzer:
         """Run the interpreter and return explored blocks."""
         try:
             input_name = f"fuzz_{self.run_count}"
-            explored, _ = run_python(
-                self.program, program_inputs,
-                self.name, input_name,
-                full_trace=False, no_read_trace=True,
-            )
+            if self.engine == 'native' and self._compiled is not None:
+                explored, _ = run_native(
+                    self.program, program_inputs,
+                    self.name, input_name,
+                    log_read=False, pickled=False,
+                    compiled=self._compiled,
+                    no_trace=True,
+                )
+            else:
+                explored, _ = run_python(
+                    self.program, program_inputs,
+                    self.name, input_name,
+                    full_trace=False, no_read_trace=True,
+                )
             return explored
         except Exception as e:
             # Some inputs may cause assertion failures — that's fine, skip
@@ -382,22 +491,163 @@ class CoverageFuzzer:
         print(f"[coverage-fuzz] Saved {path.name}: +{len(new_blocks)} blocks "
               f"({len(self.cumulative_blocks)}/{self.total_blocks} = {pct}%)")
 
+    def _seed_from_existing(self):
+        """Seed cumulative coverage from existing .input files (avoid re-discovering)."""
+        from interpreter.utils.input_parser import parse_input_file, get_bpl_field_sizes
+        existing = sorted(self.output_dir.glob("*.input"))
+        if not existing:
+            return
+        field_sizes = get_bpl_field_sizes(self.pkg_path, program=self.program)
+        for path in existing:
+            try:
+                program_inputs = parse_input_file(path, field_sizes=field_sizes)
+                explored = self._run_interpreter(program_inputs)
+                self.cumulative_blocks |= explored
+            except Exception:
+                continue
+        if self.cumulative_blocks:
+            pct = 100.0 * len(self.cumulative_blocks) / self.total_blocks if self.total_blocks else 0
+            self.best_pct = pct
+            print(f"[coverage-fuzz] Seeded from {len(existing)} existing inputs: "
+                  f"{len(self.cumulative_blocks)}/{self.total_blocks} ({pct:.1f}%)")
+
+    def _load_seed_corpus(self):
+        """Parse existing .input files into raw dicts for seed mutation."""
+        from interpreter.utils.input_parser import parse_input_file, get_bpl_field_sizes
+        corpus = []
+        field_sizes = get_bpl_field_sizes(self.pkg_path, program=self.program)
+        for path in sorted(self.output_dir.glob("*.input")):
+            try:
+                pi = parse_input_file(path, field_sizes=field_sizes)
+                corpus.append(self._program_inputs_to_raw(pi))
+            except Exception:
+                continue
+        return corpus
+
+    def _program_inputs_to_raw(self, pi):
+        """Convert ProgramInputs to raw dict matching strategy output format."""
+        raw = {}
+        for p in self.param_info:
+            name = p["name"]
+            inp = pi.variables.get(name)
+            if inp is None:
+                continue
+            if p["kind"] == "scalar":
+                raw[name] = inp.value if inp.value is not None else 0
+            elif p["kind"] == "buffer":
+                size = p["buffers"][0]["size"] if p["buffers"] else 64
+                if inp.buffers:
+                    hex_str = inp.buffers[0].get("contents", "").replace("0x", "")
+                    raw[name] = bytes.fromhex(hex_str) if hex_str else bytes(size)
+                else:
+                    raw[name] = bytes(size)
+            elif p["kind"] == "struct":
+                struct_raw = {}
+                if inp.struct:
+                    for i, field in enumerate(inp.struct):
+                        key = f"field_{i}"
+                        if "buffer" in field:
+                            buf = field["buffer"]
+                            hex_str = buf.get("contents", "").replace("0x", "")
+                            struct_raw[key] = bytes.fromhex(hex_str) if hex_str else bytes(field["size"])
+                        else:
+                            val = field.get("value", "0x0")
+                            struct_raw[key] = int(val, 16) if isinstance(val, str) else int(val)
+                raw[name] = struct_raw
+        return raw
+
+    def _build_seed_aware_strategies(self):
+        """Build a composite strategy that mutates from seed corpus."""
+        seed_corpus = self.seed_corpus
+        param_info = self.param_info
+
+        # Build base strategies for each parameter
+        base = {}
+        for p in param_info:
+            name = p["name"]
+            if p["kind"] == "scalar":
+                base[name] = _scalar_base_strategy()
+            elif p["kind"] == "buffer":
+                size = p["buffers"][0]["size"] if p["buffers"] else 64
+                seed_bufs = [s[name] for s in seed_corpus
+                             if name in s and isinstance(s[name], bytes)
+                             and len(s[name]) == size]
+                options = [
+                    st.just(bytes(size)),
+                    st.just(bytes([0xFF] * size)),
+                    st.binary(min_size=size, max_size=size),
+                ]
+                for sb in seed_bufs[:5]:
+                    options.append(_mutate_buffer_strategy(sb, size))
+                base[name] = st.one_of(*options)
+            elif p["kind"] == "struct":
+                field_strats = {}
+                for i, field in enumerate(p["struct"]):
+                    key = f"field_{i}"
+                    if field["is_ptr"]:
+                        size = field["size"]
+                        seed_bufs = []
+                        for s in seed_corpus:
+                            sv = s.get(name)
+                            if (isinstance(sv, dict) and key in sv
+                                    and isinstance(sv[key], bytes)
+                                    and len(sv[key]) == size):
+                                seed_bufs.append(sv[key])
+                        options = [
+                            st.just(bytes(size)),
+                            st.just(bytes([0xFF] * size)),
+                            st.binary(min_size=size, max_size=size),
+                        ]
+                        for sb in seed_bufs[:5]:
+                            options.append(_mutate_buffer_strategy(sb, size))
+                        field_strats[key] = st.one_of(*options)
+                    else:
+                        field_strats[key] = _scalar_base_strategy()
+                base[name] = st.fixed_dictionaries(field_strats)
+
+        @st.composite
+        def combined(draw):
+            result = {}
+            use_seed = seed_corpus and draw(st.booleans())
+            seed = draw(st.sampled_from(seed_corpus)) if use_seed else {}
+            for p in param_info:
+                name = p["name"]
+                seed_val = seed.get(name)
+                if seed_val is not None and draw(st.integers(0, 9)) < 7:
+                    result[name] = seed_val
+                else:
+                    result[name] = draw(base[name])
+            return result
+
+        return combined()
+
     def run(self):
         """Run the coverage-guided fuzzing loop."""
         self.start_time = time.time()
 
-        print(f"[coverage-fuzz] Target: {self.name}")
+        # Seed from existing inputs so we only save inputs that add NEW coverage
+        self._seed_from_existing()
+        if self.best_pct >= self.target_pct:
+            print(f"[coverage-fuzz] Already at {self.best_pct:.1f}% — target {self.target_pct}% met.")
+            return self.best_pct
+
+        # Load seed corpus for mutation-based strategies
+        self.seed_corpus = self._load_seed_corpus()
+
+        print(f"[coverage-fuzz] Target: {self.name} (engine={self.engine})")
         print(f"[coverage-fuzz] Parameters: {len(self.param_info)}")
         print(f"[coverage-fuzz] Total blocks: {self.total_blocks}")
         print(f"[coverage-fuzz] Max examples: {self.max_examples}")
         print(f"[coverage-fuzz] Target coverage: {self.target_pct}%")
+        print(f"[coverage-fuzz] Seed corpus: {len(self.seed_corpus)} inputs")
         print()
 
-        # Combined strategy for all parameters
-        combined = st.fixed_dictionaries(self.strategies)
+        # Composite strategy: mutate from seeds + fresh generation
+        combined = self._build_seed_aware_strategies()
 
-        # Track target reached
+        # Track target reached / stagnation
         target_reached = [False]
+        stagnation_limit = max(self.max_examples // 3, 20)
 
         @settings(
             max_examples=self.max_examples,
@@ -419,6 +669,7 @@ class CoverageFuzzer:
             new_blocks = explored - self.cumulative_blocks
             if new_blocks:
                 self.cumulative_blocks |= new_blocks
+                self._last_new_block_at = self.run_count
                 self._save_input(program_inputs, new_blocks)
 
             pct = 100.0 * len(self.cumulative_blocks) / self.total_blocks if self.total_blocks else 0
@@ -428,6 +679,8 @@ class CoverageFuzzer:
             target(pct, label="block_coverage")
 
             if pct >= self.target_pct:
+                target_reached[0] = True
+            elif self.run_count - self._last_new_block_at >= stagnation_limit:
                 target_reached[0] = True
 
         try:

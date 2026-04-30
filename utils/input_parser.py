@@ -119,6 +119,7 @@ _FIELD_RE = re.compile(
 
 # @params directive
 _PARAMS_RE = re.compile(r'^//\s*@params\s+(.+)$')
+_EXTRA_DATA_RE = re.compile(r'^//\s*@extra_data\s+(.+)$')
 
 
 def parse_input_file(path, field_sizes=None):
@@ -137,13 +138,22 @@ def parse_input_file(path, field_sizes=None):
 
     # Extract @params mapping
     name_map = {}  # c_name -> bpl_name
+    extra_data = None
     for line in lines:
-        m = _PARAMS_RE.match(line.strip())
+        stripped = line.strip()
+        m = _PARAMS_RE.match(stripped)
         if m:
             for pair in m.group(1).split():
                 if ':' in pair:
                     c_name, bpl_name = pair.split(':', 1)
                     name_map[c_name.strip()] = bpl_name.strip()
+            continue
+        m = _EXTRA_DATA_RE.match(stripped)
+        if m:
+            data = m.group(1).strip()
+            if data.startswith("0x"):
+                data = data[2:]
+            extra_data = bytes.fromhex(data)
 
     # Parse declarations
     variables = {}
@@ -284,7 +294,7 @@ def parse_input_file(path, field_sizes=None):
         # Unknown line — skip
         i += 1
 
-    return ProgramInputs(variables=variables)
+    return ProgramInputs(variables=variables, extra_data=extra_data)
 
 
 # ---------------------------------------------------------------------------

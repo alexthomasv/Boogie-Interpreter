@@ -3,10 +3,9 @@ from interpreter.python.MemoryMap import MemoryMap
 from interpreter.parser.declaration import StorageDeclaration, ConstantDeclaration
 from interpreter.parser.expression import QuantifiedExpression, BinaryExpression
 from interpreter.utils.utils import extract_boogie_variables
+from interpreter.utils.raw_log import RawLogWriter
 from collections import defaultdict
 from pathlib import Path
-import pickle
-import struct
 import os
 
 
@@ -36,29 +35,22 @@ class Environment:
         self._trace_parts = []
         self._trace_size = 0
 
-        # Columnar trace accumulator (non-shadow rows only)
-        self._col_path = Path("positive_examples") / test_name / f"{input_name}.trace.pkl"
-        self._col_vars = []
-        self._col_values = []
-        self._col_blocks = []
-        self._col_last_blocks = []
-        self._col_pcs = []
-        self._col_op_types = []
-
-        # Compact trace accumulator (pre-aggregated for fast Redis loading)
-        self._compact_path = Path("positive_examples") / test_name / f"{input_name}.trace.compact.pkl"
-        self._agg_pc_values = defaultdict(set)
-        self._agg_block_values = defaultdict(set)
-        self._agg_op_values = defaultdict(set)
-        self._agg_pc_registry = defaultdict(set)
-        self._agg_block_registry = defaultdict(set)
+        # Raw-log sink (the ONLY persistent trace output).  Must be
+        # attached via ``enable_raw_log`` before any trace records are
+        # generated — concretization writes happen during interpreter init
+        # so the sink is installed immediately after construction.
+        self._raw_log: RawLogWriter | None = None
+        self._raw_log_path = Path("positive_examples") / test_name / f"{input_name}.trace.raw.zst"
+        self._var_id = {}     # var name -> u32 id (assigned lazily)
+        self._var_names_list = []
+        self._block_id = {}   # block name -> u32 id
+        self._block_names_list = []
+        # Monotonic per-(var, block) write counter for loop-iteration ids.
+        self._write_counter = defaultdict(int)  # (var, block) → count
+        # Total trace events (reads + writes); exposed via _agg_total for
+        # backwards-compatible callers.
         self._agg_total = 0
         self.full_trace = False
-
-        # Iteration counter for loop-aware co-occurrence tracking.
-        # Increments each time a variable is written in the same block,
-        # giving each loop iteration a unique ID per (var, block).
-        self._write_counter = defaultdict(int)  # (var, block) → count
 
         # Direct reference to the single frame's var_store for fast access
         self._var_store = self.stackFrames[0].var_store
@@ -99,8 +91,53 @@ class Environment:
             self.trace_file.flush()
             os.fsync(self.trace_file.fileno())
 
+    def enable_raw_log(self, var_names: list[str], block_names: list[str]):
+        """Create the raw-log writer with a pre-built var + block table.
+
+        The interpreter walks the program up front (``BoogieInterpreter``
+        does this via ``generate_label_to_block`` + the list of
+        declarations) and hands the complete name tables here so the
+        streaming header can be written immediately — records are then
+        appended as execution proceeds.
+
+        Names that appear later for any reason (e.g. a read of an uninitialised
+        var) are appended to the tables; the header already contains them.
+        """
+        if self._raw_log is not None:
+            return
+        self._raw_log_path.parent.mkdir(parents=True, exist_ok=True)
+        writer = RawLogWriter(self._raw_log_path)
+        self._var_names_list = list(var_names)
+        self._var_id = {n: i for i, n in enumerate(self._var_names_list)}
+        self._block_names_list = list(block_names)
+        self._block_id = {n: i for i, n in enumerate(self._block_names_list)}
+        writer.write_header(self._var_names_list, self._block_names_list)
+        self._raw_log = writer
+
+    def _intern_var(self, name: str) -> int:
+        vid = self._var_id.get(name)
+        if vid is None:
+            # A name we did not see during upfront scan. Shouldn't
+            # normally happen — if it does, we can't change the header,
+            # so the loader won't know about it.  Fall back to emitting
+            # a zero id and an error at finish time.
+            vid = len(self._var_names_list)
+            self._var_id[name] = vid
+            self._var_names_list.append(name)
+            self._late_vars = True
+        return vid
+
+    def _intern_block(self, name: str) -> int:
+        bid = self._block_id.get(name)
+        if bid is None:
+            bid = len(self._block_names_list)
+            self._block_id[name] = bid
+            self._block_names_list.append(name)
+            self._late_blocks = True
+        return bid
+
     def _append_trace(self, key, value, op_type):
-        # Skip shadow variables — consumer (init_positive_examples) skips them
+        # Skip shadow variables — downstream consumers skip them anyway.
         if key[-7:] == '.shadow':
             return
 
@@ -117,7 +154,6 @@ class Environment:
                     width = int(vtype.name[2:])
                     value = value & ((1 << width) - 1)
                 elif vtype.name in self._int_type_names:
-                    # Type aliases to int (e.g. type i32 = int)
                     if value >= (1 << 63):
                         value = value - (1 << 64)
 
@@ -132,152 +168,35 @@ class Environment:
             if self._trace_size > 50000:
                 self.dump_buffer_trace(fsync=False)
 
-        # Compact accumulation — raw values, pickled only at flush time
-        # Uses tuple keys to avoid per-entry string formatting
-        pc = self.pc
+        # The Python interpreter is used for init-phase concretization
+        # only — never inside a loop.  Emitting iter_id=0 matches the
+        # Rust "not in any loop" convention, and downstream consumers
+        # treat it as "no iteration info".
+        iteration_id = 0
 
-        # Track iteration ID for loop-aware co-occurrence
-        if op_type == "W":
-            iter_key = (key, cb)
-            self._write_counter[iter_key] += 1
-            iteration_id = self._write_counter[iter_key]
-        else:
-            # Reads use the current iteration of the most recent write
-            iteration_id = self._write_counter.get((key, cb), 0)
-        raw_val = (value, iteration_id)
-        self._agg_pc_values[(key, pc)].add(raw_val)
-        self._agg_block_values[(key, cb)].add(raw_val)
-        self._agg_op_values[(key, pc, op_type)].add(raw_val)
-        self._agg_pc_registry[key].add(pc)
-        self._agg_block_registry[key].add(cb)
         self._agg_total += 1
 
-    def flush_columnar(self):
-        """Write accumulated columnar trace data to a pickle file."""
-        if not self._col_vars:
-            return
-        data = {
-            'var': self._col_vars,
-            'value': self._col_values,
-            'block': self._col_blocks,
-            'last_block': self._col_last_blocks,
-            'pc': self._col_pcs,
-            'op_type': self._col_op_types,
-        }
-        with open(self._col_path, 'wb') as f:
-            pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
-
-    def flush_compact(self):
-        """Write pre-aggregated compact trace to a pickle file.
-
-        Pickling is deferred to here (not per-entry) for massive speedup.
-        """
-        if self._agg_total == 0:
-            return
-        # Convert tuple keys → string keys and pickle values at flush time
-        pc_values = {
-            f"positive_examples_{k}_{pc}": {pickle.dumps(v) for v in vals}
-            for (k, pc), vals in self._agg_pc_values.items()
-        }
-        block_values = {
-            f"positive_examples_{k}_{blk}": {pickle.dumps(v) for v in vals}
-            for (k, blk), vals in self._agg_block_values.items()
-        }
-        op_values = {
-            f"positive_examples_to_op_type_{k}_{pc}_{op}": {pickle.dumps(v) for v in vals}
-            for (k, pc, op), vals in self._agg_op_values.items()
-        }
-        pc_registry = {
-            f"positive_examples_to_pc_{k}": {pickle.dumps(p) for p in pcs}
-            for k, pcs in self._agg_pc_registry.items()
-        }
-        block_registry = {
-            f"positive_examples_to_block_{k}": {pickle.dumps(b) for b in blks}
-            for k, blks in self._agg_block_registry.items()
-        }
-        data = {
-            'pc_values': pc_values,
-            'block_values': block_values,
-            'op_values': op_values,
-            'pc_registry': pc_registry,
-            'block_registry': block_registry,
-            'total': self._agg_total,
-        }
-        with open(self._compact_path, 'wb') as f:
-            pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
-        self.flush_compact_bin()
-
-    def flush_compact_bin(self):
-        """Write compact trace in v2 streaming binary format with zstd compression.
-
-        Format: SWTR(4) + version(1,=2) + total(8) + 5 category sections + DONE(4)
-        Value categories: enc_flag(1,=1) + num_members(4) + num_members*8 raw LE bytes
-        PC registry: enc_flag(1,=2) + num_members(4) + num_members*4 raw LE bytes
-        Block registry: enc_flag(1,=0) + num_members(4) + [member_len(2) + member]*
-        """
-        if self._agg_total == 0:
+        if self._raw_log is None:
             return
 
-        import zstandard as zstd
+        kind = ord('W') if op_type == 'W' else ord('R')
+        var_id = self._intern_var(key)
+        block_id = self._intern_block(cb)
+        self._raw_log.record(kind, var_id, self.pc, block_id, int(value), iteration_id)
 
-        bin_path = str(self._compact_path).replace('.compact.pkl', '.compact.bin.zst')
-
-        value_categories = [
-            (0, self._agg_pc_values,    lambda k: f"positive_examples_{k[0]}_{k[1]}"),
-            (1, self._agg_block_values, lambda k: f"positive_examples_{k[0]}_{k[1]}"),
-            (2, self._agg_op_values,    lambda k: f"positive_examples_to_op_type_{k[0]}_{k[1]}_{k[2]}"),
-        ]
-
-        cctx = zstd.ZstdCompressor(level=3, threads=-1)
-        with open(bin_path, 'wb') as fh:
-            with cctx.stream_writer(fh) as writer:
-                writer.write(b"SWTR")
-                writer.write(struct.pack('<BQ', 3, self._agg_total))  # v3: with iteration IDs
-
-                # Value categories (enc_flag=3, pairs of 8-byte value + 4-byte iteration_id)
-                for cat_id, agg_dict, key_fn in value_categories:
-                    writer.write(struct.pack('<BI', cat_id, len(agg_dict)))
-                    for raw_key, vals in agg_dict.items():
-                        key_str = key_fn(raw_key).encode()
-                        writer.write(struct.pack('<H', len(key_str)))
-                        writer.write(key_str)
-                        # Extract (value, iteration_id) pairs
-                        pairs = [(v[0] if isinstance(v, tuple) else v,
-                                  v[1] if isinstance(v, tuple) and isinstance(v[1], int) else 0)
-                                 for v in vals]
-                        writer.write(struct.pack('<BI', 3, len(pairs)))  # enc_flag=3
-                        buf = bytearray(len(pairs) * 12)  # 8 bytes value + 4 bytes iter_id
-                        for i, (val, iter_id) in enumerate(pairs):
-                            # Use signed packing for negative values (integer-typed vars)
-                            struct.pack_into('<qI', buf, i * 12, val, iter_id)
-                        writer.write(buf)
-
-                # PC registry (enc_flag=2, 4-byte raw ints)
-                writer.write(struct.pack('<BI', 3, len(self._agg_pc_registry)))
-                for raw_key, pcs in self._agg_pc_registry.items():
-                    key_str = f"positive_examples_to_pc_{raw_key}".encode()
-                    writer.write(struct.pack('<H', len(key_str)))
-                    writer.write(key_str)
-                    pc_list = list(pcs)
-                    writer.write(struct.pack('<BI', 2, len(pc_list)))
-                    buf = bytearray(len(pc_list) * 4)
-                    for i, pc in enumerate(pc_list):
-                        struct.pack_into('<I', buf, i * 4, pc)
-                    writer.write(buf)
-
-                # Block registry (enc_flag=0, pickle)
-                writer.write(struct.pack('<BI', 4, len(self._agg_block_registry)))
-                for raw_key, blks in self._agg_block_registry.items():
-                    key_str = f"positive_examples_to_block_{raw_key}".encode()
-                    writer.write(struct.pack('<H', len(key_str)))
-                    writer.write(key_str)
-                    members = [pickle.dumps(b) for b in blks]
-                    writer.write(struct.pack('<BI', 0, len(members)))
-                    for m in members:
-                        writer.write(struct.pack('<H', len(m)))
-                        writer.write(m)
-
-                writer.write(b"DONE")
+    def flush_raw_log(self):
+        """Close the raw-log writer.  Returns the record count."""
+        if self._raw_log is None:
+            return 0
+        if getattr(self, '_late_vars', False) or getattr(self, '_late_blocks', False):
+            raise RuntimeError(
+                "raw-log: saw names not in the upfront scan — header is stale. "
+                f"late_vars={self._var_names_list[-10:]!r} "
+                f"late_blocks={self._block_names_list[-10:]!r}"
+            )
+        count = self._raw_log.finish()
+        self._raw_log = None
+        return count
 
     # Kept for backward compatibility
     def debug_print_set_value(self, key, value, op_type):

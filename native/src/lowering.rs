@@ -1,6 +1,6 @@
 use crate::opcodes::*;
 use pyo3::prelude::*;
-use pyo3::types::PyList;
+use pyo3::types::{PyDict, PyList, PyTuple};
 use rustc_hash::FxHashMap;
 
 /// Intern table: variable name → VarId
@@ -48,7 +48,29 @@ impl InternTable {
 }
 
 /// Lower a Python AST program into a CompiledProgram.
-pub fn lower_program(py: Python<'_>, program: &Bound<'_, PyAny>) -> PyResult<CompiledProgram> {
+///
+/// `loop_metadata`, when provided, is a dict with three keys mapping
+/// block NAMES to the loop structure produced by the compile pipeline
+/// (see `interpreter/runner.py::_build_loop_metadata`):
+///   * `is_loop_header`: list of block names that are loop headers
+///   * `block_innermost_header`: dict block_name -> innermost header name
+///   * `loop_parent_header`: dict inner_header name -> parent header name
+pub fn lower_program(
+    py: Python<'_>,
+    program: &Bound<'_, PyAny>,
+    loop_header_live: Option<&Bound<'_, PyDict>>,
+) -> PyResult<CompiledProgram> {
+    lower_program_full(py, program, loop_header_live, None)
+}
+
+/// Extended form that also carries loop metadata. `lower_program` is a
+/// back-compat wrapper that passes `None` for the metadata.
+pub fn lower_program_full(
+    py: Python<'_>,
+    program: &Bound<'_, PyAny>,
+    loop_header_live: Option<&Bound<'_, PyDict>>,
+    loop_metadata: Option<&Bound<'_, PyDict>>,
+) -> PyResult<CompiledProgram> {
     let mut intern = InternTable::new();
     let mut blocks = Vec::new();
     let mut label_to_block: FxHashMap<String, BlockId> = FxHashMap::default();
@@ -59,7 +81,6 @@ pub fn lower_program(py: Python<'_>, program: &Bound<'_, PyAny>) -> PyResult<Com
     let decls: &Bound<'_, PyList> = declarations.downcast()?;
 
     let mut impl_decl: Option<Bound<'_, PyAny>> = None;
-    let mut proc_decl: Option<Bound<'_, PyAny>> = None;
 
     for decl in decls.iter() {
         let type_name = decl.get_type().name()?.to_string();
@@ -68,12 +89,22 @@ pub fn lower_program(py: Python<'_>, program: &Bound<'_, PyAny>) -> PyResult<Com
             if !body.is_none() {
                 impl_decl = Some(decl.clone());
             }
-        } else if type_name == "ProcedureDeclaration" {
-            proc_decl = Some(decl.clone());
         }
     }
 
     let impl_d = impl_decl.expect("No ImplementationDeclaration with body found");
+    let impl_name: String = impl_d.getattr("name")?.extract()?;
+    let mut proc_decl: Option<Bound<'_, PyAny>> = None;
+    for decl in decls.iter() {
+        let type_name = decl.get_type().name()?.to_string();
+        if type_name == "ProcedureDeclaration" {
+            let name: String = decl.getattr("name")?.extract()?;
+            if name == impl_name {
+                proc_decl = Some(decl.clone());
+                break;
+            }
+        }
+    }
 
     // Process global declarations (initialize variables)
     for decl in decls.iter() {
@@ -162,6 +193,12 @@ pub fn lower_program(py: Python<'_>, program: &Bound<'_, PyAny>) -> PyResult<Com
         }
     }
 
+    let entry_preconditions = if let Some(ref pd) = proc_decl {
+        lower_entry_preconditions(py, pd, &mut intern)?
+    } else {
+        Vec::new()
+    };
+
     // First pass: build label → BlockId mapping
     let body_blocks = body.getattr("blocks")?;
     let body_blocks_list: &Bound<'_, PyList> = body_blocks.downcast()?;
@@ -171,7 +208,9 @@ pub fn lower_program(py: Python<'_>, program: &Bound<'_, PyAny>) -> PyResult<Com
     }
 
     // Second pass: lower blocks
-    let mut pc: u32 = 0;
+    // PC 0 is reserved as virtual entry (no statement), matching Python's
+    // initialize_code_metadata() in interpreter/utils/program.py.
+    let mut pc: u32 = 1;
     for block_obj in body_blocks_list.iter() {
         let name: String = block_obj.getattr("name")?.extract()?;
         let block_id = label_to_block[&name];
@@ -219,6 +258,24 @@ pub fn lower_program(py: Python<'_>, program: &Bound<'_, PyAny>) -> PyResult<Com
             start_pc,
             assume_cond,
         });
+    }
+
+    // Cross-check: verify our label_to_pc matches Python's initialize_code_metadata.
+    // This ensures the Rust interpreter records traces at the same PCs the verifier expects.
+    {
+        let py_program_mod = py.import_bound("interpreter.utils.program")?;
+        let py_result = py_program_mod.call_method1("initialize_code_metadata", (&impl_d,))?;
+        let py_tuple: &Bound<'_, PyTuple> = py_result.downcast()?;
+        let py_label_to_pc = py_tuple.get_item(1)?;
+        for block in &blocks {
+            let py_pc_obj = py_label_to_pc.call_method1("__getitem__", (&block.name,))?;
+            let py_pc: u32 = py_pc_obj.extract()?;
+            assert_eq!(
+                block.start_pc, py_pc,
+                "PC mismatch for block {}: Rust start_pc={} vs Python label_to_pc={}",
+                block.name, block.start_pc, py_pc
+            );
+        }
     }
 
     // Post-pass: resolve $CurrAddr alloc_size_var by scanning Python AST
@@ -323,6 +380,85 @@ pub fn lower_program(py: Python<'_>, program: &Bound<'_, PyAny>) -> PyResult<Com
     let m0_id = intern.get("$M.0");
     let m0_shadow_id = intern.get("$M.0.shadow");
 
+    // Build loop_header_live_vars from Python dict and fill LoopHeaderSnap stmts
+    let mut lh_live: FxHashMap<BlockId, Vec<VarId>> = FxHashMap::default();
+    if let Some(lh_dict) = loop_header_live {
+        for (key, val) in lh_dict.iter() {
+            let block_name: String = key.extract()?;
+            let var_names: Vec<String> = val.extract()?;
+            if let Some(&bid) = label_to_block.get(&block_name) {
+                let var_ids: Vec<VarId> = var_names.iter()
+                    .filter_map(|n| intern.get(n))
+                    .collect();
+                if !var_ids.is_empty() {
+                    lh_live.insert(bid, var_ids);
+                }
+            }
+        }
+        // Patch LoopHeaderSnap statements with their live_vars
+        for (bid, vars) in &lh_live {
+            let block = &mut blocks[*bid as usize];
+            for stmt in block.body.iter_mut() {
+                if let Stmt::LoopHeaderSnap { live_vars } = stmt {
+                    *live_vars = vars.clone();
+                    break;
+                }
+            }
+            // Also check terminator
+            if let Stmt::LoopHeaderSnap { live_vars } = &mut block.terminator {
+                *live_vars = vars.clone();
+            }
+        }
+    }
+
+    // Build parallel loop metadata arrays indexed by BlockId.  When
+    // metadata isn't supplied (e.g. tests), leave everything "no loop"
+    // — the tracer emits iter_id=0 for every write which is safe.
+    let n_blocks = blocks.len();
+    let mut is_loop_header = vec![false; n_blocks];
+    let mut block_innermost_header: Vec<Option<BlockId>> = vec![None; n_blocks];
+    let mut loop_parent_header: Vec<Option<BlockId>> = vec![None; n_blocks];
+
+    if let Some(meta) = loop_metadata {
+        // is_loop_header
+        if let Some(hdrs) = meta.get_item("is_loop_header")? {
+            let names: Vec<String> = hdrs.extract()?;
+            for name in names {
+                if let Some(&bid) = label_to_block.get(&name) {
+                    is_loop_header[bid as usize] = true;
+                }
+            }
+        }
+        // block_innermost_header: block_name -> header_name
+        if let Some(bh) = meta.get_item("block_innermost_header")? {
+            let d: &Bound<'_, PyDict> = bh.downcast()?;
+            for (k, v) in d.iter() {
+                let block_name: String = k.extract()?;
+                let header_name: String = v.extract()?;
+                if let (Some(&bid), Some(&hid)) = (
+                    label_to_block.get(&block_name),
+                    label_to_block.get(&header_name),
+                ) {
+                    block_innermost_header[bid as usize] = Some(hid);
+                }
+            }
+        }
+        // loop_parent_header: inner_header -> outer_header
+        if let Some(lp) = meta.get_item("loop_parent_header")? {
+            let d: &Bound<'_, PyDict> = lp.downcast()?;
+            for (k, v) in d.iter() {
+                let inner_name: String = k.extract()?;
+                let outer_name: String = v.extract()?;
+                if let (Some(&inner_bid), Some(&outer_bid)) = (
+                    label_to_block.get(&inner_name),
+                    label_to_block.get(&outer_name),
+                ) {
+                    loop_parent_header[inner_bid as usize] = Some(outer_bid);
+                }
+            }
+        }
+    }
+
     Ok(CompiledProgram {
         blocks,
         label_to_block,
@@ -330,12 +466,17 @@ pub fn lower_program(py: Python<'_>, program: &Bound<'_, PyAny>) -> PyResult<Com
         name_to_var: intern.map.clone(),
         is_shadow: intern.shadows().to_vec(),
         entry_block: 0,
+        entry_preconditions,
         mem_maps,
         num_vars: intern.len(),
         curr_addr_id,
         curr_addr_shadow_id,
         m0_id,
         m0_shadow_id,
+        loop_header_live_vars: lh_live,
+        is_loop_header,
+        block_innermost_header,
+        loop_parent_header,
     })
 }
 
@@ -387,10 +528,27 @@ fn lower_stmt(
             let expr = stmt.getattr("expression")?;
             let expr_type = expr.get_type().name()?.to_string();
 
-            // Check for assume true
+            // Check for assume true (may be loop_header)
             if expr_type == "BooleanLiteral" {
                 let val: bool = expr.getattr("value")?.extract()?;
                 if val {
+                    // Check for loop_header attribute → LoopHeaderSnap
+                    let has_lh: bool = stmt.call_method1(
+                        "has_attribute", ("loop_header",))?.extract()?;
+                    if has_lh {
+                        return Ok(Stmt::LoopHeaderSnap { live_vars: Vec::new() });
+                    }
+                    return Ok(Stmt::AssumeTrue);
+                }
+            }
+
+            // Loop invariants and hhoudini-injected assumes are verifier
+            // annotations, not runtime preconditions. Concrete execution
+            // shouldn't assert them — the actual loop iteration will
+            // establish the invariant naturally. Skip them.
+            for attr in ["loop_invariant", "hhoudini"].iter() {
+                let has: bool = stmt.call_method1("has_attribute", (*attr,))?.extract()?;
+                if has {
                     return Ok(Stmt::AssumeTrue);
                 }
             }
@@ -457,6 +615,17 @@ fn lower_call(py: Python<'_>, stmt: &Bound<'_, PyAny>, intern: &mut InternTable)
         return Ok(Stmt::CallPrintf { args });
     }
 
+    // __VERIFIER_nondet_* / __SMACK_nondet_* are ignored only when they do
+    // not assign a result. Otherwise the VM must consume the input int_seq
+    // schedule so generated havoc paths replay in native mode.
+    if is_nondet_call(&proc_name) {
+        let assignments = lower_call_assignments(stmt, intern)?;
+        if assignments.is_empty() {
+            return Ok(Stmt::CallIgnored);
+        }
+        return Ok(Stmt::CallNondet { assignments });
+    }
+
     // Check ignore patterns (simplified — match the Python regex patterns)
     if is_ignored_call(&proc_name) {
         return Ok(Stmt::CallIgnored);
@@ -497,7 +666,6 @@ fn lower_call(py: Python<'_>, stmt: &Bound<'_, PyAny>, intern: &mut InternTable)
         || proc_name.starts_with("br_hmac_")
         || proc_name.starts_with("br_sha")
         || proc_name.starts_with("llvm.bswap")
-        || proc_name == "__SMACK_nondet_int"
     {
         return Ok(Stmt::CallIgnored);
     }
@@ -557,10 +725,6 @@ fn is_printf_call(name: &str) -> bool {
 
 /// Check if a call should be ignored (matches Python's CALL_IGNORE_FN_PATTERNS).
 fn is_ignored_call(name: &str) -> bool {
-    // __VERIFIER_nondet_*
-    if name.starts_with("__VERIFIER_nondet_") {
-        return true;
-    }
     // boogie_si_record_*
     if name.starts_with("boogie_si_record_") {
         return true;
@@ -591,6 +755,19 @@ fn is_ignored_call(name: &str) -> bool {
         return true;
     }
     false
+}
+
+fn is_nondet_call(name: &str) -> bool {
+    name.starts_with("__VERIFIER_nondet_")
+        || name == "__SMACK_nondet"
+        || name == "__SMACK_nondet_int"
+        || name == "__SMACK_nondet_long"
+        || name == "__SMACK_nondet_short"
+        || name == "__SMACK_nondet_char"
+        || name == "__SMACK_nondet_uint"
+        || name == "__SMACK_nondet_ulong"
+        || name == "__SMACK_nondet_ushort"
+        || name == "__SMACK_nondet_uchar"
 }
 
 /// Lower a quantified assume (memset/memcpy patterns).
@@ -801,8 +978,44 @@ fn find_var_by_suffix_either_ref(vars: &[&(String, VarId)], suffixes: &[&str]) -
     panic!("No variable found with suffixes: {:?}", suffixes);
 }
 
+fn lower_entry_preconditions(
+    py: Python<'_>,
+    proc_decl: &Bound<'_, PyAny>,
+    intern: &mut InternTable,
+) -> PyResult<Vec<Expr>> {
+    let mut out = Vec::new();
+    let specs = proc_decl.getattr("specifications")?;
+    let specs_list: &Bound<'_, PyList> = specs.downcast()?;
+    for spec in specs_list.iter() {
+        if spec.get_type().name()?.to_string() != "RequiresClause" {
+            continue;
+        }
+
+        let expr = spec.getattr("expression")?;
+        if !is_true_expr(&expr)? {
+            out.push(lower_expr(py, &expr, intern)?);
+        }
+    }
+    Ok(out)
+}
+
+fn is_true_expr(expr: &Bound<'_, PyAny>) -> PyResult<bool> {
+    if expr.get_type().name()?.to_string() != "BooleanLiteral" {
+        return Ok(false);
+    }
+    expr.getattr("value")?.extract()
+}
+
 /// Lower a Python expression to a Rust Expr.
 fn lower_expr(py: Python<'_>, expr: &Bound<'_, PyAny>, intern: &mut InternTable) -> PyResult<Expr> {
+    lower_expr_impl(py, expr, intern)
+}
+
+fn lower_expr_impl(
+    py: Python<'_>,
+    expr: &Bound<'_, PyAny>,
+    intern: &mut InternTable,
+) -> PyResult<Expr> {
     let type_name = expr.get_type().name()?.to_string();
 
     match type_name.as_str() {
@@ -846,9 +1059,9 @@ fn lower_expr(py: Python<'_>, expr: &Bound<'_, PyAny>, intern: &mut InternTable)
                 "$store.i8" | "$store.i16" | "$store.i32" | "$store.i64" | "$store.i128" | "$store.ref"
             ) {
                 let bw = store_load_bitwidth(&f_name);
-                let map = lower_expr(py, &args_list.get_item(0)?, intern)?;
-                let index = lower_expr(py, &args_list.get_item(1)?, intern)?;
-                let value = lower_expr(py, &args_list.get_item(2)?, intern)?;
+                let map = lower_expr_impl(py, &args_list.get_item(0)?, intern)?;
+                let index = lower_expr_impl(py, &args_list.get_item(1)?, intern)?;
+                let value = lower_expr_impl(py, &args_list.get_item(2)?, intern)?;
                 return Ok(Expr::Store {
                     bit_width: bw,
                     map: Box::new(map),
@@ -863,8 +1076,8 @@ fn lower_expr(py: Python<'_>, expr: &Bound<'_, PyAny>, intern: &mut InternTable)
                 "$load.i8" | "$load.i16" | "$load.i32" | "$load.i64" | "$load.i128" | "$load.ref"
             ) {
                 let bw = store_load_bitwidth(&f_name);
-                let map = lower_expr(py, &args_list.get_item(0)?, intern)?;
-                let index = lower_expr(py, &args_list.get_item(1)?, intern)?;
+                let map = lower_expr_impl(py, &args_list.get_item(0)?, intern)?;
+                let index = lower_expr_impl(py, &args_list.get_item(1)?, intern)?;
                 return Ok(Expr::Load {
                     bit_width: bw,
                     map: Box::new(map),
@@ -881,7 +1094,7 @@ fn lower_expr(py: Python<'_>, expr: &Bound<'_, PyAny>, intern: &mut InternTable)
             if let Some(fn_id) = resolve_builtin(&f_name) {
                 let lowered_args: Vec<Expr> = args_list
                     .iter()
-                    .map(|a| lower_expr(py, &a, intern).unwrap())
+                    .map(|a| lower_expr_impl(py, &a, intern).unwrap())
                     .collect();
                 return Ok(Expr::Builtin {
                     fn_id,
@@ -911,8 +1124,8 @@ fn lower_expr(py: Python<'_>, expr: &Bound<'_, PyAny>, intern: &mut InternTable)
                 "+" => BinOp::Add,
                 _ => panic!("Unknown binary op: {}", op_str),
             };
-            let lhs_expr = lower_expr(py, &lhs, intern)?;
-            let rhs_expr = lower_expr(py, &rhs, intern)?;
+            let lhs_expr = lower_expr_impl(py, &lhs, intern)?;
+            let rhs_expr = lower_expr_impl(py, &rhs, intern)?;
             Ok(Expr::BinOp {
                 op,
                 lhs: Box::new(lhs_expr),
@@ -921,16 +1134,16 @@ fn lower_expr(py: Python<'_>, expr: &Bound<'_, PyAny>, intern: &mut InternTable)
         }
         "LogicalNegation" => {
             let inner = expr.getattr("expression")?;
-            let lowered = lower_expr(py, &inner, intern)?;
+            let lowered = lower_expr_impl(py, &inner, intern)?;
             Ok(Expr::Not(Box::new(lowered)))
         }
         "IfExpression" => {
             let cond = expr.getattr("condition")?;
             let then = expr.getattr("then")?;
             let else_ = expr.getattr("else_")?;
-            let cond_expr = lower_expr(py, &cond, intern)?;
-            let then_expr = lower_expr(py, &then, intern)?;
-            let else_expr = lower_expr(py, &else_, intern)?;
+            let cond_expr = lower_expr_impl(py, &cond, intern)?;
+            let then_expr = lower_expr_impl(py, &then, intern)?;
+            let else_expr = lower_expr_impl(py, &else_, intern)?;
             Ok(Expr::IfThenElse {
                 cond: Box::new(cond_expr),
                 then_: Box::new(then_expr),
@@ -940,7 +1153,7 @@ fn lower_expr(py: Python<'_>, expr: &Bound<'_, PyAny>, intern: &mut InternTable)
         "UnaryExpression" => {
             // Unary minus — just evaluate the inner expression (same as Python)
             let inner = expr.getattr("expression")?;
-            lower_expr(py, &inner, intern)
+            lower_expr_impl(py, &inner, intern)
         }
         _ => panic!("Unknown expression type: {}", type_name),
     }

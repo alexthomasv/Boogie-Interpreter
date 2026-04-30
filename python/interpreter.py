@@ -10,6 +10,7 @@ from interpreter.parser.statement import (
     AssertStatement, AssumeStatement, AssignStatement, Block,
     CallStatement, GotoStatement, HavocStatement, ReturnStatement,
 )
+from interpreter.parser.specifications import RequiresClause
 from interpreter.parser.declaration import (
     StorageDeclaration, ImplementationDeclaration, ProcedureDeclaration,
     ConstantDeclaration, AxiomDeclaration,
@@ -20,6 +21,7 @@ from interpreter.python.Environment import Environment
 from interpreter.python.MemoryMap import MemoryMap
 from interpreter.python.Buffer import ReadBuffer
 from interpreter.utils.utils import *
+from interpreter.utils.inputs import ProgramInputs
 import pickle
 import time
 from pathlib import Path
@@ -58,6 +60,33 @@ def find_entry_point(program):
     return None
 
 
+def _contains_isExternal(expr):
+    """True if the expression mentions `$isExternal`.
+
+    Concrete execution treats assume as assert, but `$isExternal` is a
+    verifier-only hint that always evaluates to 0 on heap pointers — it
+    would trigger spurious failures if we asserted it.
+    """
+    stack = [expr]
+    while stack:
+        node = stack.pop()
+        if node is None:
+            continue
+        if type(node) is FunctionApplication:
+            fname = getattr(node.function, "name", None)
+            if fname == "$isExternal":
+                return True
+        for attr in ("operands", "arguments"):
+            children = getattr(node, attr, None)
+            if children:
+                stack.extend(children)
+        for attr in ("left", "right", "operand", "expression", "map", "index"):
+            child = getattr(node, attr, None)
+            if child is not None:
+                stack.append(child)
+    return False
+
+
 _STORE_FNS = frozenset(["$store.i8", "$store.i16", "$store.i32", "$store.i64", "$store.ref"])
 _LOAD_FNS = frozenset(["$load.i8", "$load.i16", "$load.i32", "$load.i64", "$load.ref"])
 
@@ -67,6 +96,25 @@ _LOAD_BW = {fn: boogie_type_bitwidth[fn.split(".")[-1]] for fn in _LOAD_FNS}
 
 # Mask for 64-bit operations
 _MASK_64 = (1 << 64) - 1
+
+
+# ============================================================
+# AssertViolation — raised by _handle_assert when a concrete
+# input drives execution into a failing __VERIFIER_assert.
+# Subclass of AssertionError so existing top-level handlers
+# that catch AssertionError still stop the run, but callers
+# can intercept selectively and read the structured pc /
+# block / expression fields.
+# ============================================================
+
+class AssertViolation(AssertionError):
+    def __init__(self, stmt, pc, block, expr_str):
+        self.stmt = stmt
+        self.pc = pc
+        self.block = block
+        self.expr_str = expr_str
+        super().__init__(
+            f"Assert failed at pc={pc} block={block!r}: {expr_str}")
 
 
 # ============================================================
@@ -80,13 +128,24 @@ class BoogieInterpreter:
         # Accept either ProgramInputs or legacy dict[str, Input]
         if isinstance(program_inputs, ProgramInputs):
             self.inputs = program_inputs
-            self.program_inputs = program_inputs.with_shadows()
+            self.program_inputs = dict(program_inputs.variables)
         else:
             self.inputs = None
             self.program_inputs = program_inputs
         self.label_to_block = {}
         self.arr_inputs = []
         self.explored_blocks = set()
+        # Per-variable havoc-sequence state.  Keyed by Boogie var
+        # name; value is (seq:list[int], count:int).  Populated from
+        # any ProgramInputs entry that has ``havoc_seq`` set so the
+        # interpreter can pin SMACK-inlined ``__VERIFIER_nondet_int``
+        # calls to a concrete schedule of values, consumed in havoc
+        # order.  Falls back to 0 when the sequence is exhausted —
+        # which naturally exits ``while(__VERIFIER_nondet_int())``
+        # loops driving the program to assertion sites under a
+        # specific path.
+        self._havoc_seq_state: dict[str, tuple[list[int], int]] = {}
+        self._refresh_havoc_sequences()
         extra = self.inputs.extra_data if self.inputs else program_inputs.get("extra_data")
         if extra:
             self.external_buffer = ReadBuffer(extra)
@@ -150,6 +209,15 @@ class BoogieInterpreter:
         self._initialize_vars(program.declarations, kind="global")
         self._concretize_global_memory()
         self.arr_inputs, self.field_inputs = preprocess_external_inputs(self.impl_decl)
+        from interpreter.utils.inputs import gather_ptr_aliases
+        self.ptr_aliases = gather_ptr_aliases(self.impl_decl)
+
+    def _refresh_havoc_sequences(self):
+        self._havoc_seq_state = {}
+        for v_name, v_inp in self.program_inputs.items():
+            seq = getattr(v_inp, "havoc_seq", None)
+            if seq is not None:
+                self._havoc_seq_state[v_name] = (list(seq), 0)
 
     def _initialize_global_axioms(self, program):
         for decl in program.declarations:
@@ -197,17 +265,51 @@ class BoogieInterpreter:
                         self.env.set_value(lhs.name, rhs)
 
     def concretize_proc_inputs(self, procedure):
+        # Phase 1 of input concretization: scalar values only. Pointer-typed
+        # params (Input.buffers / Input.struct) are address-allocated later in
+        # concretize_input_memory; havoc_seq params are consumed lazily on
+        # nondet calls. Defaulting any of those to 0 here would silently
+        # neuter the test input — every benchmark would degenerate to "all
+        # buffers at NULL, all loop bounds 0", and traces become identical
+        # regardless of which input file was loaded.
         for param in procedure.parameters:
             assert len(param.names) == 1
             name = param.names[0]
-            if name in self.program_inputs and self.program_inputs[name].value is not None:
-                log.debug(f"Concretizing procedure input: {name} to {self.program_inputs[name]}")
-                self.env.set_value(name, self.program_inputs[name].value)
-            else:
-                log.warning(f"No concrete value found for parameter {name} — "
-                            f"defaulting to 0. Check @params mapping in input file "
-                            f"(expected {name}, available: {list(self.program_inputs.keys())})")
+            inp = self.program_inputs.get(name)
+            if inp is None:
+                if name.endswith(".shadow"):
+                    base_name = name.removesuffix(".shadow")
+                    base_inp = self.program_inputs.get(base_name)
+                    if base_inp is not None and getattr(base_inp, "private", False):
+                        log.debug(
+                            f"No input found for private shadow parameter {name} "
+                            "— defaulting to 0.")
+                        self.env.set_value(name, 0, silent=True)
+                        continue
+                log.warning(
+                    f"No input found for parameter {name} — defaulting to 0. "
+                    f"Available: {sorted(self.program_inputs.keys())}")
                 self.env.set_value(name, 0, silent=True)
+                continue
+            if inp.value is not None:
+                log.debug(f"Concretizing procedure input: {name} to {inp}")
+                self.env.set_value(name, inp.value)
+                continue
+            if inp.buffers or inp.struct:
+                log.debug(
+                    f"Deferring pointer concretization for {name} "
+                    f"(handled by concretize_input_memory)")
+                continue
+            if inp.havoc_seq is not None:
+                log.debug(
+                    f"Deferring havoc-seq concretization for {name} "
+                    f"(consumed lazily by nondet calls)")
+                continue
+            log.warning(
+                f"Input for parameter {name} has no value/buffers/struct/"
+                f"havoc_seq — defaulting to 0. This is a parser bug: every "
+                f"Input must populate at least one of these fields.")
+            self.env.set_value(name, 0, silent=True)
 
     # ----------------------------------------------------------
     # Memory concretization
@@ -219,12 +321,22 @@ class BoogieInterpreter:
         Args:
             alloc_requests: list of (ArrayInfo, buffer_size_bytes) tuples
         """
-        # Group by memory map, track max size per base_ptr
+        aliases = getattr(self, "ptr_aliases", {}) or {}
+
+        def canon(p):
+            seen = set()
+            while p in aliases and p not in seen:
+                seen.add(p)
+                p = aliases[p]
+            return p
+
+        # Group by memory map, track max size per base_ptr (after alias canonicalization)
         maps = defaultdict(lambda: defaultdict(int))
         for arr_info, buf_size in alloc_requests:
-            current = maps[arr_info.mem_map][arr_info.base_ptr]
+            c_ptr = canon(arr_info.base_ptr)
+            current = maps[arr_info.mem_map][c_ptr]
             if buf_size > current:
-                maps[arr_info.mem_map][arr_info.base_ptr] = buf_size
+                maps[arr_info.mem_map][c_ptr] = buf_size
 
         ptr_assignments = {}
         log.debug(f"{'MEM MAP':<15} | {'POINTER':<15} | {'ADDRESS':<10} | {'SIZE':<10}")
@@ -238,7 +350,66 @@ class BoogieInterpreter:
                 log.debug(f"{mem_map:<15} | {ptr:<15} | {hex(current_addr):<10} | {size:<10}")
                 current_addr += (size + 7) & ~7
 
+        # Propagate canonical-pointer addresses to their aliases
+        for alias_ptr, first_ptr in aliases.items():
+            root = canon(alias_ptr)
+            if root in ptr_assignments:
+                ptr_assignments[alias_ptr] = ptr_assignments[root]
+
         return ptr_assignments
+
+    def _validate_no_aliasing(self, ptr_assignments, alloc_requests):
+        """Hard fail if any two buffers in the same memory map overlap.
+
+        Pointers listed in ``self.ptr_aliases`` are intentionally aliased
+        (SMACK emitted a ``{:ptr_alias}`` annotation) and are treated as the
+        same buffer here.
+        """
+        aliases = getattr(self, "ptr_aliases", {}) or {}
+
+        def canon(p):
+            seen = set()
+            while p in aliases and p not in seen:
+                seen.add(p)
+                p = aliases[p]
+            return p
+
+        maps = defaultdict(lambda: defaultdict(int))
+        for arr_info, buf_size in alloc_requests:
+            c_ptr = canon(arr_info.base_ptr)
+            current = maps[arr_info.mem_map][c_ptr]
+            if buf_size > current:
+                maps[arr_info.mem_map][c_ptr] = buf_size
+
+        for mem_map, ptr_dict in maps.items():
+            ranges = []
+            for ptr, size in ptr_dict.items():
+                if ptr in ptr_assignments:
+                    addr = ptr_assignments[ptr]
+                    ranges.append((ptr, addr, addr + size))
+            ranges.sort(key=lambda x: x[1])
+            for i in range(len(ranges) - 1):
+                ptr_a, _, end_a = ranges[i]
+                ptr_b, start_b, _ = ranges[i + 1]
+                assert end_a <= start_b, (
+                    f"BUFFER ALIASING in {mem_map}: "
+                    f"{ptr_a}[..{end_a}) overlaps {ptr_b}[{start_b}..)")
+
+    def _warn_scalar_buffer_params(self):
+        """Warn if a param with BPL {:array} annotations was declared as scalar."""
+        for var_name, arr_infos in self.arr_inputs.items():
+            if '.shadow' in var_name:
+                continue
+            non_shadow = [a for a in arr_infos if '.shadow' not in a.mem_map]
+            if not non_shadow:
+                continue
+            inp = self.program_inputs.get(var_name)
+            if inp and inp.value is not None and not inp.buffers and not inp.struct:
+                log.warning(
+                    f"Parameter {var_name} has BPL array annotations "
+                    f"(maps to {non_shadow[0].mem_map}) but was declared as "
+                    f"scalar in input file — this may cause aliasing. "
+                    f"Declare as buffer instead.")
 
     def concretize_input_memory(self):
         """Concretize all input buffers and struct fields into memory maps.
@@ -258,30 +429,49 @@ class BoogieInterpreter:
                 continue
             arr_key = var_name
             shadow_key = f"{var_name}.shadow"
+            shadow_inp = self.program_inputs.get(shadow_key)
 
             if inp.buffers and arr_key in self.arr_inputs:
                 non_shadow = [a for a in self.arr_inputs[arr_key] if '.shadow' not in a.mem_map]
                 shadow = [a for a in self.arr_inputs.get(shadow_key, []) if '.shadow' in a.mem_map]
+                shadow_buffers = (
+                    shadow_inp.buffers
+                    if shadow_inp is not None and shadow_inp.buffers
+                    else inp.buffers
+                )
                 for buf, ai in zip(inp.buffers, non_shadow):
                     alloc_requests.append((ai, buf['size']))
-                for buf, ai in zip(inp.buffers, shadow):
+                for buf, ai in zip(shadow_buffers, shadow):
                     alloc_requests.append((ai, buf['size']))
 
             if inp.struct and arr_key in self.arr_inputs:
                 arr_non_shadow = [a for a in self.arr_inputs[arr_key] if '.shadow' not in a.mem_map]
                 arr_shadow = [a for a in self.arr_inputs.get(shadow_key, []) if '.shadow' in a.mem_map]
+                shadow_struct = (
+                    shadow_inp.struct
+                    if shadow_inp is not None and shadow_inp.struct
+                    else inp.struct
+                )
                 buf_idx = 0
-                for field in inp.struct:
+                for struct_idx, field in enumerate(inp.struct):
                     if 'buffer' in field:
                         buf_size = field['buffer']['size']
                         if buf_idx < len(arr_non_shadow):
                             alloc_requests.append((arr_non_shadow[buf_idx], buf_size))
+                        shadow_field = (
+                            shadow_struct[struct_idx]
+                            if struct_idx < len(shadow_struct)
+                            else field
+                        )
+                        shadow_size = shadow_field.get('buffer', field['buffer'])['size']
                         if buf_idx < len(arr_shadow):
-                            alloc_requests.append((arr_shadow[buf_idx], buf_size))
+                            alloc_requests.append((arr_shadow[buf_idx], shadow_size))
                         buf_idx += 1
 
         # Phase 2: Allocate and set addresses
         ptr_to_vals = self._allocate_addresses(alloc_requests)
+        self._validate_no_aliasing(ptr_to_vals, alloc_requests)
+        self._warn_scalar_buffer_params()
         for ptr, val in ptr_to_vals.items():
             self.env.set_value(ptr, val)
 
@@ -303,10 +493,16 @@ class BoogieInterpreter:
         non_shadow = [a for a in self.arr_inputs[var_name] if '.shadow' not in a.mem_map]
         shadow = [a for a in self.arr_inputs.get(f"{var_name}.shadow", [])
                   if '.shadow' in a.mem_map]
+        shadow_inp = self.program_inputs.get(f"{var_name}.shadow")
+        shadow_buffers = (
+            shadow_inp.buffers
+            if shadow_inp is not None and shadow_inp.buffers
+            else inp.buffers
+        )
 
         for datum, arr_info in zip(inp.buffers, non_shadow):
             self._write_buffer(datum, arr_info)
-        for datum, arr_info in zip(inp.buffers, shadow):
+        for datum, arr_info in zip(shadow_buffers, shadow):
             self._write_buffer(datum, arr_info)
 
     def _concretize_struct(self, var_name, inp):
@@ -318,6 +514,12 @@ class BoogieInterpreter:
         # Get BPL array annotations for buffers pointed to by this struct
         arr_infos = self.arr_inputs.get(var_name, [])
         arr_infos_shadow = self.arr_inputs.get(f"{var_name}.shadow", [])
+        shadow_inp = self.program_inputs.get(f"{var_name}.shadow")
+        shadow_struct = (
+            shadow_inp.struct
+            if shadow_inp is not None and shadow_inp.struct
+            else inp.struct
+        )
         # Non-shadow arrays only (for matching with JSON buffers)
         arr_non_shadow = [a for a in arr_infos if '.shadow' not in a.mem_map]
         arr_shadow = [a for a in arr_infos_shadow if '.shadow' in a.mem_map]
@@ -331,12 +533,17 @@ class BoogieInterpreter:
         # Write scalar fields (and shadows)
         field_idx = 0
         buffer_idx = 0
-        for struct_field in inp.struct:
+        for struct_idx, struct_field in enumerate(inp.struct):
+            shadow_field = (
+                shadow_struct[struct_idx]
+                if struct_idx < len(shadow_struct)
+                else struct_field
+            )
             if 'value' in struct_field:
                 # Scalar field — write value to memory map
                 self._write_field(struct_field, field_infos[field_idx])
                 if field_infos_shadow:
-                    self._write_field(struct_field, field_infos_shadow[field_idx])
+                    self._write_field(shadow_field, field_infos_shadow[field_idx])
                 field_idx += 1
             elif 'buffer' in struct_field:
                 # Pointer field — value is the allocated address of the buffer
@@ -353,7 +560,9 @@ class BoogieInterpreter:
                 # Write the buffer contents to the memory map
                 self._write_buffer(struct_field['buffer'], arr_info)
                 if buffer_idx < len(arr_shadow):
-                    self._write_buffer(struct_field['buffer'], arr_shadow[buffer_idx])
+                    self._write_buffer(
+                        shadow_field.get('buffer', struct_field['buffer']),
+                        arr_shadow[buffer_idx])
                 buffer_idx += 1
 
     def _write_buffer(self, datum, arr_info):
@@ -397,6 +606,7 @@ class BoogieInterpreter:
         self._initialize_vars(procedure.body.locals, kind="local")
         self.concretize_proc_inputs(procedure)
         self.concretize_input_memory()
+        self._check_entry_preconditions(procedure)
         log.debug(f"[execute_procedure] Concretized input memory")
 
         # Cache for the hot loop
@@ -423,8 +633,7 @@ class BoogieInterpreter:
                 assert False, f"Unknown statement type: {type(last_stmt)}"
 
         env.dump_buffer_trace(fsync=True)
-        env.flush_columnar()
-        env.flush_compact()
+        env.flush_raw_log()
         self._dump_mem_trace()
 
     def _execute_block(self, block, env, label_to_pc):
@@ -601,12 +810,34 @@ class BoogieInterpreter:
             self._handle_printf(stmt)
             return
         if any(pat.match(proc) for pat in CALL_IGNORE_FN_PATTERNS):
-            # For nondet functions, assign return value from input if available
-            if stmt.assignments and self.inputs and hasattr(self.inputs, 'variables'):
+            # For nondet functions, assign return value from input if
+            # available, else default to 0.  Three input shapes are
+            # honoured, in priority order:
+            #   1. ``havoc_seq``: a list of integers consumed in call
+            #      order — one element per invocation of this nondet
+            #      site.  When exhausted, falls back to 0 (which
+            #      naturally exits ``while(__VERIFIER_nondet_int())``
+            #      loops).  This is the only way to drive a specific
+            #      counterexample path through nondet-bounded loops
+            #      where the same SMACK-inlined variable name is
+            #      reused across many iterations.
+            #   2. ``value``: a scalar (the legacy $u0 / $u1
+            #      semantics — fixed value for every call).
+            #   3. default 0.
+            if stmt.assignments:
                 for v in stmt.assignments:
-                    inp = self.inputs.variables.get(str(v.name))
-                    if inp and hasattr(inp, 'value'):
-                        self._set_value(v.name, inp.value)
+                    val = 0
+                    name = str(v.name)
+                    seq_state = self._havoc_seq_state.get(name)
+                    if seq_state is not None:
+                        seq, count = seq_state
+                        val = seq[count] if count < len(seq) else 0
+                        self._havoc_seq_state[name] = (seq, count + 1)
+                    elif self.inputs and hasattr(self.inputs, 'variables'):
+                        inp = self.inputs.variables.get(name)
+                        if inp and getattr(inp, 'value', None) is not None:
+                            val = inp.value
+                    self._set_value(v.name, val)
             return
         if proc == "putc.cross_product":
             return
@@ -652,7 +883,11 @@ class BoogieInterpreter:
             self.eval(stmt.expression, debug=True)
             log.debug(f"Assertion {stmt.expression} is violated")
             self.env.dump_memory()
-            assert False, f"Assert failed: {stmt}"
+            raise AssertViolation(
+                stmt,
+                pc=self.env.pc,
+                block=self.env.curr_block,
+                expr_str=str(stmt.expression))
 
     def _handle_assume(self, stmt):
         expr = stmt.expression
@@ -660,8 +895,38 @@ class BoogieInterpreter:
             return
         if type(expr) is QuantifiedExpression:
             self._handle_quantified_assume(expr)
-        else:
-            self.eval(expr)
+            return
+        # `$isExternal` is a verifier-only hint that is always 0 on concrete
+        # heap pointers; skip asserting it (the verifier still honours the
+        # source-level assume).
+        if _contains_isExternal(expr):
+            return
+        result = self.eval(expr)
+        # Concrete execution: assume is treated as assert — if the expression
+        # is false we have been given inputs that violate a precondition the
+        # verifier is allowed to rely on. Fail loudly.
+        if result is None or result == 0 or result is False:
+            raise AssertionError(f"concrete assume failed: {expr}")
+
+    def _check_entry_preconditions(self, procedure):
+        specs = getattr(getattr(self, "proc_decl", None), "specifications", [])
+        if not specs:
+            return
+        if getattr(self.env, "curr_block", "") == "":
+            self.env.curr_block = procedure.body.blocks[0].name
+            self.env.pc = self.label_to_pc.get(self.env.curr_block, 0)
+
+        for spec in specs:
+            if not isinstance(spec, RequiresClause):
+                continue
+            expr = spec.expression
+            if type(expr) is BooleanLiteral and expr.value:
+                continue
+            if _contains_isExternal(expr):
+                continue
+            result = self.eval(expr)
+            if result is None or result == 0 or result is False:
+                raise AssertionError(f"concrete assume failed: requires {expr}")
 
     def _handle_havoc(self, stmt):
         names = {ident.name for ident in stmt.identifiers}
@@ -1021,11 +1286,16 @@ def process_single_input(input_file, test_name, test_path, force=False, full_tra
         # Build type map for type-aware trace values
         from interpreter.parser.declaration import TypeDeclaration, StorageDeclaration
         from interpreter.parser.type import IntegerType
-        # Find type names that alias to int (e.g. type i32 = int)
+        # Find type names that alias to int, following type chains
+        # (e.g. type ref = i64, type i64 = int → ref is int-typed)
         for d in program.declarations:
-            if isinstance(d, TypeDeclaration) and hasattr(d, 'type') and isinstance(d.type, IntegerType):
-                for n in d.names:
-                    environment._int_type_names.add(n)
+            if isinstance(d, TypeDeclaration) and hasattr(d, 'type') and d.type is not None:
+                resolved = d.type
+                while hasattr(resolved, 'expand') and resolved.expand() is not None:
+                    resolved = resolved.expand()
+                if isinstance(resolved, IntegerType):
+                    for n in d.names:
+                        environment._int_type_names.add(n)
         # Map variable names to their declared types
         for d in program.declarations:
             if isinstance(d, StorageDeclaration):
@@ -1044,6 +1314,40 @@ def process_single_input(input_file, test_name, test_path, force=False, full_tra
 
         entry = find_entry_point(program)
         assert entry is not None, "No entry point found"
+
+        # Gather every variable + block name so the raw-log header can
+        # be written up front.  Tracks non-shadow names only (shadow
+        # writes are skipped in _append_trace).
+        var_names = []
+        seen_var = set()
+        def _add_var(n):
+            if n and not n.endswith('.shadow') and n not in seen_var:
+                seen_var.add(n)
+                var_names.append(n)
+        for d in program.declarations:
+            if isinstance(d, StorageDeclaration):
+                for n in d.names:
+                    _add_var(n)
+            elif isinstance(d, ConstantDeclaration):
+                for n in d.names:
+                    _add_var(n)
+        if entry and entry.body:
+            for local_decl in entry.body.locals:
+                if isinstance(local_decl, StorageDeclaration):
+                    for n in local_decl.names:
+                        _add_var(n)
+        for p in entry.parameters:
+            for n in p.names:
+                _add_var(n)
+
+        block_names = ['GLOBAL']
+        seen_block = {'GLOBAL'}
+        if entry and entry.body:
+            for b in entry.body.blocks:
+                if b.name not in seen_block:
+                    seen_block.add(b.name)
+                    block_names.append(b.name)
+        environment.enable_raw_log(var_names, block_names)
 
         log.debug(f"[process_single_input] Executing entry procedure: {entry.name}")
         interp.execute_procedure(entry)

@@ -228,3 +228,77 @@ def term_to_string(term, id_to_cexpr=None, depth=0, indent=0):
         # Unknown kinds: use cvc5's built-in string representation
         return str(term)
 
+
+def _collect_flat(term, target_kind):
+    """Collect children of an n-ary node (AND/OR), flattening nested same-kind nodes."""
+    result = []
+    for i in range(term.getNumChildren()):
+        child = term[i]
+        if child.getNumChildren() > 0 and child.getKind() == target_kind:
+            result.extend(_collect_flat(child, target_kind))
+        else:
+            result.append(child)
+    return result
+
+
+def _pretty_atom(term, id_to_cexpr, inner_pad):
+    """Pretty-print an atom inside an IMPLIES chain — break AND/OR across lines."""
+    if term.getNumChildren() > 0:
+        kind = term.getKind()
+        if kind == Kind.AND:
+            children = _collect_flat(term, Kind.AND)
+            lines = [term_to_string(children[0], id_to_cexpr)]
+            for child in children[1:]:
+                lines.append(inner_pad + "/\\ " + term_to_string(child, id_to_cexpr))
+            return "\n".join(lines)
+        if kind == Kind.OR:
+            children = _collect_flat(term, Kind.OR)
+            lines = [term_to_string(children[0], id_to_cexpr)]
+            for child in children[1:]:
+                lines.append(inner_pad + "\\/ " + term_to_string(child, id_to_cexpr))
+            return "\n".join(lines)
+    return term_to_string(term, id_to_cexpr)
+
+
+def pretty_term(term, id_to_cexpr=None, indent=0, indent_str="    "):
+    """Multi-line pretty-print of a cvc5 term. Breaks on IMPLIES chains and AND/OR."""
+    if term is None:
+        return "EMPTY"
+
+    kind = term.getKind() if term.getNumChildren() > 0 else None
+    pad = indent_str * indent
+
+    # Flatten right-associative IMPLIES chains: A => (B => (C => D)) -> [A, B, C, D]
+    if kind == Kind.IMPLIES:
+        chain = []
+        cur = term
+        while cur.getNumChildren() > 0 and cur.getKind() == Kind.IMPLIES:
+            chain.append(cur[0])
+            cur = cur[1]
+        chain.append(cur)
+
+        lines = [pad + _pretty_atom(chain[0], id_to_cexpr, pad)]
+        for i, link in enumerate(chain[1:], 1):
+            inner_pad = indent_str * (indent + i)
+            lines.append(inner_pad + "=> " + _pretty_atom(link, id_to_cexpr, inner_pad + "   "))
+        return "\n".join(lines)
+
+    # Break AND conjuncts
+    if kind == Kind.AND:
+        children = _collect_flat(term, Kind.AND)
+        lines = [pad + term_to_string(children[0], id_to_cexpr)]
+        for child in children[1:]:
+            lines.append(pad + "/\\ " + term_to_string(child, id_to_cexpr))
+        return "\n".join(lines)
+
+    # Break OR disjuncts
+    if kind == Kind.OR:
+        children = _collect_flat(term, Kind.OR)
+        lines = [pad + term_to_string(children[0], id_to_cexpr)]
+        for child in children[1:]:
+            lines.append(pad + "\\/ " + term_to_string(child, id_to_cexpr))
+        return "\n".join(lines)
+
+    # Atomic — single line
+    return pad + term_to_string(term, id_to_cexpr)
+

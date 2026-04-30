@@ -266,7 +266,7 @@ def _run_interpreter_subprocess(pkg_name):
         return None
 
     trace_dir = Path(f"positive_examples/{pkg_name}")
-    compact_files = list(trace_dir.glob("*.trace.compact.pkl")) if trace_dir.exists() else []
+    compact_files = list(trace_dir.glob("*.trace.raw.zst")) if trace_dir.exists() else []
     if compact_files:
         # Already have traces, no need to re-run
         return {"exists": True, "path": compact_files[0]}
@@ -277,7 +277,7 @@ def _run_interpreter_subprocess(pkg_name):
         cwd=str(PROJECT_ROOT),
     )
 
-    compact_files = list(trace_dir.glob("*.trace.compact.pkl")) if trace_dir.exists() else []
+    compact_files = list(trace_dir.glob("*.trace.raw.zst")) if trace_dir.exists() else []
     return {
         "exists": len(compact_files) > 0 and r.returncode == 0,
         "path": compact_files[0] if compact_files else None,
@@ -332,7 +332,7 @@ class TestPkcsI15Interpreter:
 
     def test_compact_trace_has_data(self):
         trace_dir = Path("positive_examples/bearssl_test_pkcs1_i15")
-        compact_files = list(trace_dir.glob("*.trace.compact.pkl")) if trace_dir.exists() else []
+        compact_files = list(trace_dir.glob("*.trace.raw.zst")) if trace_dir.exists() else []
         if not compact_files:
             pytest.skip("No compact trace available")
         # Check file is non-trivial (> 1KB)

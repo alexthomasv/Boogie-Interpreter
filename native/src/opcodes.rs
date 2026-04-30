@@ -132,6 +132,8 @@ pub enum Stmt {
     Assume { expr: Expr },
     /// assume true — skip
     AssumeTrue,
+    /// Loop header snapshot: record current values of live vars for trace
+    LoopHeaderSnap { live_vars: Vec<VarId> },
     /// havoc x, y, ...
     Havoc { vars: Vec<VarId> },
     /// havoc $CurrAddr (or .shadow) — allocation: read size from alloc_size_var,
@@ -146,6 +148,8 @@ pub enum Stmt {
     Return,
     /// Calls that are ignored (verifier_nondet, etc.)
     CallIgnored,
+    /// __VERIFIER_nondet_* / __SMACK_nondet_* with assignment results.
+    CallNondet { assignments: Vec<VarId> },
     /// call printf.ref.* — read format string from $M.0, format args, print
     CallPrintf { args: Vec<Expr> },
     /// call time.cross_product
@@ -242,6 +246,8 @@ pub struct CompiledProgram {
     pub is_shadow: Vec<bool>,
     /// Entry block ID
     pub entry_block: BlockId,
+    /// Preconditions that must hold before the entry block executes.
+    pub entry_preconditions: Vec<Expr>,
     /// Memory map info for each VarId that holds a memory map
     pub mem_maps: Vec<MemMapInfo>,
     /// Total number of variables
@@ -254,4 +260,16 @@ pub struct CompiledProgram {
     pub m0_id: Option<VarId>,
     /// VarId for $M.0.shadow
     pub m0_shadow_id: Option<VarId>,
+    /// Loop header block → live variable IDs to snapshot
+    pub loop_header_live_vars: rustc_hash::FxHashMap<BlockId, Vec<VarId>>,
+    /// BlockId → true iff this block is a loop header.  Parallel arrays
+    /// to `blocks`; len == blocks.len().
+    pub is_loop_header: Vec<bool>,
+    /// BlockId → innermost enclosing loop header's BlockId (or None if
+    /// this block is not inside any loop).
+    pub block_innermost_header: Vec<Option<BlockId>>,
+    /// For each loop header BlockId, its parent (immediately-enclosing)
+    /// loop header, or None if it is a top-level loop.  Indexed by the
+    /// header's own BlockId; entries are None for non-header blocks.
+    pub loop_parent_header: Vec<Option<BlockId>>,
 }

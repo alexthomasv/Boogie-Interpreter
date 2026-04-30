@@ -16,8 +16,6 @@ from collections import defaultdict
 
 # ── Constants ────────────────────────────────────────────────────────────
 
-FINISH_PC = -1337
-ERROR_PC = -1338
 
 ASSERT_IGNORE_LIST = set(
     ["__VERIFIER_assert",
@@ -56,6 +54,7 @@ CALL_IGNORE_FN_PATTERNS = (
 
 CALL_IGNORE_LIST = set(
     ["__VERIFIER_nondet_int",
+    "__SMACK_nondet_int",
     "$initialize.cross_product",
     "$alloc",
     "corral_atomic_begin",

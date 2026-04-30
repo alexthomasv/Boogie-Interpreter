@@ -2,7 +2,7 @@ use crate::builtins;
 use crate::memory_map::MemoryMap;
 use crate::opcodes::*;
 use crate::trace::{TraceAccumulator, OP_READ, OP_WRITE};
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 const MASK_64: i64 = -1i64; // all bits set = u64::MAX as i64
 
@@ -13,7 +13,18 @@ pub enum Value {
     Map(usize), // index into VM.memory_maps
 }
 
+/// Structured VM stop reason for expected Boogie-level concrete execution
+/// outcomes. Internal VM errors still use panic/assert so callers can tell
+/// them apart from useful failing inputs.
+#[derive(Debug, Clone)]
+pub enum ExecutionStatus {
+    Completed,
+    AssertViolation { pc: u32, block: String },
+    AssumeViolation { pc: u32, block: String },
+}
+
 /// The virtual machine that executes compiled Boogie programs.
+#[derive(Clone)]
 pub struct VM {
     /// Variable store: VarId → Value
     pub vars: Vec<Value>,
@@ -48,14 +59,17 @@ pub struct VM {
     pub curr_addr_id: Option<VarId>,
     pub curr_addr_shadow_id: Option<VarId>,
     /// wlen_buf for write.cross_product
-    wlen_buf: [i64; 6],
-    wlen_buf_idx: usize,
+    pub wlen_buf: [i64; 6],
+    pub wlen_buf_idx: usize,
     /// External read buffer
     pub external_buffer: Vec<u8>,
     pub external_buffer_pos: usize,
     /// VarId for $M.0 and $M.0.shadow (for read.cross_product)
     pub m0_id: Option<VarId>,
     pub m0_shadow_id: Option<VarId>,
+    /// Per-variable nondet schedules loaded from .input int_seq entries.
+    pub havoc_sequences: FxHashMap<VarId, Vec<i64>>,
+    pub havoc_counts: FxHashMap<VarId, usize>,
 }
 
 impl VM {
@@ -63,6 +77,16 @@ impl VM {
         let n = program.num_vars as usize;
         let vars = vec![Value::Scalar(0); n];
         let var_to_map = vec![None; n];
+        let mut trace = TraceAccumulator::new();
+        // Install loop metadata so packed iter_id emission works.  The
+        // vectors are parallel to `program.blocks` and already include
+        // the non-loop defaults (all false / None) when the compile
+        // pipeline didn't pass metadata.
+        trace.set_loop_metadata(
+            program.is_loop_header.clone(),
+            program.block_innermost_header.clone(),
+            program.loop_parent_header.clone(),
+        );
         Self {
             vars,
             var_names: program.var_names.clone(),
@@ -74,7 +98,7 @@ impl VM {
             curr_block_id: 0,
             last_block: String::new(),
             explored_blocks: FxHashSet::default(),
-            trace: TraceAccumulator::new(),
+            trace,
             log_read: true,
             alloc_addr: 0,
             alloc_addr_shadow: 0,
@@ -87,7 +111,26 @@ impl VM {
             m0_id: program.m0_id,
             m0_shadow_id: program.m0_shadow_id,
             no_trace: false,
+            havoc_sequences: FxHashMap::default(),
+            havoc_counts: FxHashMap::default(),
         }
+    }
+
+    pub fn set_havoc_sequence(&mut self, var_id: VarId, seq: Vec<i64>) {
+        self.havoc_sequences.insert(var_id, seq);
+        self.havoc_counts.insert(var_id, 0);
+    }
+
+    #[inline]
+    pub fn next_havoc_value(&mut self, var_id: VarId) -> i64 {
+        let count = *self.havoc_counts.get(&var_id).unwrap_or(&0);
+        let value = self
+            .havoc_sequences
+            .get(&var_id)
+            .and_then(|seq| seq.get(count).copied())
+            .unwrap_or(0);
+        self.havoc_counts.insert(var_id, count + 1);
+        value
     }
 
     /// Initialize a memory map variable.
@@ -179,8 +222,11 @@ impl VM {
     }
 
     /// Execute the program starting from the entry block.
-    pub fn execute(&mut self, program: &CompiledProgram) {
+    pub fn execute(&mut self, program: &CompiledProgram) -> ExecutionStatus {
         let mut block_id = program.entry_block;
+        if let Some(status) = self.check_entry_preconditions(program) {
+            return status;
+        }
 
         loop {
             let block = &program.blocks[block_id as usize];
@@ -188,21 +234,29 @@ impl VM {
             self.last_block = std::mem::replace(&mut self.curr_block, block.name.clone());
             self.curr_block_id = block_id;
             self.pc = block.start_pc;
+            // Let the trace accumulator update its loop stack for this
+            // block entry — drives the packed iter_id semantics.
+            self.trace.on_block_enter(block_id);
 
             // Execute body statements
             for stmt in &block.body {
-                self.execute_stmt(stmt, program);
+                if let Err(status) = self.execute_stmt(stmt, program) {
+                    return status;
+                }
                 self.pc += 1;
             }
 
             // Handle terminator
             match &block.terminator {
-                Stmt::Return => break,
+                Stmt::Return => return ExecutionStatus::Completed,
                 Stmt::Goto { targets } => {
                     if targets.len() == 1 {
                         block_id = targets[0];
                     } else {
-                        block_id = self.resolve_branch(targets, program);
+                        match self.resolve_branch(targets, program) {
+                            Ok(next) => block_id = next,
+                            Err(status) => return status,
+                        }
                     }
                 }
                 _ => panic!("Block terminator must be Goto or Return"),
@@ -210,8 +264,31 @@ impl VM {
         }
     }
 
+    fn check_entry_preconditions(&mut self, program: &CompiledProgram) -> Option<ExecutionStatus> {
+        if program.entry_preconditions.is_empty() {
+            return None;
+        }
+        let entry = &program.blocks[program.entry_block as usize];
+        self.curr_block = entry.name.clone();
+        self.curr_block_id = program.entry_block;
+        self.pc = entry.start_pc;
+        for expr in &program.entry_preconditions {
+            if !self.eval_bool(expr, program) {
+                return Some(ExecutionStatus::AssumeViolation {
+                    pc: self.pc,
+                    block: self.curr_block.clone(),
+                });
+            }
+        }
+        None
+    }
+
     /// Resolve a multi-target goto by evaluating assume conditions.
-    fn resolve_branch(&mut self, targets: &[BlockId], program: &CompiledProgram) -> BlockId {
+    fn resolve_branch(
+        &mut self,
+        targets: &[BlockId],
+        program: &CompiledProgram,
+    ) -> Result<BlockId, ExecutionStatus> {
         let mut taken = None;
         for &target_id in targets {
             let block = &program.blocks[target_id as usize];
@@ -229,11 +306,18 @@ impl VM {
                 }
             }
         }
-        taken.expect("No goto condition is true")
+        taken.ok_or_else(|| ExecutionStatus::AssumeViolation {
+            pc: self.pc,
+            block: self.curr_block.clone(),
+        })
     }
 
     /// Execute a single statement.
-    fn execute_stmt(&mut self, stmt: &Stmt, program: &CompiledProgram) {
+    fn execute_stmt(
+        &mut self,
+        stmt: &Stmt,
+        program: &CompiledProgram,
+    ) -> Result<(), ExecutionStatus> {
         match stmt {
             Stmt::Assign1 { lhs, rhs } => {
                 let val = self.eval(rhs, program);
@@ -247,14 +331,40 @@ impl VM {
             }
             Stmt::Assert { expr } => {
                 if !self.eval_bool(expr, program) {
-                    panic!("Assertion failed at PC {}", self.pc);
+                    return Err(ExecutionStatus::AssertViolation {
+                        pc: self.pc,
+                        block: self.curr_block.clone(),
+                    });
                 }
             }
             Stmt::Assume { expr } => {
-                // Just evaluate; runtime assumes are consumed for side effects
-                self.eval(expr, program);
+                // `$isExternal` is a verifier-only hint that always reads 0 on
+                // heap pointers during concrete execution; skip asserting it.
+                if !expr_contains_is_external(expr) {
+                    // Concrete execution: assume is treated as assert — if the
+                    // expression is false, the inputs violate a precondition
+                    // the verifier is allowed to rely on, so fail loudly.
+                    if !self.eval_bool(expr, program) {
+                        return Err(ExecutionStatus::AssumeViolation {
+                            pc: self.pc,
+                            block: self.curr_block.clone(),
+                        });
+                    }
+                }
             }
             Stmt::AssumeTrue => {}
+            Stmt::LoopHeaderSnap { live_vars } => {
+                if !self.no_trace {
+                    for &vid in live_vars {
+                        if let Value::Scalar(val) = self.vars[vid as usize] {
+                            if !self.is_shadow[vid as usize] {
+                                self.trace.record(
+                                    vid, val, self.pc, self.curr_block_id, OP_WRITE);
+                            }
+                        }
+                    }
+                }
+            }
             Stmt::Havoc { vars } => {
                 for &var_id in vars {
                     self.clear_var(var_id);
@@ -296,6 +406,12 @@ impl VM {
                 self.get_scalar(*var_id);
             }
             Stmt::CallIgnored => {}
+            Stmt::CallNondet { assignments } => {
+                for &var_id in assignments {
+                    let value = self.next_havoc_value(var_id);
+                    self.set_scalar(var_id, value, false);
+                }
+            }
             Stmt::CallPrintf { args } => {
                 self.execute_printf(args, program);
             }
@@ -465,6 +581,7 @@ impl VM {
                 panic!("Terminator should not be in body statements")
             }
         }
+        Ok(())
     }
 
     /// Set a variable from an eval result.
@@ -656,11 +773,18 @@ impl VM {
     }
 
     /// Execute a printf call: read format string from $M.0, format args, print.
+    ///
+    /// printf is in the shadowing pass's EXEMPTION_LIST (see
+    /// passes/transform/shadowing.py:139), so its args are NOT doubled
+    /// — what we receive here is the original [fmt, args...] tuple.
+    /// Older revisions of this VM divided len()/2 assuming shadowing;
+    /// that crashed on single-arg ``printf.ref(.str.6)`` calls
+    /// (n==0 → vals[0] panic).
     fn execute_printf(&mut self, args: &[Expr], program: &CompiledProgram) {
+        if args.is_empty() {
+            return;  // malformed printf without format string — skip silently
+        }
         let vals: Vec<i64> = args.iter().map(|a| self.eval_i64(a, program)).collect();
-        // After shadowing, args are doubled. Take first half.
-        let n = vals.len() / 2;
-        let vals = &vals[..n];
 
         let m0_id = match self.m0_id {
             Some(id) => id,
@@ -894,4 +1018,31 @@ pub enum EvalResult {
     Scalar(i64),
     Bool(bool),
     MapRef(usize),
+}
+
+/// True if `expr` mentions `$isExternal` anywhere in its tree. Used to skip
+/// concrete assume-as-assert for verifier-only hints.
+fn expr_contains_is_external(expr: &Expr) -> bool {
+    match expr {
+        Expr::IsExternal => true,
+        Expr::Var(_) | Expr::Const(_) | Expr::Bool(_) => false,
+        Expr::BinOp { lhs, rhs, .. } => {
+            expr_contains_is_external(lhs) || expr_contains_is_external(rhs)
+        }
+        Expr::Builtin { args, .. } => args.iter().any(expr_contains_is_external),
+        Expr::Store { map, index, value, .. } => {
+            expr_contains_is_external(map)
+                || expr_contains_is_external(index)
+                || expr_contains_is_external(value)
+        }
+        Expr::Load { map, index, .. } => {
+            expr_contains_is_external(map) || expr_contains_is_external(index)
+        }
+        Expr::IfThenElse { cond, then_, else_ } => {
+            expr_contains_is_external(cond)
+                || expr_contains_is_external(then_)
+                || expr_contains_is_external(else_)
+        }
+        Expr::Not(inner) => expr_contains_is_external(inner),
+    }
 }

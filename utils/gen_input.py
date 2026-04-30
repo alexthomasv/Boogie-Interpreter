@@ -17,7 +17,8 @@ from interpreter.parser.declaration import (
 )
 from interpreter.parser.statement import CallStatement
 from interpreter.utils.inputs import (
-    preprocess_external_inputs, process_field_stmt, process_array_stmt,
+    input_contract_from_requires, preprocess_external_inputs,
+    process_field_stmt, process_array_stmt,
 )
 from interpreter.utils.program import RE_SMACK, RE_SMACK_NONDET, RE_VERIFIER
 
@@ -36,21 +37,38 @@ _SIG_RE = re.compile(
 )
 
 
-def _find_c_harness(entry_point_name, examples_dir):
-    """Search examples/ for the C file containing the entry point wrapper function."""
+def _find_c_harness(entry_point_name, examples_dir, benchmark_name=None):
+    """Find the C file containing the entry point wrapper function.
+
+    Prefer examples/<benchmark_name>/ before the broader examples/ scan so
+    similarly named wrappers in neighboring benchmarks do not win by directory
+    traversal order.
+    """
     examples = Path(examples_dir)
     if not examples.is_dir():
         return None
-    for c_file in examples.rglob("*.c"):
-        try:
-            text = c_file.read_text()
-        except Exception:
-            continue
-        # Look for the function definition
-        if re.search(rf'\b{re.escape(entry_point_name)}\s*\(', text):
-            return c_file
-    return None
 
+    roots = []
+    if benchmark_name:
+        preferred = examples / benchmark_name
+        if preferred.is_dir():
+            roots.append(preferred)
+    roots.append(examples)
+
+    seen = set()
+    for root in roots:
+        for c_file in sorted(root.rglob("*.c")):
+            if c_file in seen:
+                continue
+            seen.add(c_file)
+            try:
+                text = c_file.read_text()
+            except Exception:
+                continue
+            # Look for the function definition
+            if re.search(rf'\b{re.escape(entry_point_name)}\s*\(', text):
+                return c_file
+    return None
 
 def _parse_c_harness(c_file, entry_point_name):
     """Parse a C harness file to extract parameter info and SMACK annotations.
@@ -412,6 +430,7 @@ def _gather_struct_layout(proc, param_name):
 def _generate_bpl_fallback(program, bpl_param_names, impl_decl, proc_decl):
     """Generate template using only BPL annotations (no C source available)."""
     arr_map, field_map = preprocess_external_inputs(impl_decl)
+    private_params = _private_inputs_from_requires(proc_decl, bpl_param_names)
 
     template = []
     for param_name in bpl_param_names:
@@ -419,6 +438,7 @@ def _generate_bpl_fallback(program, bpl_param_names, impl_decl, proc_decl):
                        if '.shadow' not in fi.mem_map]
         arr_infos = [ai for ai in arr_map.get(param_name, [])
                      if '.shadow' not in ai.mem_map]
+        is_private = param_name in private_params
 
         if field_infos:
             layout = _gather_struct_layout(impl_decl, param_name)
@@ -440,7 +460,7 @@ def _generate_bpl_fallback(program, bpl_param_names, impl_decl, proc_decl):
                         'buffer': {'contents': f'zeros({buf_size})', 'size': buf_size},
                     })
             entry = {
-                'var': param_name, 'private': False,
+                'var': param_name, 'private': is_private,
                 '_comment': f'struct ({len(fields)} fields) — sizes may need adjustment',
                 'struct': fields,
             }
@@ -448,18 +468,23 @@ def _generate_bpl_fallback(program, bpl_param_names, impl_decl, proc_decl):
             ai = arr_infos[0]
             size = ai.elem_size * ai.num_elements
             entry = {
-                'var': param_name, 'private': False,
+                'var': param_name, 'private': is_private,
                 '_comment': f'buffer ({size} bytes) — size may need adjustment',
                 'buffers': [{'contents': f'zeros({size})', 'size': size}],
             }
         else:
             entry = {
-                'var': param_name, 'private': False,
+                'var': param_name, 'private': is_private,
                 '_comment': 'scalar', 'value': 0,
             }
         template.append(entry)
 
     return template
+
+
+def _private_inputs_from_requires(proc_decl, bpl_param_names):
+    _public, private = input_contract_from_requires(proc_decl, bpl_param_names)
+    return private
 
 
 # ---------------------------------------------------------------------------
@@ -492,7 +517,7 @@ def generate_template(pkg_path):
 
     # Try to find the C harness
     examples_dir = pkg_path.parent.parent / "examples"
-    c_file = _find_c_harness(entry_name, examples_dir)
+    c_file = _find_c_harness(entry_name, examples_dir, benchmark_name=name)
 
     if c_file:
         params, annotations = _parse_c_harness(c_file, entry_name)
@@ -519,7 +544,7 @@ def _load_template_context(pkg_path):
     entry_name = impl_decl.name.rsplit('.cross_product', 1)[0]
 
     examples_dir = pkg_path.parent.parent / "examples"
-    c_file = _find_c_harness(entry_name, examples_dir)
+    c_file = _find_c_harness(entry_name, examples_dir, benchmark_name=name)
     c_params = {}
     c_name_order = []
     if c_file:
