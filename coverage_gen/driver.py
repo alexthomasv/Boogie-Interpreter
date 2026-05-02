@@ -12,6 +12,7 @@ Usage:
 import argparse
 import copy
 from concurrent.futures import ProcessPoolExecutor, as_completed
+import hashlib
 import json
 import os
 import pickle
@@ -20,6 +21,8 @@ import re
 import sys
 import time
 from pathlib import Path
+from interpreter.utils.debug_log import DebugLogger
+from interpreter.utils.support_matrix import support_matrix_summary
 
 _BYTE_PATTERNS = [
     "0x00",
@@ -174,17 +177,34 @@ def _symbolic_worker(task):
     }
 
 
+def _path_task_progress(label: str, completed: int, total: int, result: dict):
+    if total <= 1:
+        return
+    step = max(1, total // 4)
+    if completed != total and completed % step != 0:
+        return
+    stats = result.get("stats", {}) or {}
+    print(f"[{label}] completed {completed}/{total} seeds | "
+          f"candidates={len(result.get('candidates') or [])} "
+          f"states={stats.get('states_explored', 0)} "
+          f"solver_queries={stats.get('solver_queries', 0)} "
+          f"frontier={stats.get('frontier_ranked_objectives', 0)}")
+
+
 class CoverageExecutor:
     """Evaluator facade with optional fork-backed parallel candidate execution."""
 
     def __init__(self, program, test_name: str, *, timeout: int,
-                 engine: str, jobs: int | None):
+                 engine: str, jobs: int | None, debug_logger=None):
         from interpreter.coverage_gen.evaluator import Evaluator
 
+        self.debug = (debug_logger or DebugLogger.disabled()).bind(
+            component="coverage-executor", test_name=test_name)
         self.jobs, self.cpu_count = _resolve_jobs(jobs)
         self.parallel_enabled = self.jobs > 1 and hasattr(os, "fork")
         self.evaluator = Evaluator(program, test_name, timeout=timeout,
-                                   engine=engine)
+                                   engine=engine,
+                                   debug_logger=self.debug)
         self.runs = 0
         self.timeouts = 0
         self.errors = 0
@@ -231,6 +251,8 @@ class CoverageExecutor:
     def evaluate_many(self, tasks: list[tuple[int, object, str]]) -> list[dict]:
         if not tasks:
             return []
+        self.debug.event("candidate", "evaluate_many_start", count=len(tasks),
+                         parallel=self.parallel_enabled)
         if not self.parallel_enabled or self._executor is None:
             results = []
             for index, program_inputs, input_name in tasks:
@@ -257,6 +279,11 @@ class CoverageExecutor:
                 })
                 results.append(result)
                 self._merge_eval_stats(result)
+            self.debug.event("candidate", "evaluate_many_end",
+                             count=len(results),
+                             runs=self.runs,
+                             errors=self.errors,
+                             timeouts=self.timeouts)
             return results
 
         futures = {
@@ -278,11 +305,19 @@ class CoverageExecutor:
                 }
             results.append(result)
             self._merge_eval_stats(result)
-        return sorted(results, key=lambda r: r["index"])
+        out = sorted(results, key=lambda r: r["index"])
+        self.debug.event("candidate", "evaluate_many_end",
+                         count=len(out),
+                         runs=self.runs,
+                         errors=self.errors,
+                         timeouts=self.timeouts)
+        return out
 
     def concolic_many(self, tasks: list[dict]) -> list[dict]:
         if not tasks:
             return []
+        self.debug.event("solver", "concolic_many_start",
+                         count=len(tasks), parallel=self.parallel_enabled)
         if not hasattr(self.evaluator, "concolic_suggest"):
             return [
                 {
@@ -295,7 +330,8 @@ class CoverageExecutor:
             ]
         if not self.parallel_enabled or self._executor is None:
             results = []
-            for task in tasks:
+            total = len(tasks)
+            for completed, task in enumerate(tasks, start=1):
                 before_errors = self.evaluator.errors
                 candidates, stats = self.evaluator.concolic_suggest(
                     **task["kwargs"])
@@ -307,6 +343,9 @@ class CoverageExecutor:
                 }
                 results.append(result)
                 self.errors += int(result.get("errors", 0))
+                _path_task_progress("concolic", completed, total, result)
+            self.debug.event("solver", "concolic_many_end",
+                             count=len(results), errors=self.errors)
             return results
 
         futures = {
@@ -314,7 +353,10 @@ class CoverageExecutor:
             for task in tasks
         }
         results = []
+        total = len(futures)
+        completed = 0
         for fut in as_completed(futures):
+            completed += 1
             try:
                 result = fut.result()
             except Exception as exc:
@@ -326,11 +368,17 @@ class CoverageExecutor:
                 }
             results.append(result)
             self.errors += int(result.get("errors", 0))
-        return sorted(results, key=lambda r: r["index"])
+            _path_task_progress("concolic", completed, total, result)
+        out = sorted(results, key=lambda r: r["index"])
+        self.debug.event("solver", "concolic_many_end",
+                         count=len(out), errors=self.errors)
+        return out
 
     def symbolic_many(self, tasks: list[dict]) -> list[dict]:
         if not tasks:
             return []
+        self.debug.event("solver", "symbolic_many_start",
+                         count=len(tasks), parallel=self.parallel_enabled)
         if not hasattr(self.evaluator, "symbolic_explore"):
             return [
                 {
@@ -343,7 +391,8 @@ class CoverageExecutor:
             ]
         if not self.parallel_enabled or self._executor is None:
             results = []
-            for task in tasks:
+            total = len(tasks)
+            for completed, task in enumerate(tasks, start=1):
                 before_errors = self.evaluator.errors
                 candidates, stats = self.evaluator.symbolic_explore(
                     **task["kwargs"])
@@ -355,6 +404,9 @@ class CoverageExecutor:
                 }
                 results.append(result)
                 self.errors += int(result.get("errors", 0))
+                _path_task_progress("symbolic", completed, total, result)
+            self.debug.event("solver", "symbolic_many_end",
+                             count=len(results), errors=self.errors)
             return results
 
         futures = {
@@ -362,7 +414,10 @@ class CoverageExecutor:
             for task in tasks
         }
         results = []
+        total = len(futures)
+        completed = 0
         for fut in as_completed(futures):
+            completed += 1
             try:
                 result = fut.result()
             except Exception as exc:
@@ -374,7 +429,11 @@ class CoverageExecutor:
                 }
             results.append(result)
             self.errors += int(result.get("errors", 0))
-        return sorted(results, key=lambda r: r["index"])
+            _path_task_progress("symbolic", completed, total, result)
+        out = sorted(results, key=lambda r: r["index"])
+        self.debug.event("solver", "symbolic_many_end",
+                         count=len(out), errors=self.errors)
+        return out
 
     def _merge_eval_stats(self, result: dict):
         self.runs += int(result.get("runs", 0))
@@ -425,9 +484,11 @@ def _record_candidate_result(corpus, out_dir: Path, candidate, covered: set,
                              debug_candidates: bool = False,
                              status: str = "ok",
                              violation_pc=None,
-                             violation_block=None):
+                             violation_block=None,
+                             debug_logger=None):
     from interpreter.coverage_gen.writer import write_input_file
 
+    debug = debug_logger or DebugLogger.disabled()
     new_blocks = covered - corpus.covered
     text = None
     if status == "assert_violation":
@@ -437,6 +498,10 @@ def _record_candidate_result(corpus, out_dir: Path, candidate, covered: set,
             if debug_candidates:
                 print(f"[{label}:assert-skip] duplicate assertion trace | "
                       f"pc={pc_key}")
+            debug.event("candidate", "candidate_skip",
+                        label=label, reason="duplicate_assertion",
+                        status=status, violation_pc=violation_pc,
+                        violation_block=violation_block)
             return None, gen_idx, trace_idx
         corpus.assertion_signatures.add(assertion_sig)
 
@@ -458,6 +523,11 @@ def _record_candidate_result(corpus, out_dir: Path, candidate, covered: set,
         else:
             print(f"[{label}:assert] failing input recorded for feedback | "
                   f"wrote assert_{assert_idx}.input | {loc}")
+        debug.event("candidate", "candidate_assertion",
+                    label=label, output=str(out_path),
+                    new_blocks=len(new_blocks),
+                    violation_pc=violation_pc,
+                    violation_block=violation_block)
         return "assertion", gen_idx, trace_idx
 
     if status == "assume_violation":
@@ -466,6 +536,10 @@ def _record_candidate_result(corpus, out_dir: Path, candidate, covered: set,
             if violation_block:
                 loc += f" block={violation_block}"
             print(f"[{label}:assume] invalid precondition input | {loc}")
+        debug.event("candidate", "candidate_skip",
+                    label=label, reason="assume_violation",
+                    violation_pc=violation_pc,
+                    violation_block=violation_block)
         return None, gen_idx, trace_idx
 
     if new_blocks:
@@ -477,6 +551,11 @@ def _record_candidate_result(corpus, out_dir: Path, candidate, covered: set,
         print(f"[{label}] +{len(new_blocks):3d} blocks -> "
               f"{len(corpus.covered):5d} total | wrote gen_{gen_idx}.input | "
               f"{_sample_blocks(new_blocks)}")
+        debug.event("candidate", "candidate_kept",
+                    label=label, reason="new_coverage",
+                    output=str(out_path),
+                    new_blocks=sorted(new_blocks),
+                    blocks_total=len(corpus.covered))
         return "coverage", gen_idx + 1, trace_idx
 
     if allow_trace and corpus.should_add_trace(candidate, covered):
@@ -487,16 +566,24 @@ def _record_candidate_result(corpus, out_dir: Path, candidate, covered: set,
                       source=label, allow_trace=True):
             print(f"[{label}:trace] kept distinct trace | "
                   f"wrote trace_{trace_idx}.input")
+            debug.event("candidate", "candidate_kept",
+                        label=label, reason="trace_diversity",
+                        output=str(out_path))
             return "trace", gen_idx, trace_idx + 1
 
     if debug_candidates:
         print(f"[{label}:skip] no new coverage or trace diversity")
+    debug.event("candidate", "candidate_skip",
+                label=label, reason="no_new_coverage_or_trace",
+                status=status, covered=len(covered))
     return None, gen_idx, trace_idx
 
 
 def _record_seed_assertion_feedback(corpus, path: Path, inputs, covered: set,
                                     params_line: str, result: dict,
-                                    *, debug_candidates: bool = False):
+                                    *, debug_candidates: bool = False,
+                                    debug_logger=None):
+    debug = debug_logger or DebugLogger.disabled()
     pc = result.get("violation_pc")
     pc_key = str(pc) if pc is not None else "unknown"
     assertion_sig = (pc_key, corpus.trace_signature(inputs, covered))
@@ -504,6 +591,8 @@ def _record_seed_assertion_feedback(corpus, path: Path, inputs, covered: set,
         if debug_candidates:
             print(f"[seed:assert-skip] {path.name} duplicate assertion trace | "
                   f"pc={pc_key}")
+        debug.event("candidate", "seed_assertion_skip",
+                    path=str(path), reason="duplicate_assertion", pc=pc_key)
         return
 
     corpus.assertion_signatures.add(assertion_sig)
@@ -519,11 +608,15 @@ def _record_seed_assertion_feedback(corpus, path: Path, inputs, covered: set,
         if block:
             loc += f" block={block}"
         print(f"[seed:assert] {path.name} recorded for feedback | {loc}")
+    debug.event("candidate", "seed_assertion_feedback",
+                path=str(path), pc=pc_key,
+                block=result.get("violation_block"))
 
 
 def _write_candidate(corpus, evaluator, out_dir: Path, candidate,
                      params_line: str, gen_idx: int, trace_idx: int,
-                     label: str, *, allow_trace: bool = True):
+                     label: str, *, allow_trace: bool = True,
+                     debug_logger=None):
     result = _run_eval(evaluator, candidate, f"gen_{gen_idx}")
     return _record_candidate_result(
         corpus, out_dir, candidate, result["covered"], params_line, gen_idx, trace_idx,
@@ -531,15 +624,17 @@ def _write_candidate(corpus, evaluator, out_dir: Path, candidate,
         status=result.get("status", "ok"),
         violation_pc=result.get("violation_pc"),
         violation_block=result.get("violation_block"),
+        debug_logger=debug_logger,
     )
 
 
 def _write_interesting(corpus, evaluator, out_dir: Path, candidate,
-                       params_line: str, gen_idx: int, label: str) -> tuple[bool, int]:
+                       params_line: str, gen_idx: int, label: str,
+                       *, debug_logger=None) -> tuple[bool, int]:
     trace_idx = _next_trace_idx(out_dir)
     kind, gen_idx, _trace_idx = _write_candidate(
         corpus, evaluator, out_dir, candidate, params_line, gen_idx,
-        trace_idx, label, allow_trace=False,
+        trace_idx, label, allow_trace=False, debug_logger=debug_logger,
     )
     return kind == "coverage", gen_idx
 
@@ -547,7 +642,11 @@ def _write_interesting(corpus, evaluator, out_dir: Path, candidate,
 def _evaluate_candidate_batch(corpus, executor: CoverageExecutor, out_dir: Path,
                               candidates: list[tuple[object, str, str]],
                               *, gen_idx: int, trace_idx: int,
-                              debug_candidates: bool = False):
+                              debug_candidates: bool = False,
+                              debug_logger=None):
+    debug = debug_logger or DebugLogger.disabled()
+    debug.event("candidate", "candidate_batch_start",
+                count=len(candidates))
     tasks = [
         (idx, candidate, f"{label}_{idx}")
         for idx, (candidate, _params_line, label) in enumerate(candidates)
@@ -565,21 +664,28 @@ def _evaluate_candidate_batch(corpus, executor: CoverageExecutor, out_dir: Path,
             status=result.get("status", "ok"),
             violation_pc=result.get("violation_pc"),
             violation_block=result.get("violation_block"),
+            debug_logger=debug,
         )
         if kind == "coverage":
             coverage_new += 1
         elif kind == "trace":
             trace_new += 1
+    debug.event("candidate", "candidate_batch_end",
+                count=len(candidates), coverage_new=coverage_new,
+                trace_new=trace_new)
     return coverage_new, trace_new, gen_idx, trace_idx
 
 
 def _load_seeds(seed_dir: Path, corpus, executor: CoverageExecutor,
-                *, debug_candidates: bool = False) -> int:
+                *, debug_candidates: bool = False, debug_logger=None) -> int:
     from interpreter.coverage_gen.corpus import _extract_params_line
     from interpreter.utils.input_parser import parse_input_file
 
+    debug = debug_logger or DebugLogger.disabled()
     seed_dir = Path(seed_dir)
+    debug.event("candidate", "seed_load_start", seed_dir=str(seed_dir))
     if not seed_dir.exists():
+        debug.event("candidate", "seed_load_missing", seed_dir=str(seed_dir))
         return 0
 
     parsed = []
@@ -589,6 +695,8 @@ def _load_seeds(seed_dir: Path, corpus, executor: CoverageExecutor,
         except Exception as exc:
             corpus.invalid_inputs += 1
             print(f"[corpus] Warning: could not load seed {p.name}: {exc}")
+            debug.event("candidate", "seed_parse_error",
+                        path=str(p), error=f"{type(exc).__name__}: {exc}")
 
     tasks = [
         (idx, inputs, path.stem)
@@ -603,7 +711,8 @@ def _load_seeds(seed_dir: Path, corpus, executor: CoverageExecutor,
         if status == "assert_violation":
             _record_seed_assertion_feedback(
                 corpus, path, inputs, covered, params_line, result,
-                debug_candidates=debug_candidates)
+                debug_candidates=debug_candidates,
+                debug_logger=debug)
             continue
         if status == "assume_violation":
             if debug_candidates:
@@ -614,10 +723,16 @@ def _load_seeds(seed_dir: Path, corpus, executor: CoverageExecutor,
                     loc += f" block={block}"
                 print(f"[seed:assume] {path.name} invalid precondition input | "
                       f"{loc}")
+            debug.event("candidate", "seed_skip", path=str(path),
+                        reason="assume_violation",
+                        pc=result.get("violation_pc"),
+                        block=result.get("violation_block"))
             continue
         if status not in ("ok", None):
             if debug_candidates:
                 print(f"[seed:skip] {path.name} status={status}")
+            debug.event("candidate", "seed_skip", path=str(path),
+                        reason="status", status=status)
             continue
         added = corpus.add(
             path, inputs, covered,
@@ -625,8 +740,14 @@ def _load_seeds(seed_dir: Path, corpus, executor: CoverageExecutor,
         )
         if debug_candidates and not added:
             print(f"[seed:skip] {path.name} duplicate/no trace diversity")
+        debug.event("candidate", "seed_result", path=str(path),
+                    added=bool(added), covered=len(covered),
+                    status=status)
 
     corpus.loaded_inputs += len(parsed)
+    debug.event("candidate", "seed_load_end",
+                parsed=len(parsed), loaded=corpus.loaded_inputs,
+                corpus_entries=len(corpus.entries))
     return len(parsed)
 
 
@@ -700,7 +821,8 @@ def _deterministic_candidates(inputs):
 
 def run_deterministic_probes(corpus, evaluator, out_dir: Path,
                              max_candidates: int = 200,
-                             *, debug_candidates: bool = False) -> int:
+                             *, debug_candidates: bool = False,
+                             debug_logger=None) -> int:
     """Try deterministic boundary/havoc probes before random greybox fuzz."""
     gen_idx = _next_gen_idx(out_dir)
     trace_idx = _next_trace_idx(out_dir)
@@ -720,7 +842,8 @@ def run_deterministic_probes(corpus, evaluator, out_dir: Path,
     if hasattr(evaluator, "evaluate_many"):
         new_count, _trace_new, _gen_idx, _trace_idx = _evaluate_candidate_batch(
             corpus, evaluator, out_dir, candidates, gen_idx=gen_idx,
-            trace_idx=trace_idx, debug_candidates=debug_candidates)
+            trace_idx=trace_idx, debug_candidates=debug_candidates,
+            debug_logger=debug_logger)
         return new_count
 
     new_count = 0
@@ -728,6 +851,7 @@ def run_deterministic_probes(corpus, evaluator, out_dir: Path,
         kind, gen_idx, trace_idx = _write_candidate(
             corpus, evaluator, out_dir, candidate, params_line,
             gen_idx, trace_idx, label,
+            debug_logger=debug_logger,
         )
         if kind == "coverage":
             new_count += 1
@@ -736,7 +860,8 @@ def run_deterministic_probes(corpus, evaluator, out_dir: Path,
 
 def run_greybox(corpus, evaluator, out_dir: Path, iters: int,
                 *, batch_size: int = 1, progress_interval: int = 200,
-                debug_candidates: bool = False) -> int:
+                debug_candidates: bool = False,
+                debug_logger=None) -> int:
     """Run the greybox mutation phase. Returns the number of new inputs written."""
     from interpreter.coverage_gen.mutator import mutate, splice
 
@@ -769,13 +894,15 @@ def run_greybox(corpus, evaluator, out_dir: Path, iters: int,
         if hasattr(evaluator, "evaluate_many"):
             batch_new, _trace_new, gen_idx, trace_idx = _evaluate_candidate_batch(
                 corpus, evaluator, out_dir, batch, gen_idx=gen_idx,
-                trace_idx=trace_idx, debug_candidates=debug_candidates)
+                trace_idx=trace_idx, debug_candidates=debug_candidates,
+                debug_logger=debug_logger)
         else:
             batch_new = 0
             for candidate, params_line, label in batch:
                 kind, gen_idx, trace_idx = _write_candidate(
                     corpus, evaluator, out_dir, candidate, params_line,
                     gen_idx, trace_idx, label,
+                    debug_logger=debug_logger,
                 )
                 if kind == "coverage":
                     batch_new += 1
@@ -955,6 +1082,29 @@ def _concolic_should_stop(stats: dict, new_inputs: int,
     return False, None
 
 
+def _build_recommendations(*, executor: CoverageExecutor, stall_reason: str | None,
+                           total_new_inputs: int, symbolic_stats: dict,
+                           phase_decisions: list[dict]) -> list[str]:
+    recommendations = []
+    if executor.native_fallback_reason:
+        recommendations.append(
+            "Native Rust engine was unavailable; rebuild/install it before long coverage runs.")
+    if stall_reason == "no-seeds":
+        recommendations.append(
+            "No valid seed inputs were loaded; run gen-input without --seed-only or provide a seed directory.")
+    if (
+        total_new_inputs == 0
+        and symbolic_stats.get("complete_within_bounds")
+        and int(symbolic_stats.get("paths_unknown", 0) or 0) == 0
+    ):
+        recommendations.append(
+            "Bounded symbolic search completed without new valid inputs; current seeds may already cover the bounded feasible paths it saw.")
+    if any(d.get("action") == "downshift" for d in phase_decisions):
+        recommendations.append(
+            "Adaptive scheduling skipped later unproductive path phases so the run could spend time on remaining strategies.")
+    return recommendations
+
+
 def run_symbolic(corpus, evaluator, out_dir: Path, *,
                  loop_bound: int = 8,
                  max_path_depth: int = 512,
@@ -965,8 +1115,10 @@ def run_symbolic(corpus, evaluator, out_dir: Path, *,
                  profile: str = "max-coverage",
                  seed_limit: int | None = None,
                  jobs: int = 1,
-                 debug_candidates: bool = False) -> tuple[int, dict]:
+                 debug_candidates: bool = False,
+                 debug_logger=None) -> tuple[int, dict]:
     """Run bounded native symbolic path exploration over current seeds."""
+    debug = debug_logger or DebugLogger.disabled()
     supports_symbolic = (
         hasattr(evaluator, "symbolic_many")
         or hasattr(evaluator, "symbolic_explore")
@@ -990,7 +1142,16 @@ def run_symbolic(corpus, evaluator, out_dir: Path, *,
     if len(selected) < len(entries):
         stats_total["seed_limit_applied"] = True
     if not selected:
+        debug.event("solver", "symbolic_no_seeds",
+                    available=len(entries), seed_limit=seed_limit)
         return 0, stats_total
+    limit_label = "auto" if seed_limit is None or seed_limit <= 0 else seed_limit
+    print(f"[symbolic] scheduling {len(selected)}/{len(entries)} seeds "
+          f"(limit={limit_label}, "
+          f"jobs={jobs})")
+    debug.event("solver", "symbolic_schedule",
+                selected=len(selected), available=len(entries),
+                seed_limit=effective_seed_limit, jobs=jobs)
 
     if hasattr(evaluator, "symbolic_many"):
         tasks = []
@@ -1042,7 +1203,8 @@ def run_symbolic(corpus, evaluator, out_dir: Path, *,
                 ))
         batch_new, _trace_new, gen_idx, trace_idx = _evaluate_candidate_batch(
             corpus, evaluator, out_dir, candidate_batch, gen_idx=gen_idx,
-            trace_idx=trace_idx, debug_candidates=debug_candidates)
+            trace_idx=trace_idx, debug_candidates=debug_candidates,
+            debug_logger=debug_logger)
         new_count += batch_new
     else:
         for selected_idx, (entry_idx, entry, _score) in enumerate(selected):
@@ -1076,6 +1238,7 @@ def run_symbolic(corpus, evaluator, out_dir: Path, *,
                     corpus, evaluator, out_dir, candidate,
                     entry.params_line or corpus.params_line,
                     gen_idx, trace_idx, "symbolic",
+                    debug_logger=debug_logger,
                 )
                 if kind == "coverage":
                     new_count += 1
@@ -1092,8 +1255,10 @@ def run_concolic(corpus, evaluator, out_dir: Path, *,
                  profile: str = "max-coverage",
                  seed_limit: int | None = None,
                  jobs: int = 1,
-                 debug_candidates: bool = False) -> tuple[int, dict]:
+                 debug_candidates: bool = False,
+                 debug_logger=None) -> tuple[int, dict]:
     """Run native branch-negation concolic search over current corpus."""
+    debug = debug_logger or DebugLogger.disabled()
     supports_concolic = (
         hasattr(evaluator, "concolic_many")
         or hasattr(evaluator, "concolic_suggest")
@@ -1117,7 +1282,16 @@ def run_concolic(corpus, evaluator, out_dir: Path, *,
     if len(selected) < len(entries):
         stats_total["seed_limit_applied"] = True
     if not selected:
+        debug.event("solver", "concolic_no_seeds",
+                    available=len(entries), seed_limit=seed_limit)
         return 0, stats_total
+    limit_label = "auto" if seed_limit is None or seed_limit <= 0 else seed_limit
+    print(f"[concolic] scheduling {len(selected)}/{len(entries)} seeds "
+          f"(limit={limit_label}, "
+          f"jobs={jobs})")
+    debug.event("solver", "concolic_schedule",
+                selected=len(selected), available=len(entries),
+                seed_limit=effective_seed_limit, jobs=jobs)
 
     if hasattr(evaluator, "concolic_many"):
         tasks = []
@@ -1154,7 +1328,8 @@ def run_concolic(corpus, evaluator, out_dir: Path, *,
                 ))
         batch_new, _trace_new, gen_idx, trace_idx = _evaluate_candidate_batch(
             corpus, evaluator, out_dir, candidate_batch, gen_idx=gen_idx,
-            trace_idx=trace_idx, debug_candidates=debug_candidates)
+            trace_idx=trace_idx, debug_candidates=debug_candidates,
+            debug_logger=debug_logger)
         new_count += batch_new
     else:
         for entry_idx, entry, _score in selected:
@@ -1178,6 +1353,7 @@ def run_concolic(corpus, evaluator, out_dir: Path, *,
                     corpus, evaluator, out_dir, candidate,
                     entry.params_line or corpus.params_line,
                     gen_idx, trace_idx, "concolic",
+                    debug_logger=debug_logger,
                 )
                 if kind == "coverage":
                     new_count += 1
@@ -1228,7 +1404,8 @@ def generate_coverage_inputs(program, test_name: str, seed_dir: Path,
                              max_solver_queries: int | None = None,
                              max_symbolic_states: int | None = None,
                              path_seed_limit: int | None = None,
-                             solver_timeout_ms: int | None = None) -> dict:
+                             solver_timeout_ms: int | None = None,
+                             debug_logger=None) -> dict:
     """Run the unified deterministic/concolic/greybox input pipeline."""
     from interpreter.coverage_gen.corpus import Corpus
 
@@ -1256,11 +1433,15 @@ def generate_coverage_inputs(program, test_name: str, seed_dir: Path,
     path_seed_limit = int(cfg.get("path_seed_limit", 0))
     solver_timeout_ms = int(cfg["solver_timeout_ms"])
 
+    debug = (debug_logger or DebugLogger.disabled()).bind(
+        component="coverage-driver", test_name=test_name)
+
     random.seed(rng_seed)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     executor = CoverageExecutor(program, test_name, timeout=timeout,
-                                engine=engine, jobs=jobs)
+                                engine=engine, jobs=jobs,
+                                debug_logger=debug)
     corpus = Corpus()
     phase_timings = []
     deterministic_new = 0
@@ -1293,12 +1474,36 @@ def generate_coverage_inputs(program, test_name: str, seed_dir: Path,
     if executor.native_fallback_reason:
         print("[driver] native evaluator fallback: "
               f"{executor.native_fallback_reason}")
+    debug.event(
+        "exec",
+        "coverage_pipeline_start",
+        mode=mode,
+        profile=profile,
+        path_engine=path_engine,
+        engine=engine,
+        seed_dir=seed_dir,
+        out_dir=out_dir,
+        jobs=executor.jobs,
+        budgets={
+            "deterministic": deterministic_budget,
+            "rounds": rounds,
+            "iters": iters,
+            "loop_bound": loop_bound,
+            "havoc_bound": havoc_bound,
+            "max_path_depth": max_path_depth,
+            "max_solver_queries": max_solver_queries,
+            "max_symbolic_states": max_symbolic_states,
+            "path_seed_limit": path_seed_limit,
+            "solver_timeout_ms": solver_timeout_ms,
+        },
+    )
 
     try:
         print(f"[driver] Loading seeds from {seed_dir} ...")
         t0 = time.perf_counter()
         n_seeds = _load_seeds(
-            seed_dir, corpus, executor, debug_candidates=debug_candidates)
+            seed_dir, corpus, executor, debug_candidates=debug_candidates,
+            debug_logger=debug)
         elapsed = time.perf_counter() - t0
         phase_timings.append({
             "phase": "seed-load",
@@ -1312,32 +1517,40 @@ def generate_coverage_inputs(program, test_name: str, seed_dir: Path,
               f"invalid={corpus.invalid_inputs} duplicate={corpus.duplicate_inputs}")
 
         if corpus.entries:
-            print(f"[driver] Starting deterministic probe phase "
-                  f"({deterministic_budget} candidates max) ...")
-            before_runs = executor.runs
-            before_blocks = len(corpus.covered)
-            before_trace = corpus.trace_interesting_inputs
-            t0 = time.perf_counter()
-            deterministic_new = run_deterministic_probes(
-                corpus, executor, out_dir,
-                max_candidates=deterministic_budget,
-                debug_candidates=debug_candidates)
-            elapsed = time.perf_counter() - t0
-            evaluated = executor.runs - before_runs
-            phase_timings.append({
-                "phase": "deterministic",
-                "seconds": round(elapsed, 6),
-                "evaluated": evaluated,
-                "evals_per_sec": round(evaluated / elapsed, 3) if elapsed else evaluated,
-                "new_inputs": deterministic_new,
-                "blocks_added": len(corpus.covered) - before_blocks,
-                "trace_added": corpus.trace_interesting_inputs - before_trace,
-            })
-            print(f"[driver] deterministic done in {elapsed:.2f}s | "
-                  f"evals={evaluated} new_inputs={deterministic_new} "
-                  f"blocks={len(corpus.covered)} "
-                  f"trace={corpus.trace_interesting_inputs} "
-                  f"rate={evaluated / elapsed if elapsed else evaluated:.1f}/s")
+            if deterministic_budget > 0:
+                print(f"[driver] Starting deterministic probe phase "
+                      f"({deterministic_budget} candidates max) ...")
+                before_runs = executor.runs
+                before_blocks = len(corpus.covered)
+                before_trace = corpus.trace_interesting_inputs
+                t0 = time.perf_counter()
+                deterministic_new = run_deterministic_probes(
+                    corpus, executor, out_dir,
+                    max_candidates=deterministic_budget,
+                    debug_candidates=debug_candidates,
+                    debug_logger=debug)
+                elapsed = time.perf_counter() - t0
+                evaluated = executor.runs - before_runs
+                phase_timings.append({
+                    "phase": "deterministic",
+                    "seconds": round(elapsed, 6),
+                    "evaluated": evaluated,
+                    "evals_per_sec": round(evaluated / elapsed, 3) if elapsed else evaluated,
+                    "new_inputs": deterministic_new,
+                    "blocks_added": len(corpus.covered) - before_blocks,
+                    "trace_added": corpus.trace_interesting_inputs - before_trace,
+                })
+                print(f"[driver] deterministic done in {elapsed:.2f}s | "
+                      f"evals={evaluated} new_inputs={deterministic_new} "
+                      f"blocks={len(corpus.covered)} "
+                      f"trace={corpus.trace_interesting_inputs} "
+                      f"rate={evaluated / elapsed if elapsed else evaluated:.1f}/s")
+            else:
+                _record_phase_decision(
+                    phase_decisions, phase="deterministic", round_idx=None,
+                    action="skip", reason="zero-deterministic-budget")
+                print("[driver] Skipping deterministic probe phase "
+                      "(budget=0)")
 
             remaining_iters = iters
             remaining_solver_queries = max_solver_queries
@@ -1385,6 +1598,7 @@ def generate_coverage_inputs(program, test_name: str, seed_dir: Path,
                         seed_limit=path_seed_limit,
                         jobs=executor.jobs,
                         debug_candidates=debug_candidates,
+                        debug_logger=debug,
                     )
                     elapsed = time.perf_counter() - t0
                     evaluated = executor.runs - before_runs
@@ -1481,6 +1695,7 @@ def generate_coverage_inputs(program, test_name: str, seed_dir: Path,
                         seed_limit=path_seed_limit,
                         jobs=executor.jobs,
                         debug_candidates=debug_candidates,
+                        debug_logger=debug,
                     )
                     elapsed = time.perf_counter() - t0
                     evaluated = executor.runs - before_runs
@@ -1556,6 +1771,7 @@ def generate_coverage_inputs(program, test_name: str, seed_dir: Path,
                         batch_size=max(1, executor.jobs * 4),
                         progress_interval=progress_interval,
                         debug_candidates=debug_candidates,
+                        debug_logger=debug,
                     )
                     elapsed = time.perf_counter() - t0
                     evaluated = executor.runs - before_runs
@@ -1628,6 +1844,15 @@ def generate_coverage_inputs(program, test_name: str, seed_dir: Path,
         and executor.timeouts == 0
         and executor.native_fallback_reason is None
     )
+    total_new_inputs = deterministic_new + symbolic_new + concolic_new + greybox_new
+    useful_inputs = total_new_inputs + corpus.generated_trace_inputs
+    recommendations = _build_recommendations(
+        executor=executor,
+        stall_reason=stall_reason,
+        total_new_inputs=total_new_inputs,
+        symbolic_stats=symbolic_stats,
+        phase_decisions=phase_decisions,
+    )
 
     report = {
         "strategy": "unified-gen-input",
@@ -1674,9 +1899,7 @@ def generate_coverage_inputs(program, test_name: str, seed_dir: Path,
         "symbolic_new_inputs": symbolic_new,
         "concolic_new_inputs": concolic_new,
         "greybox_new_inputs": greybox_new,
-        "total_new_inputs": (
-            deterministic_new + symbolic_new + concolic_new + greybox_new
-        ),
+        "total_new_inputs": total_new_inputs,
         "trace_interesting_inputs": corpus.trace_interesting_inputs,
         "generated_trace_inputs": corpus.generated_trace_inputs,
         "assertion_inputs": corpus.assertion_inputs,
@@ -1688,18 +1911,9 @@ def generate_coverage_inputs(program, test_name: str, seed_dir: Path,
         "assertion_pcs": executor.assertion_pcs,
         "generated_assertion_pcs": corpus.assertion_pcs,
         "seed_assertion_feedback_pcs": corpus.seed_assertion_feedback_pcs,
-        "total_written_inputs": (
-            deterministic_new + symbolic_new + concolic_new + greybox_new
-            + corpus.generated_trace_inputs
-        ),
-        "useful_inputs": (
-            deterministic_new + symbolic_new + concolic_new + greybox_new
-            + corpus.generated_trace_inputs
-        ),
-        "valid_written_inputs": (
-            deterministic_new + symbolic_new + concolic_new + greybox_new
-            + corpus.generated_trace_inputs
-        ),
+        "total_written_inputs": useful_inputs,
+        "useful_inputs": useful_inputs,
+        "valid_written_inputs": useful_inputs,
         "corpus_entries": len(corpus.entries),
         "candidates_evaluated": executor.runs,
         "timeouts": executor.timeouts,
@@ -1709,10 +1923,17 @@ def generate_coverage_inputs(program, test_name: str, seed_dir: Path,
         "rounds_completed": len(round_reports),
         "rounds": round_reports,
         "stall_reason": stall_reason,
+        "recommendations": recommendations,
         "blocks_covered": len(corpus.covered),
         "coverage": _coverage_dict(program, corpus.covered),
     }
     report_path = _write_report(out_dir, report)
+    debug.event("exec", "coverage_pipeline_end",
+                total_seconds=round(total_elapsed, 6),
+                total_new_inputs=total_new_inputs,
+                blocks_covered=len(corpus.covered),
+                stall_reason=stall_reason,
+                report_path=report_path)
     print("[driver] Coverage search is bounded. "
           "Unbounded all-path exploration is not claimed.")
     if phase_decisions:
@@ -1722,9 +1943,11 @@ def generate_coverage_inputs(program, test_name: str, seed_dir: Path,
             )
             print(f"[driver] adaptive: {decision['phase']} "
                   f"{decision['action']}{round_txt} | {decision['reason']}")
+    for recommendation in recommendations[:3]:
+        print(f"[driver] recommendation: {recommendation}")
     print(f"[driver] Wrote coverage report: {report_path}")
     print(f"[driver] final: covered={len(corpus.covered)} "
-          f"new_inputs={deterministic_new + symbolic_new + concolic_new + greybox_new} "
+          f"new_inputs={total_new_inputs} "
           f"trace_inputs={corpus.generated_trace_inputs} "
           f"assert_feedback={len(corpus.assertion_feedback_entries)} "
           f"stall={stall_reason} engine={_engine_detail(executor)} "
@@ -1800,6 +2023,11 @@ def main(argv=None):
                              "(default: automatic)")
     parser.add_argument("--solver-timeout-ms", type=int, default=None,
                         help="Override per-query SMT timeout in milliseconds")
+    parser.add_argument("--debug-log",
+                        help="Directory for structured debug JSONL sidecar logs")
+    parser.add_argument("--debug-categories", default="all",
+                        help="Comma-separated debug categories "
+                             "(default: all; e.g. candidate,solver)")
     parser.add_argument("--out-dir",
                         help="Output directory for generated .input files "
                              "(default: test_input/<name>/)")
@@ -1822,11 +2050,21 @@ def main(argv=None):
         print(f"ERROR: {program_pkl} not found", file=sys.stderr)
         sys.exit(1)
     print(f"[driver] Loading {test_name} ...")
-    program = pickle.loads(program_pkl.read_bytes())
+    program_bytes = program_pkl.read_bytes()
+    program_hash = hashlib.sha256(program_bytes).hexdigest()
+    program = pickle.loads(program_bytes)
 
     seed_dir = Path(args.seed) if args.seed else Path(f"test_input/{test_name}")
     out_dir = Path(args.out_dir) if args.out_dir else seed_dir
     out_dir.mkdir(parents=True, exist_ok=True)
+    debug_logger = DebugLogger.from_options(
+        args.debug_log,
+        args.debug_categories,
+        run_id=f"{test_name}-{int(time.time())}",
+    ).bind(test_name=test_name, command="coverage-gen",
+           program_hash=program_hash)
+    debug_logger.event("unsupported", "support_matrix",
+                       summary=support_matrix_summary())
 
     report = generate_coverage_inputs(
         program, test_name, seed_dir, out_dir,
@@ -1849,6 +2087,7 @@ def main(argv=None):
         max_symbolic_states=args.max_symbolic_states,
         path_seed_limit=args.path_seed_limit,
         solver_timeout_ms=args.solver_timeout_ms,
+        debug_logger=debug_logger,
     )
     if report["seed_inputs"] == 0:
         sys.exit(1)

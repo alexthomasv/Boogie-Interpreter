@@ -1,8 +1,8 @@
-"""Shared fixtures for interpreter tests."""
-import pytest
 import pickle
-from pathlib import Path
 import sys
+from pathlib import Path
+
+import pytest
 
 # This repo IS the `interpreter` package. Add the parent of the repo root
 # to sys.path so `import interpreter.python.*` works.
@@ -15,6 +15,33 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from interpreter.python.interpreter import BoogieInterpreter, find_entry_point
+
+
+def pytest_addoption(parser):
+    group = parser.getgroup("interpreter correctness")
+    group.addoption("--run-slow", action="store_true", default=False,
+                    help="run tests marked slow")
+    group.addoption("--run-benchmark", action="store_true", default=False,
+                    help="run tests marked benchmark/requires_compiled_package")
+    group.addoption("--run-exhaustive", action="store_true", default=False,
+                    help="run tests marked exhaustive")
+
+
+def pytest_collection_modifyitems(config, items):
+    gates = [
+        ("slow", config.getoption("--run-slow"),
+         "need --run-slow to run"),
+        ("benchmark", config.getoption("--run-benchmark"),
+         "need --run-benchmark to run"),
+        ("requires_compiled_package", config.getoption("--run-benchmark"),
+         "need --run-benchmark to run"),
+        ("exhaustive", config.getoption("--run-exhaustive"),
+         "need --run-exhaustive to run"),
+    ]
+    for item in items:
+        for marker, enabled, reason in gates:
+            if marker in item.keywords and not enabled:
+                item.add_marker(pytest.mark.skip(reason=reason))
 
 
 @pytest.fixture
@@ -33,7 +60,7 @@ def available_benchmarks():
             name = pkg.name.removesuffix("_pkg")
             pkl = pkg / f"{name}.pkl"
             input_dir = PARENT / "test_input" / name
-            if pkl.exists() and input_dir.exists() and list(input_dir.glob("*.json")):
+            if pkl.exists() and input_dir.exists() and list(input_dir.glob("*.input")):
                 benchmarks.append(name)
     return benchmarks
 
@@ -49,18 +76,20 @@ def benchmark_data(benchmark_name):
     pkg_dir = PARENT / "test_packages" / f"{benchmark_name}_pkg"
     pkl_path = pkg_dir / f"{benchmark_name}.pkl"
     input_dir = PARENT / "test_input" / benchmark_name
-    input_file = sorted(input_dir.glob("*.json"))[0]
+    input_file = sorted(input_dir.glob("*.input"))[0]
 
-    with open(pkl_path, 'rb') as f:
+    with open(pkl_path, "rb") as f:
         program = pickle.load(f)
 
-    from interpreter.utils.utils import parse_inputs
-    program_inputs = parse_inputs(input_file)
+    from interpreter.utils.input_parser import get_bpl_field_sizes, parse_input_file
+
+    field_sizes = get_bpl_field_sizes(pkg_dir, program=program)
+    program_inputs = parse_input_file(input_file, field_sizes=field_sizes)
 
     return {
-        'name': benchmark_name,
-        'program': program,
-        'program_inputs': program_inputs,
-        'input_file': input_file,
-        'input_name': input_file.stem,
+        "name": benchmark_name,
+        "program": program,
+        "program_inputs": program_inputs,
+        "input_file": input_file,
+        "input_name": input_file.stem,
     }

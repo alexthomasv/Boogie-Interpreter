@@ -4,14 +4,17 @@ from interpreter.parser.declaration import StorageDeclaration, ConstantDeclarati
 from interpreter.parser.expression import QuantifiedExpression, BinaryExpression
 from interpreter.utils.utils import extract_boogie_variables
 from interpreter.utils.raw_log import RawLogWriter
+from interpreter.utils.debug_log import DebugLogger
 from collections import defaultdict
 from pathlib import Path
 import os
 
 
 class Environment:
-    def __init__(self, test_name, input_name):
+    def __init__(self, test_name, input_name, debug_logger=None):
         self.input_name = input_name
+        self.debug = (debug_logger or DebugLogger.disabled()).bind(
+            input_name=input_name)
         self.stackFrames = [Context()]
         self.alloc_addr = 0
         self.alloc_addr_shadow = 0
@@ -50,6 +53,7 @@ class Environment:
         # Total trace events (reads + writes); exposed via _agg_total for
         # backwards-compatible callers.
         self._agg_total = 0
+        self._raw_log_count = 0
         self.full_trace = False
 
         # Direct reference to the single frame's var_store for fast access
@@ -87,6 +91,8 @@ class Environment:
             self._trace_parts = []
             self._trace_size = 0
         if fsync and self.trace_file is not None:
+            self.debug.event("trace", "text_trace_flush", path=self._trace_path,
+                             bytes=self._trace_size, fsync=True)
             print(f"flushing trace file")
             self.trace_file.flush()
             os.fsync(self.trace_file.fileno())
@@ -113,6 +119,13 @@ class Environment:
         self._block_id = {n: i for i, n in enumerate(self._block_names_list)}
         writer.write_header(self._var_names_list, self._block_names_list)
         self._raw_log = writer
+        self.debug.event(
+            "trace",
+            "raw_log_open",
+            path=self._raw_log_path,
+            vars=len(self._var_names_list),
+            blocks=len(self._block_names_list),
+        )
 
     def _intern_var(self, name: str) -> int:
         vid = self._var_id.get(name)
@@ -125,6 +138,7 @@ class Environment:
             self._var_id[name] = vid
             self._var_names_list.append(name)
             self._late_vars = True
+            self.debug.event("trace", "raw_log_late_var", var=name, var_id=vid)
         return vid
 
     def _intern_block(self, name: str) -> int:
@@ -134,6 +148,7 @@ class Environment:
             self._block_id[name] = bid
             self._block_names_list.append(name)
             self._late_blocks = True
+            self.debug.event("trace", "raw_log_late_block", block=name, block_id=bid)
         return bid
 
     def _append_trace(self, key, value, op_type):
@@ -189,13 +204,22 @@ class Environment:
         if self._raw_log is None:
             return 0
         if getattr(self, '_late_vars', False) or getattr(self, '_late_blocks', False):
+            self.debug.event(
+                "trace",
+                "raw_log_stale_header",
+                late_vars=self._var_names_list[-10:],
+                late_blocks=self._block_names_list[-10:],
+            )
             raise RuntimeError(
                 "raw-log: saw names not in the upfront scan — header is stale. "
                 f"late_vars={self._var_names_list[-10:]!r} "
                 f"late_blocks={self._block_names_list[-10:]!r}"
             )
         count = self._raw_log.finish()
+        self._raw_log_count = count
         self._raw_log = None
+        self.debug.event("trace", "raw_log_close", records=count,
+                         path=self._raw_log_path)
         return count
 
     # Kept for backward compatibility
@@ -207,12 +231,15 @@ class Environment:
 
     def set_concrete_value(self, key, value, silent):
         if key == "$CurrAddr":
+            self.debug.event("mem", "alloc_addr_write", var=key, value=value)
             print(f"[detected alloc] $CurrAddr: {key} <- {value}")
             self.alloc_addr = value
         elif key == "$CurrAddr.shadow":
+            self.debug.event("mem", "alloc_addr_write", var=key, value=value)
             print(f"[detected alloc] $CurrAddr.shadow: {key} <- {value}")
             self.alloc_addr_shadow = value
         if isinstance(value, str):
+            self.debug.event("exec", "string_value_coerced", var=key, value=value)
             print(f"[detected str] {key} <- {value}")
             value = int(value, 0)
         if not silent:
@@ -313,6 +340,9 @@ class Environment:
             return curr_addr
 
         print(f"No concrete value found for {var_name}, setting to 0")
+        self.debug.event("exec", "uninitialized_var_defaulted",
+                         var=var_name, value=0, pc=self.pc,
+                         block=self.curr_block or "GLOBAL")
         self.set_value(var_name, 0, silent)
         return 0
 

@@ -306,7 +306,6 @@ def generate_cvc5_function_map(solver: Solver):
         "$sext.i32.i64": (solver.mkOp(Kind.BITVECTOR_SIGN_EXTEND, 64), 1, 32, 64),
         "$sext.i8.i32": (solver.mkOp(Kind.BITVECTOR_SIGN_EXTEND, 32), 1, 8, 32),
         "$sext.i16.i32": (solver.mkOp(Kind.BITVECTOR_SIGN_EXTEND, 32), 1, 16, 32),
-        "$sext.i32.i64": (solver.mkOp(Kind.BITVECTOR_SIGN_EXTEND, 64), 1, 32, 64),
 
         # Zero extend
         "$zext.i32.i64": (solver.mkOp(Kind.BITVECTOR_ZERO_EXTEND, 64), 1, 32, 64),
@@ -536,10 +535,6 @@ _INT_ENC_FN_MAP = {
     "$bitcast.ref.ref": (None, 1, None, None),
     "$p2i.ref.i64": (None, 1, None, None),
     "$i2p.i64.ref": (None, 1, None, None),
-    # Mul.ref
-    "$mul.ref": (Kind.MULT, 2, None, None),
-    "$add.ref": (Kind.ADD, 2, None, None),
-    "$sub.ref": (Kind.SUB, 2, None, None),
     # Binary expressions
     "==": (Kind.EQUAL, 2, None, None),
     "!=": (Kind.DISTINCT, 2, None, None),
@@ -2031,22 +2026,22 @@ def _parse_infix_expr(s, state_cache):
     while i < len(s):
         if s[i].isspace():
             i += 1
-        elif s[i] == '$' or (s[i].isalpha() and s[i:i+5] == 'STORE'):
+        elif s[i] == '$' or s[i].isalpha() or s[i] == '_':
             # Variable or STORE keyword.  SMACK-emitted names embed
             # additional ``$`` segments (e.g.
-            # ``$free_105_inline$__VERIFIER_nondet_int$0$$i0`` for a
-            # loop-snapshot of an inlined nondet-int call), so the
-            # tokenizer must accept ``$`` inside an identifier after
-            # the leading ``$``.  Without this, the second ``$`` ends
-            # the token early and the parser sees an "Unknown variable"
-            # for the truncated prefix.
+            # ``$free_105_inline$__VERIFIER_nondet_int$0$$i0`` and
+            # ``inline$foo$0$$i0``), so the tokenizer must accept ``$``
+            # inside identifiers and also preserve non-$ prefixes.
+            # Without this, the parser sees truncated names like
+            # ``$foo$0$$i0`` and reports "Unknown variable".
             j = i
             if s[i] == '$':
                 j += 1
                 while j < len(s) and (s[j].isalnum() or s[j] in '._$'):
                     j += 1
             else:
-                j = i + 5
+                while j < len(s) and (s[j].isalnum() or s[j] in '._$'):
+                    j += 1
             tokens.append(('ID', s[i:j]))
             i = j
         elif s[i].isdigit():

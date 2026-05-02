@@ -1,4 +1,5 @@
 use crate::builtins;
+use crate::debug_log;
 use crate::opcodes::*;
 use crate::vm::{EvalResult, VM, Value};
 use crate::CompiledProgramWrapper;
@@ -384,6 +385,19 @@ impl<'a> Engine<'a> {
         }
     }
 
+    fn unsupported(&mut self, reason: &str, fields: &[(&str, String)]) {
+        self.stats.unsupported += 1;
+        let mut event_fields = vec![
+            ("reason", reason.to_string()),
+            ("pc", self.vm.pc.to_string()),
+            ("block", self.vm.curr_block.clone()),
+        ];
+        for (key, value) in fields {
+            event_fields.push((*key, value.clone()));
+        }
+        debug_log::event("unsupported", "symbolic_unsupported", &event_fields);
+    }
+
     fn execute(&mut self) {
         if !self.check_entry_preconditions() {
             return;
@@ -393,10 +407,19 @@ impl<'a> Engine<'a> {
         loop {
             if depth >= self.max_path_depth {
                 self.stats.depth_bounded = true;
+                debug_log::event("solver", "path_depth_bounded", &[
+                    ("depth", depth.to_string()),
+                    ("max_path_depth", self.max_path_depth.to_string()),
+                    ("block", self.vm.curr_block.clone()),
+                ]);
                 break;
             }
             depth += 1;
             if !self.record_loop_visit(block_id) {
+                debug_log::event("solver", "loop_bounded", &[
+                    ("block_id", block_id.to_string()),
+                    ("loop_bound", self.loop_bound.to_string()),
+                ]);
                 break;
             }
 
@@ -451,7 +474,9 @@ impl<'a> Engine<'a> {
                             bool_expr,
                         );
                     } else {
-                        self.stats.unsupported += 1;
+                        self.unsupported("requires_symbolic_bool", &[
+                            ("requires_index", idx.to_string()),
+                        ]);
                     }
                 }
                 return false;
@@ -495,7 +520,15 @@ impl<'a> Engine<'a> {
                 let ev = self.eval_bool(cond);
                 if ev.value {
                     if taken.is_some() {
-                        self.stats.unsupported += 1;
+                        self.unsupported("multiple_true_branch_targets", &[
+                            ("source", source.name.clone()),
+                            ("targets", targets.len().to_string()),
+                        ]);
+                        debug_log::event("branch", "branch_unsupported", &[
+                            ("source", source.name.clone()),
+                            ("reason", "multiple_true_targets".to_string()),
+                            ("targets", targets.len().to_string()),
+                        ]);
                         return None;
                     }
                     taken = Some(target_id);
@@ -509,10 +542,25 @@ impl<'a> Engine<'a> {
         let taken_id = match taken {
             Some(id) => id,
             None => {
-                self.stats.unsupported += 1;
+                self.unsupported("no_true_branch_target", &[
+                    ("source", source.name.clone()),
+                    ("targets", targets.len().to_string()),
+                ]);
+                debug_log::event("branch", "branch_unsupported", &[
+                    ("source", source.name.clone()),
+                    ("reason", "no_true_target".to_string()),
+                    ("targets", targets.len().to_string()),
+                ]);
                 return None;
             }
         };
+        debug_log::event("branch", "branch_resolved", &[
+            ("source", source.name.clone()),
+            ("taken", self.program.blocks[taken_id as usize].name.clone()),
+            ("targets", targets.len().to_string()),
+            ("pc", self.vm.pc.to_string()),
+            ("path_constraints", self.path_constraints.len().to_string()),
+        ]);
 
         let mut objective_indices: Vec<usize> = evals
             .iter()
@@ -562,7 +610,13 @@ impl<'a> Engine<'a> {
                     );
                 }
                 BranchObjective::Unsat => self.stats.solver_unsat += 1,
-                BranchObjective::Unsupported => self.stats.unsupported += 1,
+                BranchObjective::Unsupported => self.unsupported(
+                    "branch_objective_unsupported",
+                    &[
+                        ("source", source.name.clone()),
+                        ("target", target_name.clone()),
+                    ],
+                ),
             }
         }
 
@@ -661,12 +715,20 @@ impl<'a> Engine<'a> {
         constraints.push(objective);
         let key = solve_cache_key(&constraints);
 
+        let mut cache_hit = false;
         let result = if let Some(cached) = self.solver_cache.get(&key) {
             self.stats.solver_cache_hits += 1;
+            cache_hit = true;
             cached.clone()
         } else {
             if self.stats.solver_queries >= self.max_solver_queries {
                 self.stats.solver_query_bounded = true;
+                debug_log::event("solver", "solver_query_bounded", &[
+                    ("source", source_block.clone()),
+                    ("target", target_block.clone()),
+                    ("max_solver_queries", self.max_solver_queries.to_string()),
+                    ("constraints", constraints.len().to_string()),
+                ]);
                 return;
             }
             self.stats.solver_queries += 1;
@@ -674,6 +736,22 @@ impl<'a> Engine<'a> {
             self.solver_cache.insert(key, solved.clone());
             solved
         };
+        let result_name = match &result {
+            SolveResult::Sat(_) => "sat",
+            SolveResult::Unsat => "unsat",
+            SolveResult::Unknown => "unknown",
+            SolveResult::Error => "error",
+        };
+        debug_log::event("solver", "solver_result", &[
+            ("source", source_block.clone()),
+            ("target", target_block.clone()),
+            ("branch_index", branch_index.to_string()),
+            ("result", result_name.to_string()),
+            ("cache_hit", cache_hit.to_string()),
+            ("constraints", constraints.len().to_string()),
+            ("path_constraints", self.path_constraints.len().to_string()),
+            ("solver_queries", self.stats.solver_queries.to_string()),
+        ]);
 
         match result {
             SolveResult::Sat(values) => {
@@ -702,13 +780,29 @@ impl<'a> Engine<'a> {
 
     fn push_candidate(&mut self, candidate: Candidate) -> bool {
         if candidate.updates.is_empty() {
+            debug_log::event("candidate", "native_candidate_skip", &[
+                ("reason", "empty_updates".to_string()),
+                ("source", candidate.source_block),
+                ("target", candidate.target_block),
+            ]);
             return false;
         }
         let sig = update_signature(&candidate.updates);
         if self.candidate_sigs.insert(sig) {
+            debug_log::event("candidate", "native_candidate", &[
+                ("source", candidate.source_block.clone()),
+                ("target", candidate.target_block.clone()),
+                ("branch_index", candidate.branch_index.to_string()),
+                ("updates", candidate.updates.len().to_string()),
+            ]);
             self.candidates.push(candidate);
             true
         } else {
+            debug_log::event("candidate", "native_candidate_skip", &[
+                ("reason", "duplicate".to_string()),
+                ("source", candidate.source_block),
+                ("target", candidate.target_block),
+            ]);
             false
         }
     }
@@ -803,7 +897,7 @@ impl<'a> Engine<'a> {
                                 bool_expr,
                             );
                         } else {
-                            self.stats.unsupported += 1;
+                            self.unsupported("assert_symbolic_bool", &[]);
                         }
                     }
                     return false;
@@ -837,7 +931,9 @@ impl<'a> Engine<'a> {
                 alloc_size_var,
             } => {
                 if *alloc_size_var == u32::MAX {
-                    self.stats.unsupported += 1;
+                    self.unsupported("havoc_curr_addr_missing_size", &[
+                        ("var_id", var_id.to_string()),
+                    ]);
                     return false;
                 }
                 let alloc_size = self.vm.get_scalar_silent(*alloc_size_var);
@@ -1192,7 +1288,9 @@ impl<'a> Engine<'a> {
         };
         let idx_ev = self.eval_i64(index);
         if idx_ev.sym.is_some() {
-            self.stats.unsupported += 1;
+            self.unsupported("symbolic_store_index", &[
+                ("bit_width", bit_width.to_string()),
+            ]);
         }
         let idx_val = eval_to_i64(&idx_ev.value);
         let val_ev = self.eval_i64(value);
@@ -1234,7 +1332,9 @@ impl<'a> Engine<'a> {
         };
         let idx_ev = self.eval_i64(index);
         if idx_ev.sym.is_some() {
-            self.stats.unsupported += 1;
+            self.unsupported("symbolic_load_index", &[
+                ("bit_width", bit_width.to_string()),
+            ]);
         }
         let idx_val = eval_to_i64(&idx_ev.value);
         let ew = self.vm.memory_maps[map_idx].element_bit_width;

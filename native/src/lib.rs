@@ -1,5 +1,6 @@
 mod builtins;
 mod concolic;
+mod debug_log;
 mod lowering;
 mod memory_map;
 mod opcodes;
@@ -40,6 +41,43 @@ fn lower(
 #[pyclass]
 pub(crate) struct CompiledProgramWrapper {
     pub(crate) inner: opcodes::CompiledProgram,
+}
+
+const FNV64_OFFSET: u64 = 0xcbf29ce484222325;
+const FNV64_PRIME: u64 = 0x100000001b3;
+
+fn fnv64_update(mut hash: u64, bytes: &[u8]) -> u64 {
+    for byte in bytes {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(FNV64_PRIME);
+    }
+    hash
+}
+
+fn memory_summary<'py>(py: Python<'py>, vm: &vm::VM) -> PyResult<Bound<'py, PyDict>> {
+    let out = PyDict::new_bound(py);
+    for map in &vm.memory_maps {
+        let mut items: Vec<(i64, i64)> = map
+            .memory
+            .iter()
+            .map(|(addr, value)| (*addr, *value))
+            .collect();
+        items.sort_by_key(|(addr, _)| *addr);
+        let mut hash = FNV64_OFFSET;
+        for (addr, value) in &items {
+            hash = fnv64_update(hash, &addr.to_le_bytes());
+            hash = fnv64_update(hash, &value.to_le_bytes());
+        }
+        let summary = PyDict::new_bound(py);
+        summary.set_item("entries", items.len())?;
+        summary.set_item("min_addr", items.first().map(|(addr, _)| *addr))?;
+        summary.set_item("max_addr", items.last().map(|(addr, _)| *addr))?;
+        summary.set_item("hash", format!("{:016x}", hash))?;
+        summary.set_item("index_bit_width", map.index_bit_width)?;
+        summary.set_item("element_bit_width", map.element_bit_width)?;
+        out.set_item(map.name.as_str(), summary)?;
+    }
+    Ok(out)
 }
 
 /// Execute a pre-lowered program with pre-initialized state from Python.
@@ -97,6 +135,11 @@ fn execute(
         writer.write_header(&program.var_names, &block_names).map_err(|e| {
             pyo3::exceptions::PyIOError::new_err(format!("raw log header: {}", e))
         })?;
+        debug_log::event("trace", "native_raw_log_open", &[
+            ("path", raw_log_path.clone()),
+            ("vars", program.var_names.len().to_string()),
+            ("blocks", block_names.len().to_string()),
+        ]);
         vm.trace.raw_log = Some(writer);
     }
 
@@ -156,6 +199,11 @@ fn execute(
         vm.explored_blocks.len(),
         vm.trace.total
     );
+    debug_log::event("exec", "native_execution_end", &[
+        ("elapsed_ms", exec_elapsed.as_millis().to_string()),
+        ("blocks", vm.explored_blocks.len().to_string()),
+        ("trace_entries", vm.trace.total.to_string()),
+    ]);
 
     // Close the raw log and return a small summary dict.
     let result = PyDict::new_bound(py);
@@ -192,11 +240,27 @@ fn execute(
             close_start.elapsed(),
             count
         );
+        debug_log::event("trace", "native_raw_log_close", &[
+            ("elapsed_ms", close_start.elapsed().as_millis().to_string()),
+            ("records", count.to_string()),
+        ]);
         count
     } else {
         0
     };
     result.set_item("trace_records", record_count)?;
+    result.set_item("memory_summary", memory_summary(py, &vm)?)?;
+    result.set_item("external_consumed", vm.external_buffer_pos)?;
+    debug_log::event("exec", "native_result", &[
+        ("status", match &status {
+            ExecutionStatus::Completed => "ok".to_string(),
+            ExecutionStatus::AssertViolation { .. } => "assert_violation".to_string(),
+            ExecutionStatus::AssumeViolation { .. } => "assume_violation".to_string(),
+        }),
+        ("trace_records", record_count.to_string()),
+        ("memory_maps", vm.memory_maps.len().to_string()),
+        ("external_consumed", vm.external_buffer_pos.to_string()),
+    ]);
 
     Ok(result.into())
 }

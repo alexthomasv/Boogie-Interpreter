@@ -396,7 +396,6 @@ def generate_function_map():
         "$sext.i32.i64": (sext_fn(32, 64), 1, 32, 64),
         "$sext.i8.i32": (sext_fn(8, 32), 1, 8, 32),
         "$sext.i16.i32": (sext_fn(16, 32), 1, 16, 32),
-        "$sext.i32.i64": (sext_fn(32, 64), 1, 32, 64),
         "$zext.i32.i64": (lambda x: x, 1, 32, 64),
         "$zext.i8.i32": (lambda x: x, 1, 8, 32),
         "$zext.i8.i64": (lambda x: x, 1, 8, 64),
