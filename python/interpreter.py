@@ -22,6 +22,7 @@ from interpreter.python.MemoryMap import MemoryMap
 from interpreter.python.Buffer import ReadBuffer
 from interpreter.utils.utils import *
 from interpreter.utils.inputs import ProgramInputs
+from interpreter.utils.debug_log import DebugLogger
 import pickle
 import time
 from pathlib import Path
@@ -122,9 +123,12 @@ class AssertViolation(AssertionError):
 # ============================================================
 
 class BoogieInterpreter:
-    def __init__(self, environment: Environment, program_inputs, test_name: str):
+    def __init__(self, environment: Environment, program_inputs, test_name: str,
+                 debug_logger=None):
         self.test_name = test_name
         self.env = environment
+        self.debug = (debug_logger or getattr(environment, "debug", None)
+                      or DebugLogger.disabled()).bind(engine="python")
         # Accept either ProgramInputs or legacy dict[str, Input]
         if isinstance(program_inputs, ProgramInputs):
             self.inputs = program_inputs
@@ -211,6 +215,15 @@ class BoogieInterpreter:
         self.arr_inputs, self.field_inputs = preprocess_external_inputs(self.impl_decl)
         from interpreter.utils.inputs import gather_ptr_aliases
         self.ptr_aliases = gather_ptr_aliases(self.impl_decl)
+        self.debug.event(
+            "input",
+            "preprocess_complete",
+            implementation=self.impl_decl_name,
+            blocks=len(getattr(self.impl_decl.body, "blocks", []) or []),
+            globals=len(program.global_variables()),
+            arr_inputs=len(self.arr_inputs),
+            field_inputs=len(self.field_inputs),
+        )
 
     def _refresh_havoc_sequences(self):
         self._havoc_seq_state = {}
@@ -218,6 +231,15 @@ class BoogieInterpreter:
             seq = getattr(v_inp, "havoc_seq", None)
             if seq is not None:
                 self._havoc_seq_state[v_name] = (list(seq), 0)
+        if self._havoc_seq_state:
+            self.debug.event(
+                "input",
+                "havoc_sequences_loaded",
+                sequences={
+                    name: len(seq)
+                    for name, (seq, _count) in self._havoc_seq_state.items()
+                },
+            )
 
     def _initialize_global_axioms(self, program):
         for decl in program.declarations:
@@ -347,6 +369,9 @@ class BoogieInterpreter:
             for ptr in sorted(ptr_dict.keys()):
                 size = ptr_dict[ptr]
                 ptr_assignments[ptr] = current_addr
+                self.debug.event("mem", "buffer_alloc",
+                                 mem_map=mem_map, ptr=ptr,
+                                 base=current_addr, size=size)
                 log.debug(f"{mem_map:<15} | {ptr:<15} | {hex(current_addr):<10} | {size:<10}")
                 current_addr += (size + 7) & ~7
 
@@ -355,6 +380,9 @@ class BoogieInterpreter:
             root = canon(alias_ptr)
             if root in ptr_assignments:
                 ptr_assignments[alias_ptr] = ptr_assignments[root]
+                self.debug.event("mem", "buffer_alias",
+                                 alias=alias_ptr, target=first_ptr,
+                                 root=root, base=ptr_assignments[root])
 
         return ptr_assignments
 
@@ -394,6 +422,9 @@ class BoogieInterpreter:
                 assert end_a <= start_b, (
                     f"BUFFER ALIASING in {mem_map}: "
                     f"{ptr_a}[..{end_a}) overlaps {ptr_b}[{start_b}..)")
+        self.debug.event("mem", "alias_validation_complete",
+                         maps=len(maps),
+                         alloc_requests=len(alloc_requests))
 
     def _warn_scalar_buffer_params(self):
         """Warn if a param with BPL {:array} annotations was declared as scalar."""
@@ -472,6 +503,9 @@ class BoogieInterpreter:
         ptr_to_vals = self._allocate_addresses(alloc_requests)
         self._validate_no_aliasing(ptr_to_vals, alloc_requests)
         self._warn_scalar_buffer_params()
+        self.debug.event("mem", "input_memory_allocated",
+                         alloc_requests=len(alloc_requests),
+                         pointers=len(ptr_to_vals))
         for ptr, val in ptr_to_vals.items():
             self.env.set_value(ptr, val)
 
@@ -577,6 +611,9 @@ class BoogieInterpreter:
             val = contents[i] if i < len(contents) else 0
             log.debug(f"{mem_map.name}[{addr}] <- {hex(val)}")
             mem_map.set(addr, val)
+        self.debug.event("mem", "buffer_write",
+                         mem_map=mem_map.name, base=base, size=size,
+                         content_bytes=len(contents))
 
     def _write_field(self, field_data, field_info):
         """Write a scalar field value into a memory map via FieldInfo."""
@@ -597,16 +634,26 @@ class BoogieInterpreter:
             addr = base_ptr + i * element_bit_width
             log.debug(f"Concretizing field: {field_info.mem_map}[{addr}] = {hex(chunk)}")
             mem_map.set(addr, chunk)
+        self.debug.event("mem", "field_write",
+                         mem_map=mem_map.name, base=base_ptr,
+                         size=field_info.size, chunks=len(chunks))
 
     # ----------------------------------------------------------
     # Execution engine
     # ----------------------------------------------------------
 
     def execute_procedure(self, procedure):
+        self.debug.event(
+            "exec",
+            "procedure_start",
+            procedure=procedure.name,
+            input_name=getattr(self.env, "input_name", None),
+        )
         self._initialize_vars(procedure.body.locals, kind="local")
         self.concretize_proc_inputs(procedure)
         self.concretize_input_memory()
         self._check_entry_preconditions(procedure)
+        self.debug.event("input", "concretization_complete")
         log.debug(f"[execute_procedure] Concretized input memory")
 
         # Cache for the hot loop
@@ -633,13 +680,28 @@ class BoogieInterpreter:
                 assert False, f"Unknown statement type: {type(last_stmt)}"
 
         env.dump_buffer_trace(fsync=True)
-        env.flush_raw_log()
+        records = env.flush_raw_log()
         self._dump_mem_trace()
+        self.debug.event(
+            "exec",
+            "procedure_end",
+            procedure=procedure.name,
+            explored_blocks=len(explored_blocks),
+            trace_records=records,
+        )
 
     def _execute_block(self, block, env, label_to_pc):
         env.last_block = env.curr_block
         env.curr_block = block.name
         env.pc = label_to_pc[block.name]
+        self.debug.event(
+            "exec",
+            "block_enter",
+            block=block.name,
+            pc=env.pc,
+            last_block=env.last_block or "GLOBAL",
+            statements=len(block.statements),
+        )
         stmts = block.statements
         n = len(stmts) - 1
         execute = self._execute_statement
@@ -652,13 +714,29 @@ class BoogieInterpreter:
         targets = stmt.identifiers
         target_blocks = [self.label_to_block[t.name] for t in targets]
         taken = None
+        branch_evals = []
         for tblock in target_blocks:
             cond = extract_first_assume_stmt(tblock)
             assert isinstance(cond, AssumeStatement), f"{cond} {type(cond)}"
-            if self.eval(cond.expression):
+            value = self.eval(cond.expression)
+            branch_evals.append({
+                "target": tblock.name,
+                "value": bool(value),
+                "condition": str(cond.expression),
+            })
+            if value:
                 assert taken is None, f"Multiple goto conditions are true: {stmt}"
                 taken = tblock
         assert taken is not None, f"No goto condition is true: {stmt}"
+        self.debug.event(
+            "branch",
+            "goto_resolved",
+            block=self.env.curr_block,
+            pc=self.env.pc,
+            targets=[b.name for b in target_blocks],
+            taken=taken.name,
+            evaluations=branch_evals,
+        )
         blocks.append(taken)
 
     # ----------------------------------------------------------
@@ -828,29 +906,52 @@ class BoogieInterpreter:
                 for v in stmt.assignments:
                     val = 0
                     name = str(v.name)
+                    source = "default"
                     seq_state = self._havoc_seq_state.get(name)
                     if seq_state is not None:
                         seq, count = seq_state
                         val = seq[count] if count < len(seq) else 0
                         self._havoc_seq_state[name] = (seq, count + 1)
+                        source = "havoc_seq" if count < len(seq) else "havoc_seq_exhausted"
                     elif self.inputs and hasattr(self.inputs, 'variables'):
                         inp = self.inputs.variables.get(name)
                         if inp and getattr(inp, 'value', None) is not None:
                             val = inp.value
+                            source = "input_value"
+                    self.debug.event(
+                        "exec",
+                        "nondet_call",
+                        proc=proc,
+                        target=name,
+                        value=val,
+                        source=source,
+                        pc=self.env.pc,
+                        block=self.env.curr_block,
+                    )
                     self._set_value(v.name, val)
+            else:
+                self.debug.event("exec", "ignored_call", proc=proc,
+                                 pc=self.env.pc, block=self.env.curr_block)
             return
         if proc == "putc.cross_product":
             return
         if proc == "time.cross_product":
             [self.eval(arg) for arg in stmt.arguments]
             time_res = int(time.time())
+            self.debug.event("exec", "time_call", proc=proc, value=time_res,
+                             assignments=[v.name for v in stmt.assignments],
+                             pc=self.env.pc, block=self.env.curr_block)
             for v in stmt.assignments:
                 self._set_value(v.name, time_res)
             return
         if proc == "write.cross_product":
             [self.eval(arg) for arg in stmt.arguments]
+            value = self.wlen_buf[self.wlen_buf_idx % len(self.wlen_buf)]
+            self.debug.event("exec", "write_call", proc=proc, value=value,
+                             assignments=[v.name for v in stmt.assignments],
+                             pc=self.env.pc, block=self.env.curr_block)
             for v in stmt.assignments:
-                self._set_value(v.name, self.wlen_buf[self.wlen_buf_idx % len(self.wlen_buf)])
+                self._set_value(v.name, value)
             self.wlen_buf_idx += 1
             return
         if proc == "read.cross_product":
@@ -861,6 +962,17 @@ class BoogieInterpreter:
             read_len, read_len_shadow = args[4], args[5]
             assert read_len == read_len_shadow, f"TODO: Handle read.cross_product: {read_len} {read_len_shadow}"
             data = self.external_buffer.read(read_len)
+            self.debug.event(
+                "exec",
+                "read_call",
+                proc=proc,
+                ptr=buf_ptr,
+                shadow_ptr=buf_ptr_shadow,
+                requested=read_len,
+                returned=len(data),
+                pc=self.env.pc,
+                block=self.env.curr_block,
+            )
             for i in range(read_len):
                 buf.set(buf_ptr + i, data[i])
                 buf_shadow.set(buf_ptr_shadow + i, data[i])
@@ -872,7 +984,15 @@ class BoogieInterpreter:
                 self._set_value(v.name, read_len)
             return
         if proc == "crypto_memcmp":
+            self.debug.event("unsupported", "unsupported_call",
+                             proc=proc, pc=self.env.pc,
+                             block=self.env.curr_block,
+                             reason="crypto_memcmp")
             assert False, f"TODO: Handle crypto_memcmp: {stmt}"
+        self.debug.event("unsupported", "unsupported_call",
+                         proc=proc, pc=self.env.pc,
+                         block=self.env.curr_block,
+                         reason="unknown_call")
         assert False, f"Unknown call statement: {proc}"
 
     def _handle_goto(self, stmt):
@@ -882,6 +1002,13 @@ class BoogieInterpreter:
         if not self.eval(stmt.expression):
             self.eval(stmt.expression, debug=True)
             log.debug(f"Assertion {stmt.expression} is violated")
+            self.debug.event(
+                "exec",
+                "assert_violation",
+                pc=self.env.pc,
+                block=self.env.curr_block,
+                expression=str(stmt.expression),
+            )
             self.env.dump_memory()
             raise AssertViolation(
                 stmt,
@@ -906,6 +1033,14 @@ class BoogieInterpreter:
         # is false we have been given inputs that violate a precondition the
         # verifier is allowed to rely on. Fail loudly.
         if result is None or result == 0 or result is False:
+            self.debug.event(
+                "exec",
+                "assume_violation",
+                pc=self.env.pc,
+                block=self.env.curr_block,
+                expression=str(expr),
+                result=result,
+            )
             raise AssertionError(f"concrete assume failed: {expr}")
 
     def _check_entry_preconditions(self, procedure):
@@ -926,6 +1061,14 @@ class BoogieInterpreter:
                 continue
             result = self.eval(expr)
             if result is None or result == 0 or result is False:
+                self.debug.event(
+                    "exec",
+                    "requires_violation",
+                    pc=self.env.pc,
+                    block=self.env.curr_block,
+                    expression=str(expr),
+                    result=result,
+                )
                 raise AssertionError(f"concrete assume failed: requires {expr}")
 
     def _handle_havoc(self, stmt):
@@ -944,9 +1087,19 @@ class BoogieInterpreter:
                 elif not isinstance(s, (HavocStatement, AssumeStatement)):
                     break
             self.env.handle_curr_addr(havoc_var, constraints)
+            self.debug.event(
+                "mem",
+                "havoc_curr_addr",
+                var=havoc_var,
+                constraints=[str(c) for c in constraints],
+                pc=self.env.pc,
+                block=self.env.curr_block,
+            )
             self._get_var(havoc_var)
 
         for ident in stmt.identifiers:
+            self.debug.event("exec", "havoc_clear", var=ident.name,
+                             pc=self.env.pc, block=self.env.curr_block)
             self.env.clear_var(ident.name)
 
     _stmt_dispatch = {
@@ -960,6 +1113,12 @@ class BoogieInterpreter:
 
     def _execute_statement(self, stmt):
         handler = self._stmt_dispatch.get(type(stmt))
+        if handler is None:
+            self.debug.event("unsupported", "unsupported_statement",
+                             statement_type=type(stmt).__name__,
+                             statement=str(stmt),
+                             pc=self.env.pc,
+                             block=self.env.curr_block)
         assert handler is not None, f"Unknown statement type: {stmt} ({type(stmt)})"
         handler(self, stmt)
 
@@ -979,6 +1138,10 @@ class BoogieInterpreter:
         elif any("memcpy" in v.name for v in boogie_vars):
             self._handle_memcpy_assume(q_expr, boogie_vars)
         else:
+            self.debug.event("unsupported", "unsupported_quantified_assume",
+                             expression=str(q_expr.expression),
+                             pc=self.env.pc,
+                             block=self.env.curr_block)
             assert False, f"TODO: Handle quantified expression: {q_expr.expression.op}"
 
     @staticmethod
@@ -991,16 +1154,34 @@ class BoogieInterpreter:
                     break
         return result
 
+    @staticmethod
+    def _is_fill_range_pattern(expr):
+        """SMACK emits the fill-range guard for memset/memcpy with two
+        equivalent parenthesizations:
+
+        (a) outer ``&&``: ``$sle(dst,x) && ($slt(x,dst+len) ==> ...)``
+        (b) outer ``==>`` with ``&&`` LHS:
+            ``($sle(dst,x) && $slt(x,dst+len)) ==> ...``
+
+        Both encode "for x in [dst, dst+len), M.ret[x] = ...". The
+        existing inlined-memset tests use form (a); aead's inlined
+        chacha20poly1305 wrapper produces form (b). Recognize both."""
+        if expr.op == "&&":
+            return True
+        if expr.op == "==>" and getattr(expr.lhs, "op", None) == "&&":
+            return True
+        return False
+
     def _handle_memset_assume(self, q_expr, boogie_vars):
         expr = q_expr.expression
 
-        if expr.op == "&&":
+        if self._is_fill_range_pattern(expr):
             free_vars = [v for v in boogie_vars if v not in q_expr.variables]
             classified = self._classify_vars(free_vars, {
                 "M.ret": "M_ret", "dst": "dst", "len": "len", "val": "val",
             })
             for role in ("M_ret", "dst", "len", "val"):
-                assert role in classified, f"Missing {role} in memset &&: {q_expr.expression}"
+                assert role in classified, f"Missing {role} in memset fill: {q_expr.expression}"
             assert "memset" in classified["dst"].name, f"Not memset?? {q_expr.expression}"
 
             val = self._get_var(classified["val"].name)
@@ -1021,13 +1202,14 @@ class BoogieInterpreter:
     def _handle_memcpy_assume(self, q_expr, boogie_vars):
         expr = q_expr.expression
 
-        if expr.op == "&&":
-            classified = self._classify_vars(boogie_vars, {
+        if self._is_fill_range_pattern(expr):
+            free_vars = [v for v in boogie_vars if v not in q_expr.variables]
+            classified = self._classify_vars(free_vars, {
                 "$M.ret": "M_ret", "$M.src": "M_src",
                 "$len": "len", "$src": "src", "$dst": "dst",
             })
             for role in ("M_ret", "M_src", "len", "src", "dst"):
-                assert role in classified, f"Missing {role} in memcpy &&: {boogie_vars}"
+                assert role in classified, f"Missing {role} in memcpy fill: {boogie_vars}"
 
             dst = self._get_var(classified["dst"].name)
             src = self._get_var(classified["src"].name)

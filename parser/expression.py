@@ -3,6 +3,7 @@ from .node import Node
 from .binding import Binding
 from .program import Program
 from .scope import Scope
+from .type import MapType
 
 
 class Type:

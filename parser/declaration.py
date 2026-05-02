@@ -1,6 +1,7 @@
 from .node import Node
 from .binding import Binding
 from .scope import Scope
+from .specifications import ModifiesClause
 
 
 class Declaration(Node):

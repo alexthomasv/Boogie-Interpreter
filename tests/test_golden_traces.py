@@ -18,11 +18,18 @@ try:
 except ImportError:
     HAS_NATIVE = False
 
-pytestmark = pytest.mark.skipif(not HAS_NATIVE, reason="Native interpreter not built")
+native_required = pytest.mark.skipif(not HAS_NATIVE, reason="Native interpreter not built")
 
 
 class TestGoldenTraces:
     """Compare Python and native interpreter outputs on real benchmarks."""
+
+    pytestmark = [
+        native_required,
+        pytest.mark.integration,
+        pytest.mark.requires_compiled_package,
+        pytest.mark.slow,
+    ]
 
     def test_both_engines_match(self, benchmark_data):
         """Run both engines on the same input and assert identical results."""

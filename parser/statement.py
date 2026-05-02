@@ -7,6 +7,9 @@ from .expression import LabelIdentifier, Identifier
 class Statement(Node):
     pass
 
+class Label(Declaration):
+    name = None
+
 class AssertStatement(Statement):
     expression = None
     children = ["expression"]
@@ -250,6 +253,8 @@ class Body(Node):
         return "{\n" + '\n'.join(body_locals + body_blocks) + "\n}"
 
     def fresh_var(self, type_, prefix, taken=None):
+        from .boogie_parser import bpl
+
         if taken is None:
             taken = []
         taken += [d.names for d in self.locals]

@@ -3,6 +3,7 @@
 import signal
 import tempfile
 import copy
+import os
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -10,6 +11,7 @@ from typing import Optional
 
 from interpreter.utils.inputs import ProgramInputs
 from interpreter.python.interpreter import hex_to_bytes
+from interpreter.utils.debug_log import DebugLogger
 
 
 @contextmanager
@@ -39,9 +41,11 @@ class Evaluator:
     """Run the Boogie interpreter on a ProgramInputs and return block coverage."""
 
     def __init__(self, program, test_name: str, timeout: int = 30,
-                 engine: str = "native"):
+                 engine: str = "native", debug_logger=None):
         self.program = program
         self.test_name = test_name
+        self.debug = (debug_logger or DebugLogger.disabled()).bind(
+            component="coverage-evaluator", test_name=test_name)
         self.timeout = timeout
         self.engine_requested = engine
         self.engine = engine
@@ -72,6 +76,8 @@ class Evaluator:
                 )
                 print("[coverage] Native evaluator unavailable; "
                       f"falling back to Python ({self.native_fallback_reason})")
+                self.debug.event("exec", "native_fallback",
+                                 reason=self.native_fallback_reason)
                 self.engine = "python"
 
     def _get_entry(self):
@@ -91,6 +97,10 @@ class Evaluator:
                    input_name: str = "_cov_eval") -> EvaluationResult:
         """Execute program_inputs and return coverage plus stop status."""
         self.runs += 1
+        self.debug.event("candidate", "evaluation_start",
+                         input_name=input_name, engine=self.engine,
+                         run_index=self.runs,
+                         timeout=self.timeout)
         try:
             with _alarm(self.timeout):
                 if self.engine == "native":
@@ -99,10 +109,22 @@ class Evaluator:
                     result = self._run_python_result(program_inputs, input_name)
                 self._account_result(result)
                 self.last_result = result
+                self.debug.event(
+                    "candidate",
+                    "evaluation_end",
+                    input_name=input_name,
+                    status=result.status,
+                    covered=len(result.covered),
+                    violation_pc=result.violation_pc,
+                    violation_block=result.violation_block,
+                    message=result.message,
+                )
                 return result
         except TimeoutError:
             self.timeouts += 1
             result = EvaluationResult(set(), status="timeout")
+            self.debug.event("candidate", "evaluation_timeout",
+                             input_name=input_name, timeout=self.timeout)
         except Exception as exc:
             self.errors += 1
             result = EvaluationResult(
@@ -110,6 +132,8 @@ class Evaluator:
                 status="internal_error",
                 message=f"{type(exc).__name__}: {exc}",
             )
+            self.debug.event("candidate", "evaluation_error",
+                             input_name=input_name, error=result.message)
         self.last_result = result
         return result
 
@@ -130,7 +154,8 @@ class Evaluator:
         from interpreter.python.Environment import Environment
         from interpreter.python.interpreter import BoogieInterpreter, AssertViolation
 
-        env = Environment(self.test_name, input_name)
+        debug = self.debug.bind(input_name=input_name, engine="python")
+        env = Environment(self.test_name, input_name, debug_logger=debug)
         env.full_trace = False
         env.LOG_READ = False
 
@@ -138,7 +163,8 @@ class Evaluator:
         if entry is None:
             return EvaluationResult(set())
 
-        interp = BoogieInterpreter(env, program_inputs, input_name)
+        interp = BoogieInterpreter(env, program_inputs, input_name,
+                                   debug_logger=debug)
         interp.preprocess(self.program)
         try:
             interp.execute_procedure(entry)
@@ -188,6 +214,7 @@ class Evaluator:
             compiled=self._compiled,
             no_trace=True,
             return_status=True,
+            debug_logger=self.debug.bind(input_name=input_name, engine="native"),
         )
         return EvaluationResult(
             set(explored.get("explored_blocks") or []),
@@ -204,6 +231,8 @@ class Evaluator:
                          havoc_bound: int = 8) -> tuple[list[ProgramInputs], dict]:
         """Ask the native concolic engine for branch-negation candidates."""
         if self.engine != "native" or self._compiled is None:
+            self.debug.event("solver", "concolic_skipped",
+                             input_name=input_name, reason="native-unavailable")
             return [], {"skipped": "native-unavailable"}
 
         try:
@@ -215,25 +244,51 @@ class Evaluator:
                 program_inputs, input_name, havoc_bound=havoc_bound,
                 init_state=_init_python_state, extract_state=_extract_state)
             if not symbols:
+                self.debug.event("solver", "concolic_skipped",
+                                 input_name=input_name,
+                                 reason="no-symbolic-inputs",
+                                 cache_hit=cache_hit)
                 return [], {
                     "skipped": "no-symbolic-inputs",
                     "python_state_cache_hits": int(cache_hit),
                     "python_state_cache_misses": int(not cache_hit),
                 }
 
-            result = swoosh_interp.concolic_suggest(
-                self._compiled,
-                var_store,
-                memory_maps,
-                mem_map_info,
-                symbols,
-                extra_data=program_inputs.extra_data,
-                covered_blocks=set(covered_blocks),
+            self.debug.event(
+                "solver",
+                "concolic_start",
+                input_name=input_name,
+                symbols=len(symbols),
+                covered_blocks=len(covered_blocks),
                 loop_bound=loop_bound,
                 max_path_depth=max_path_depth,
                 max_solver_queries=max_solver_queries,
                 solver_timeout_ms=solver_timeout_ms,
+                cache_hit=cache_hit,
             )
+            env_updates = self.debug.native_env()
+            old_env = {key: os.environ.get(key) for key in env_updates}
+            try:
+                os.environ.update(env_updates)
+                result = swoosh_interp.concolic_suggest(
+                    self._compiled,
+                    var_store,
+                    memory_maps,
+                    mem_map_info,
+                    symbols,
+                    extra_data=program_inputs.extra_data,
+                    covered_blocks=set(covered_blocks),
+                    loop_bound=loop_bound,
+                    max_path_depth=max_path_depth,
+                    max_solver_queries=max_solver_queries,
+                    solver_timeout_ms=solver_timeout_ms,
+                )
+            finally:
+                for key, old in old_env.items():
+                    if old is None:
+                        os.environ.pop(key, None)
+                    else:
+                        os.environ[key] = old
             candidates = []
             for item in result.get("candidates", []):
                 updates = item.get("updates", {})
@@ -242,9 +297,16 @@ class Evaluator:
             stats = dict(result.get("stats", {}))
             stats["python_state_cache_hits"] = int(cache_hit)
             stats["python_state_cache_misses"] = int(not cache_hit)
+            self.debug.event("solver", "concolic_end",
+                             input_name=input_name,
+                             candidates=len(candidates),
+                             stats=stats)
             return candidates, stats
         except Exception as exc:
             self.errors += 1
+            self.debug.event("solver", "concolic_error",
+                             input_name=input_name,
+                             error=f"{type(exc).__name__}: {exc}")
             return [], {"error": f"{type(exc).__name__}: {exc}"}
 
     def symbolic_explore(self, program_inputs: ProgramInputs, input_name: str,
@@ -256,6 +318,8 @@ class Evaluator:
                          max_states: int = 256) -> tuple[list[ProgramInputs], dict]:
         """Ask the native bounded symbolic worklist engine for path inputs."""
         if self.engine != "native" or self._compiled is None:
+            self.debug.event("solver", "symbolic_skipped",
+                             input_name=input_name, reason="native-unavailable")
             return [], {"skipped": "native-unavailable"}
 
         try:
@@ -267,26 +331,53 @@ class Evaluator:
                 program_inputs, input_name, havoc_bound=havoc_bound,
                 init_state=_init_python_state, extract_state=_extract_state)
             if not symbols:
+                self.debug.event("solver", "symbolic_skipped",
+                                 input_name=input_name,
+                                 reason="no-symbolic-inputs",
+                                 cache_hit=cache_hit)
                 return [], {
                     "skipped": "no-symbolic-inputs",
                     "python_state_cache_hits": int(cache_hit),
                     "python_state_cache_misses": int(not cache_hit),
                 }
 
-            result = swoosh_interp.symbolic_explore(
-                self._compiled,
-                var_store,
-                memory_maps,
-                mem_map_info,
-                symbols,
-                extra_data=program_inputs.extra_data,
-                covered_blocks=set(covered_blocks),
+            self.debug.event(
+                "solver",
+                "symbolic_start",
+                input_name=input_name,
+                symbols=len(symbols),
+                covered_blocks=len(covered_blocks),
                 loop_bound=loop_bound,
                 max_path_depth=max_path_depth,
                 max_solver_queries=max_solver_queries,
                 solver_timeout_ms=solver_timeout_ms,
                 max_states=max_states,
+                cache_hit=cache_hit,
             )
+            env_updates = self.debug.native_env()
+            old_env = {key: os.environ.get(key) for key in env_updates}
+            try:
+                os.environ.update(env_updates)
+                result = swoosh_interp.symbolic_explore(
+                    self._compiled,
+                    var_store,
+                    memory_maps,
+                    mem_map_info,
+                    symbols,
+                    extra_data=program_inputs.extra_data,
+                    covered_blocks=set(covered_blocks),
+                    loop_bound=loop_bound,
+                    max_path_depth=max_path_depth,
+                    max_solver_queries=max_solver_queries,
+                    solver_timeout_ms=solver_timeout_ms,
+                    max_states=max_states,
+                )
+            finally:
+                for key, old in old_env.items():
+                    if old is None:
+                        os.environ.pop(key, None)
+                    else:
+                        os.environ[key] = old
             candidates = []
             for item in result.get("candidates", []):
                 updates = item.get("updates", {})
@@ -295,9 +386,16 @@ class Evaluator:
             stats = dict(result.get("stats", {}))
             stats["python_state_cache_hits"] = int(cache_hit)
             stats["python_state_cache_misses"] = int(not cache_hit)
+            self.debug.event("solver", "symbolic_end",
+                             input_name=input_name,
+                             candidates=len(candidates),
+                             stats=stats)
             return candidates, stats
         except Exception as exc:
             self.errors += 1
+            self.debug.event("solver", "symbolic_error",
+                             input_name=input_name,
+                             error=f"{type(exc).__name__}: {exc}")
             return [], {"error": f"{type(exc).__name__}: {exc}"}
 
     def _prepare_symbolic_state(self, program_inputs: ProgramInputs,
@@ -307,11 +405,24 @@ class Evaluator:
         cached = self._symbolic_state_cache.get(key)
         if cached is not None:
             var_store, memory_maps, mem_map_info, symbols, bindings = copy.deepcopy(cached)
+            self.debug.event(
+                "solver",
+                "symbolic_layout",
+                input_name=input_name,
+                cache_hit=True,
+                symbols=len(symbols),
+                by_kind=_symbol_counts(symbols),
+                scalars=len(var_store),
+                maps=len(memory_maps),
+                map_entries=sum(len(v) for v in memory_maps.values()),
+            )
             return var_store, memory_maps, mem_map_info, symbols, bindings, True
 
         interp, _entry = init_state(
             self.program, program_inputs, self.test_name, input_name,
             no_read_trace=True,
+            debug_logger=self.debug.bind(input_name=input_name,
+                                         engine="python-init"),
         )
         try:
             var_store, memory_maps, mem_map_info = extract_state(interp)
@@ -326,7 +437,26 @@ class Evaluator:
         if len(self._symbolic_state_cache) >= self._symbolic_state_cache_limit:
             self._symbolic_state_cache.pop(next(iter(self._symbolic_state_cache)))
         self._symbolic_state_cache[key] = copy.deepcopy(bundle)
+        self.debug.event(
+            "solver",
+            "symbolic_layout",
+            input_name=input_name,
+            cache_hit=False,
+            symbols=len(symbols),
+            by_kind=_symbol_counts(symbols),
+            scalars=len(var_store),
+            maps=len(memory_maps),
+            map_entries=sum(len(v) for v in memory_maps.values()),
+        )
         return var_store, memory_maps, mem_map_info, symbols, bindings, False
+
+
+def _symbol_counts(symbols: list[dict]) -> dict:
+    counts = {}
+    for symbol in symbols:
+        kind = symbol.get("kind", "unknown")
+        counts[kind] = counts.get(kind, 0) + 1
+    return counts
 
 
 def _int_to_u64(value: int) -> int:

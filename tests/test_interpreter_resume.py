@@ -24,7 +24,7 @@ from unittest.mock import patch, MagicMock
 # Since the main block is in `if __name__ == '__main__'`, we test it via subprocess.
 # For unit-level tests, we import process_single_input directly.
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = Path(__file__).resolve().parents[2]
 
 
 class TestProcessSingleInput(unittest.TestCase):

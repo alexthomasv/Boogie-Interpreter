@@ -629,10 +629,11 @@ class TestStatements:
         interp.execute_statement(stmt)  # Should not raise
 
     def test_assume_false(self):
-        """Assume false should not crash — interpreter just evaluates for trace."""
+        """Concrete assume failures are invalid inputs and should fail loudly."""
         interp = self.make_interpreter()
         stmt = bpl("assume false;")
-        interp.execute_statement(stmt)
+        with pytest.raises(AssertionError, match="concrete assume failed"):
+            interp.execute_statement(stmt)
 
 
 # ============================================================
@@ -667,6 +668,37 @@ class TestMemsetMemcpy:
     # ----------------------------------------------------------
     # Memset tests
     # ----------------------------------------------------------
+
+    def test_memset_fill_range_outer_implies(self):
+        """
+        Memset fill-range, alternate parenthesisation:
+
+            forall x :: ((dst <= x && x < dst+len) ==> M.ret[x] == val)
+
+        SMACK's inlined chacha20poly1305 wrapper in aead emits this
+        form (outer ``==>`` with ``&&`` LHS); previously the dispatch
+        fell through to ``_handle_preserve_assume`` and crashed on
+        ``lhs.function.name``. The fill semantics must apply unchanged.
+        """
+        interp = self.make_interpreter()
+        M_ret = MemoryMap("test", "inline$$memset.i8.cross_product$0$$M.ret", 64, 8, interp.env)
+        interp.env.set_value("inline$$memset.i8.cross_product$0$$M.ret", M_ret)
+        interp.env.set_value("inline$$memset.i8.cross_product$0$$dst", 100)
+        interp.env.set_value("inline$$memset.i8.cross_product$0$$len", 10)
+        interp.env.set_value("inline$$memset.i8.cross_product$0$$val", 0xAB)
+
+        stmt = bpl(
+            r'assume (forall x: ref :: (($sle.ref.bool(inline$$memset.i8.cross_product$0$$dst, x) '
+            r'&& $slt.ref.bool(x, $add.ref(inline$$memset.i8.cross_product$0$$dst, '
+            r'inline$$memset.i8.cross_product$0$$len))) '
+            r'==> (inline$$memset.i8.cross_product$0$$M.ret[x] == '
+            r'inline$$memset.i8.cross_product$0$$val)));'
+        )
+        # Must not raise — and must apply fill semantics.
+        interp.execute_statement(stmt)
+
+        for addr in range(100, 110):
+            assert M_ret.get(addr) == 0xAB, f"M.ret[{addr}] = {M_ret.get(addr)}, expected 0xAB"
 
     def test_memset_fill_range(self):
         """
@@ -1041,6 +1073,12 @@ class TestMemsetMemcpy:
 
 class TestEndToEnd:
     """Integration tests that run the interpreter on actual compiled packages."""
+    pytestmark = [
+        pytest.mark.integration,
+        pytest.mark.benchmark,
+        pytest.mark.requires_compiled_package,
+        pytest.mark.slow,
+    ]
 
     @pytest.fixture
     def aead_pkg(self):
@@ -1745,6 +1783,12 @@ def _load_and_run(test_name, input_name, tmp_path):
 
 class TestBenchmarkInputs:
     """Run interpreter on each available benchmark and verify basic properties."""
+    pytestmark = [
+        pytest.mark.integration,
+        pytest.mark.benchmark,
+        pytest.mark.requires_compiled_package,
+        pytest.mark.slow,
+    ]
 
     @pytest.mark.parametrize("test_name,input_name", _BENCHMARKS)
     def test_execution_completes(self, test_name, input_name, tmp_path):
