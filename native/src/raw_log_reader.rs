@@ -97,14 +97,8 @@ const TOTAL_FLUSH_MEMBERS: u64 = 50_000_000;
 ///   * `Sadd12` — value sets: Vec of fixed 12-byte members.
 ///   * `SaddBytes` — pickle-encoded members (PC / block registry).
 enum FlushCmd {
-    Sadd12 {
-        key: String,
-        members: Vec<[u8; 12]>,
-    },
-    SaddBytes {
-        key: String,
-        members: Vec<Vec<u8>>,
-    },
+    Sadd12 { key: String, members: Vec<[u8; 12]> },
+    SaddBytes { key: String, members: Vec<Vec<u8>> },
 }
 
 /// Per-stage throughput counters. Incremented by the thread owning the
@@ -137,11 +131,7 @@ struct Counters {
 /// to pre-T2 behaviour; no performance regression, just no speedup.
 /// Multi-frame files unlock N-way parallel zstd decode, lifting the
 /// single-frame ~300 MB/s decode ceiling.
-pub fn load_raw_log_to_redis(
-    path: &Path,
-    redis_url: &str,
-    iter_id_offset: u32,
-) -> io::Result<u64> {
+pub fn load_raw_log_to_redis(path: &Path, redis_url: &str, iter_id_offset: u32) -> io::Result<u64> {
     let file = File::open(path)?;
     let file_size = file.metadata()?.len();
     let mmap = unsafe { Mmap::map(&file)? };
@@ -264,9 +254,16 @@ pub fn load_raw_log_to_redis(
     // when frames have variable sizes.
     let (frame_tx, frame_rx) = bounded::<FrameJob>(record_frames.len().max(1));
     for (idx, range) in record_frames.iter().cloned().enumerate() {
-        let skip = if idx == 0 { skip_header_bytes_in_first } else { 0 };
+        let skip = if idx == 0 {
+            skip_header_bytes_in_first
+        } else {
+            0
+        };
         frame_tx
-            .send(FrameJob { range, skip_bytes: skip })
+            .send(FrameJob {
+                range,
+                skip_bytes: skip,
+            })
             .expect("frame_tx bounded cap == frames.len(), send can't fail");
     }
     drop(frame_tx);
@@ -377,8 +374,7 @@ struct FrameJob {
 /// tens of KB minimum, so this threshold is comfortably above noise.
 fn scan_frame_ranges(data: &[u8]) -> Vec<std::ops::Range<usize>> {
     const MIN_REAL_FRAME: usize = 64;
-    let starts: Vec<usize> =
-        memchr::memmem::find_iter(data, &ZSTD_FRAME_MAGIC).collect();
+    let starts: Vec<usize> = memchr::memmem::find_iter(data, &ZSTD_FRAME_MAGIC).collect();
     if starts.is_empty() {
         return Vec::new();
     }
@@ -398,9 +394,7 @@ fn scan_frame_ranges(data: &[u8]) -> Vec<std::ops::Range<usize>> {
 /// header occupies — relevant for legacy single-frame files where the
 /// caller needs to skip past the header before record parsing in the
 /// same decompressed stream.
-fn parse_header_from_frame0(
-    frame_bytes: &[u8],
-) -> io::Result<(Vec<String>, Vec<String>, usize)> {
+fn parse_header_from_frame0(frame_bytes: &[u8]) -> io::Result<(Vec<String>, Vec<String>, usize)> {
     let mut reader = zstd::stream::read::Decoder::new(Cursor::new(frame_bytes))?;
 
     let mut magic = [0u8; 4];
@@ -433,9 +427,8 @@ fn parse_header_from_frame0(
 fn header_encoded_size(var_names: &[String], block_names: &[String]) -> usize {
     // MAGIC(4) + VERSION(1) + var_table_len(4) +
     //   Σ (len u16 + utf8 bytes) + block_table_len(4) + Σ ...
-    let table = |names: &[String]| -> usize {
-        4 + names.iter().map(|n| 2 + n.len()).sum::<usize>()
-    };
+    let table =
+        |names: &[String]| -> usize { 4 + names.iter().map(|n| 2 + n.len()).sum::<usize>() };
     4 + 1 + table(var_names) + table(block_names)
 }
 
@@ -547,13 +540,12 @@ fn worker_loop(
                 let count = members.len() as u64;
                 for ci in (0..members.len()).step_by(MEMBERS_PER_SADD) {
                     let end = (ci + MEMBERS_PER_SADD).min(members.len());
-                    let slices: Vec<&[u8]> = members[ci..end].iter().map(|m| m.as_slice()).collect();
+                    let slices: Vec<&[u8]> =
+                        members[ci..end].iter().map(|m| m.as_slice()).collect();
                     pipe.sadd(&key, &slices).ignore();
                 }
                 batched += 1;
-                counters
-                    .members_flushed
-                    .fetch_add(count, Ordering::Relaxed);
+                counters.members_flushed.fetch_add(count, Ordering::Relaxed);
                 if batched >= KEYS_PER_EXECUTE {
                     flush_pipe(&mut pipe, &mut conn, &mut batched)?;
                 }
@@ -562,13 +554,12 @@ fn worker_loop(
                 let count = members.len() as u64;
                 for ci in (0..members.len()).step_by(MEMBERS_PER_SADD) {
                     let end = (ci + MEMBERS_PER_SADD).min(members.len());
-                    let slices: Vec<&[u8]> = members[ci..end].iter().map(|m| m.as_slice()).collect();
+                    let slices: Vec<&[u8]> =
+                        members[ci..end].iter().map(|m| m.as_slice()).collect();
                     pipe.sadd(&key, &slices).ignore();
                 }
                 batched += 1;
-                counters
-                    .members_flushed
-                    .fetch_add(count, Ordering::Relaxed);
+                counters.members_flushed.fetch_add(count, Ordering::Relaxed);
                 if batched >= KEYS_PER_EXECUTE {
                     flush_pipe(&mut pipe, &mut conn, &mut batched)?;
                 }

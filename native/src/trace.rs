@@ -92,7 +92,11 @@ impl TraceAccumulator {
     #[inline]
     fn header_contains_block(&self, header: BlockId, block: BlockId) -> bool {
         // Walk the innermost-header chain starting at `block` upwards.
-        let mut cur = self.block_innermost_header.get(block as usize).copied().flatten();
+        let mut cur = self
+            .block_innermost_header
+            .get(block as usize)
+            .copied()
+            .flatten();
         while let Some(h) = cur {
             if h == header {
                 return true;

@@ -526,14 +526,13 @@ def _lookup_free_const(state_cache, node: SerializedNode):
 
 
 def _remember_free_const(state_cache, name: str, term: Term):
+    put_runtime = getattr(state_cache, "put_runtime_cvc5_var", None)
+    if callable(put_runtime):
+        put_runtime(name, term)
+        return
     cache = getattr(state_cache, "cached_id_to_cvc5", None)
     if isinstance(cache, MutableMapping):
         cache[name] = term
-    redis = getattr(state_cache, "redis", None)
-    if redis is not None:
-        from src.state.redis_keys import put_cvc5_var
-
-        put_cvc5_var(redis, name, term)
 
 
 def deserialize_cvc5_term(state_cache, root_term: SerializedCvc5TermV2 | Term) -> Term:

@@ -1,33 +1,23 @@
-from .declaration import VariableDeclaration, ProcedureDeclaration
 from .node import Node
-from .binding import Binding
-from .program import Program
-from .scope import Scope
-from .type import MapType
-
-
-class Type:
-    Boolean = "Boolean"
-    Integer = "Integer"
-
-class BitvectorType(Type):
-    def __init__(self, base=None, width=None):
-        self.base = base
-        self.width = width
 
 # Expressions
 
 class Expression(Node):
     Wildcard = None
 
-    @staticmethod
-    def show():
+    def __repr__(self):
+        if self is Expression.Wildcard:
+            return "*"
+        return super().__repr__()
+
+    def show(self):
         return "*"
 
 Expression.Wildcard = Expression()
 
 class Literal(Expression):
     def __init__(self, value):
+        super().__init__()
         self.value = value
 
     def __eq__(self, other):
@@ -50,9 +40,6 @@ class BooleanLiteral(Literal):
     def __repr__(self):
         return f"{'true' if self.value else 'false'}"
 
-    def type(self):
-        return Type.Boolean
-
 class IntegerLiteral(Literal):
     def __eq__(self, other):
         if not isinstance(other, IntegerLiteral):
@@ -64,9 +51,6 @@ class IntegerLiteral(Literal):
 
     def __repr__(self):
         return str(self.value)
-
-    def type(self):
-        return Type.Integer
 
 class BitvectorLiteral(Literal):
     def __init__(self, value, base):
@@ -87,17 +71,24 @@ class BitvectorLiteral(Literal):
     def show(self):
         return f"{self.value}bv{self.base}"
 
-    def type(self):
-        return BitvectorType(self.base)
+class RealLiteral(Literal):
+    def __eq__(self, other):
+        if not isinstance(other, RealLiteral):
+            return NotImplemented
+        return other.value == self.value
+
+    def __hash__(self):
+        return hash(self.value)
+
+    def __repr__(self):
+        return str(self.value)
 
 # Identifier Classes
 class Identifier(Expression):
     name = ""
     
     def __init__(self, **opts):
-        Expression.__init__(self, **opts)
-        if "name" in opts:
-            self.name = opts["name"]
+        super().__init__(**opts)
         self.prefix = None
 
     def __eq__(self, other):
@@ -108,21 +99,6 @@ class Identifier(Expression):
     def __hash__(self):
         return hash(self.name)
     
-    def type(self):
-        if self.declaration and hasattr(self.declaration, 'type'):
-            return self.declaration.type
-
-    def is_variable(self):
-        return self.declaration and isinstance(self.declaration, VariableDeclaration)
-
-    def get_full_name(self):
-        if self.is_global():
-            return self.name
-        return f"{self.declaration.parent.parent.name}.{self.name}"
-
-    def is_global(self):
-        return self.declaration is not None and self.declaration.parent is not None and isinstance(self.declaration.parent, Program)
-
     def set_prefix(self, prefix, indent=1):
         self.prefix = prefix
         self.indent = "  " * indent
@@ -164,11 +140,7 @@ class FunctionApplication(Expression):
 
     def hilite(self):
         args_str = ', '.join([arg.hilite() for arg in self.arguments])
-        return f"{self.function.hilite()}({args_str})" + (f":{self.type().hilite()}" if self.type() else "")
-
-    def type(self):
-        if self.function.declaration and hasattr(self.function.declaration, 'return_type'):
-            return self.function.declaration.return_type
+        return f"{self.function.hilite()}({args_str})"
 
 # Unary Expression
 
@@ -191,22 +163,13 @@ class OldExpression(UnaryExpression):
     def show(self):
         return f"old({self.expression.show()})"
 
-    def type(self):
-        return self.expression.type()
-
 class LogicalNegation(UnaryExpression):
     def __repr__(self):
         return f"!{self.expression}"
 
-    def type(self):
-        return Type.Boolean
-
 class ArithmeticNegation(UnaryExpression):
     def __repr__(self):
         return f"-{self.expression}"
-
-    def type(self):
-        return Type.Integer
 
 # Binary Expression
 
@@ -227,16 +190,6 @@ class BinaryExpression(Expression):
     def __repr__(self):
         return f"({self.lhs} {self.op} {self.rhs})"
 
-    def type(self):
-        boolean_ops = ['<==>', '==>', '||', '&&', '==', '!=', '<', '>', '<=', '>=', '<:']
-        if self.op in boolean_ops:
-            return Type.Boolean
-        elif self.op == '++':
-            if isinstance(self.lhs.type(), BitvectorType) and isinstance(self.rhs.type(), BitvectorType):
-                return BitvectorType(width=self.lhs.type().width + self.rhs.type().width)
-        elif self.op in ['+', '-', '*', '/', '%']:
-            return Type.Integer
-
 # Other Expression Classes
 
 class IfExpression(Expression):
@@ -255,9 +208,6 @@ class IfExpression(Expression):
 
     def __repr__(self):
         return f"(if {str(self.condition)} then {str(self.then)} else {str(self.else_)})"
-
-    def type(self):
-        return self.then.type()
 
 class MapSelect(Expression):
     map = None
@@ -278,24 +228,42 @@ class MapSelect(Expression):
     def __repr__(self):
         return f"{self.map}[{', '.join([str(idx) for idx in self.indexes])}]"
 
-    def type(self):
-        if isinstance(self.map.type(), MapType):
-            return self.map.type().range
-
 class MapUpdate(Expression):
     map = None
     indexes = None
     value = None
     children = ["map", "indexes", "value"]
-    
+
+    def __eq__(self, other):
+        if not isinstance(other, MapUpdate):
+            return NotImplemented
+        return self.map == other.map and self.indexes == other.indexes and self.value == other.value
+
+    def __hash__(self):
+        return hash((self.map, tuple(self.indexes), self.value))
+
     def eql(self, mu):
         return isinstance(mu, MapUpdate) and self.map.eql(mu.map) and self.indexes == mu.indexes and self.value.eql(mu.value)
 
     def __repr__(self):
         return f"{self.map}[{', '.join([str(idx) for idx in self.indexes])} := {self.value}]"
 
-    def type(self):
-        return self.map.type()
+class RangeIndex(Expression):
+    expression = None
+    high = None
+    low = None
+    children = ["expression", "high", "low"]
+
+    def __eq__(self, other):
+        if not isinstance(other, RangeIndex):
+            return NotImplemented
+        return self.expression == other.expression and self.high == other.high and self.low == other.low
+
+    def __hash__(self):
+        return hash((self.expression, self.high, self.low))
+
+    def __repr__(self):
+        return f"{self.expression}[{self.high}:{self.low}]"
 
 # Quantified Expression
 
@@ -321,9 +289,6 @@ class QuantifiedExpression(Expression):
         triggers_str = ' '.join([str(trig) for trig in self.triggers])
         return f"({self.quantifier} {type_args_str} {vars_str} :: {triggers_str} {self.expression})"
 
-    def type(self):
-        return Type.Boolean
-
 class Trigger(Expression):
     expressions = None
     children = ["expressions"]
@@ -338,4 +303,4 @@ class Trigger(Expression):
         return f"{{{', '.join([str(e) for e in self.expressions])}}}"
 
     def show(self):
-        return f"{{{', '.join([e.show() for e in self.expressions])}}}"
+        return f"{{{', '.join([str(e) for e in self.expressions])}}}"

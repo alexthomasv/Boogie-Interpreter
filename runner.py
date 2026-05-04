@@ -1,13 +1,12 @@
 """
-Unified interpreter runner — dispatches between Python and Rust native engines.
+Rust interpreter runner.
 
 Usage:
-    python -m interpreter.runner <test_pkg_path> [--engine=python|native|both] [--force] [--full-trace]
+    python -m interpreter.runner <test_pkg_path> [--engine=native] [--force] [--full-trace]
 
 Architecture:
-    The native engine uses a 2-phase approach:
-    1. Python handles initialization + concretization (AST walking, I/O, <1s)
-    2. Rust handles execution (the hot loop that takes minutes on PyPy)
+    Python still loads pickled Boogie ASTs and performs one-time PyO3 lowering.
+    Per-input concretization and execution run in Rust.
 """
 import argparse
 import hashlib
@@ -18,16 +17,22 @@ import struct
 import shutil
 import time
 from pathlib import Path
-import concurrent.futures
-from concurrent.futures import ProcessPoolExecutor
 from multiprocessing.connection import wait as wait_for_process_message
 import functools
 import os
-import tempfile
 
-from interpreter.python.interpreter import BoogieInterpreter, find_entry_point
+from swoosh_cli.layout import current_layout, first_existing, legacy_input_dir
+
+from interpreter.errors import AssertViolation, AssumeViolation
 from interpreter.utils.debug_log import DebugLogger
+from interpreter.utils.program import find_entry_point
 from interpreter.utils.support_matrix import support_matrix_summary
+from interpreter.utils.static_eval import (
+    compute_static_scalars,
+    compute_static_values,
+    expr_base_ptr,
+    offset_delta,
+)
 
 
 _FNV64_OFFSET = 0xCBF29CE484222325
@@ -55,20 +60,6 @@ def _memory_contents_summary(memory: dict) -> dict:
     }
 
 
-def _memory_summary_from_env(environment) -> dict:
-    from interpreter.python.MemoryMap import MemoryMap
-
-    out = {}
-    for name, value in environment.last_frame().var_store.items():
-        if not isinstance(value, MemoryMap):
-            continue
-        summary = _memory_contents_summary(value.memory)
-        summary["index_bit_width"] = value.index_bit_width
-        summary["element_bit_width"] = value.element_bit_width
-        out[name] = summary
-    return out
-
-
 def _normalize_engine_result(result: dict, *, engine: str, input_name: str) -> dict:
     out = dict(result)
     out["engine"] = engine
@@ -80,7 +71,29 @@ def _normalize_engine_result(result: dict, *, engine: str, input_name: str) -> d
     out.setdefault("message", None)
     out.setdefault("trace_records", None)
     out.setdefault("memory_summary", {})
+    if out["status"] == "assume_violation":
+        out["invalid_input"] = True
+        out.setdefault("invalid_reason", "assume")
+    else:
+        out.setdefault("invalid_input", False)
+        out.setdefault("invalid_reason", None)
     return out
+
+
+_LEGACY_PYTHON_MESSAGE = (
+    "The Python interpreter runtime has been archived at "
+    "archive/legacy_python/runtime/python and is no longer an active engine. "
+    "Use the Rust native engine."
+)
+
+
+def _legacy_python_runtime_disabled(feature: str):
+    raise RuntimeError(f"{feature} is deprecated. {_LEGACY_PYTHON_MESSAGE}")
+
+
+def _reject_legacy_engine(engine: str):
+    if engine != "native":
+        _legacy_python_runtime_disabled(f"engine={engine!r}")
 
 
 def _build_loop_header_live(test_path):
@@ -167,12 +180,167 @@ def _build_loop_metadata(test_path):
 # ---------------------------------------------------------------------------
 _SHARED_PROGRAM = None
 _SHARED_COMPILED = None   # CompiledProgramWrapper from swoosh_interp.lower()
+_SHARED_PREPARED = None   # PreparedNativeProgram
 _SHARED_FIELD_SIZES = None
+
+
+def _build_trace_name_tables(program, entry):
+    """Return complete var/block name tables for raw init logs."""
+    from interpreter.parser.declaration import StorageDeclaration, ConstantDeclaration
+
+    var_names = []
+    seen = set()
+
+    def add_var(name):
+        if name and not name.endswith('.shadow') and name not in seen:
+            seen.add(name)
+            var_names.append(name)
+
+    for d in program.declarations:
+        if isinstance(d, StorageDeclaration):
+            for n in d.names:
+                add_var(n)
+        elif isinstance(d, ConstantDeclaration):
+            for n in d.names:
+                add_var(n)
+    if entry.body:
+        for local_decl in entry.body.locals:
+            if isinstance(local_decl, StorageDeclaration):
+                for n in local_decl.names:
+                    add_var(n)
+    for p in entry.parameters:
+        for n in p.names:
+            add_var(n)
+
+    block_names = ['GLOBAL']
+    seen_b = {'GLOBAL'}
+    if entry.body:
+        for b in entry.body.blocks:
+            if b.name not in seen_b:
+                seen_b.add(b.name)
+                block_names.append(b.name)
+    return var_names, block_names
+
+
+class PreparedNativeProgram:
+    """Static native-run state reused across many ProgramInputs.
+
+    The Rust VM is already fast for warm no-trace executions. This object
+    removes repeated Python-side scans from the hot path: finding entry
+    declarations, block/PC metadata, external-input annotations, pointer
+    aliases, declaration initialization shape, trace name tables, and native
+    lowering.
+    """
+
+    def __init__(self, program, *, test_path=None, compiled=None):
+        from interpreter.parser.declaration import (
+            AxiomDeclaration,
+            ImplementationDeclaration,
+            ProcedureDeclaration,
+        )
+        from interpreter.utils.inputs import preprocess_external_inputs, gather_ptr_aliases
+        from interpreter.utils.program import generate_label_to_block, initialize_code_metadata
+
+        self.program = program
+        self.test_path = Path(test_path) if test_path is not None else None
+
+        impl_decls = [
+            d for d in program.declarations
+            if isinstance(d, ImplementationDeclaration) and d.body
+        ]
+        impl_names = {d.name for d in impl_decls}
+        proc_decls = [
+            d for d in program.declarations
+            if isinstance(d, ProcedureDeclaration)
+            and not isinstance(d, ImplementationDeclaration)
+            and d.name in impl_names
+        ]
+        assert len(proc_decls) == 1 and len(impl_decls) == 1, (
+            f"We only support inlined procedures. "
+            f"{[p.name for p in proc_decls]} {len(proc_decls)} {len(impl_decls)} "
+            f"{[d.name for d in program.declarations if isinstance(d, ProcedureDeclaration)]}"
+        )
+
+        self.impl_decl = impl_decls[0]
+        self.impl_decl_name = self.impl_decl.name
+        self.proc_decl = proc_decls[0]
+        self.entry = self.impl_decl
+        self.label_to_block = generate_label_to_block(program)
+        (
+            self.pc_to_stmt,
+            self.label_to_pc,
+            self.pc_to_block_name,
+            self.pc_to_label,
+        ) = initialize_code_metadata(self.impl_decl)
+        self.global_axioms = tuple(
+            decl for decl in program.declarations
+            if isinstance(decl, AxiomDeclaration)
+        )
+        self.arr_inputs, self.field_inputs = preprocess_external_inputs(self.impl_decl)
+        self.ptr_aliases = gather_ptr_aliases(self.impl_decl)
+        self.trace_var_names, self.trace_block_names = _build_trace_name_tables(
+            program, self.entry)
+        self.compiled = compiled if compiled is not None else self._lower_program()
+        self.native_meta = self._build_native_meta()
+
+    def _lower_program(self):
+        import swoosh_interp
+
+        if self.test_path is not None:
+            lh_live = _build_loop_header_live(self.test_path)
+            loop_meta = _build_loop_metadata(self.test_path)
+            return swoosh_interp.lower(self.program, lh_live, loop_meta)
+        return swoosh_interp.lower(self.program)
+
+    def _build_native_meta(self):
+        """Build static metadata for Rust-side per-input concretization."""
+        static_scalars = compute_static_scalars(self.program)
+        static_values = compute_static_values(self.program)
+
+        arr_inputs = {}
+        for key, infos in self.arr_inputs.items():
+            arr_inputs[key] = [
+                {
+                    "mem_map": ai.mem_map,
+                    "base_ptr": ai.base_ptr,
+                    "offset_delta": offset_delta(ai.offset, ai.base_ptr, static_values),
+                    "elem_size": ai.elem_size,
+                    "num_elements": ai.num_elements,
+                }
+                for ai in infos
+            ]
+
+        field_inputs = {}
+        for key, infos in self.field_inputs.items():
+            items = []
+            for fi in infos:
+                base_ptr = expr_base_ptr(fi.base_ptr)
+                items.append({
+                    "var_name": fi.var_name,
+                    "mem_map": fi.mem_map,
+                    "base_ptr": base_ptr,
+                    "offset_delta": offset_delta(fi.base_ptr, base_ptr, static_values),
+                    "size": fi.size,
+                })
+            field_inputs[key] = items
+
+        return {
+            "static_scalars": static_scalars,
+            "arr_inputs": arr_inputs,
+            "field_inputs": field_inputs,
+            "ptr_aliases": dict(self.ptr_aliases),
+        }
+
+
+def prepare_native(program, *, test_path=None, compiled=None):
+    """Prepare reusable static state for high-throughput native execution."""
+    return PreparedNativeProgram(program, test_path=test_path, compiled=compiled)
 
 
 def _load_shared(test_path, engine):
     """Load program + compile bytecode once in the parent process."""
-    global _SHARED_PROGRAM, _SHARED_COMPILED, _SHARED_FIELD_SIZES
+    global _SHARED_PROGRAM, _SHARED_COMPILED, _SHARED_PREPARED, _SHARED_FIELD_SIZES
+    _reject_legacy_engine(engine)
 
     with open(test_path, 'rb') as f:
         _SHARED_PROGRAM = pickle.load(f)
@@ -180,15 +348,22 @@ def _load_shared(test_path, engine):
     from interpreter.utils.input_parser import get_bpl_field_sizes
     _SHARED_FIELD_SIZES = get_bpl_field_sizes(test_path.parent, program=_SHARED_PROGRAM)
 
-    if engine in ('native', 'both'):
-        try:
-            import swoosh_interp
-            lh_live = _build_loop_header_live(test_path)
-            loop_meta = _build_loop_metadata(test_path)
-            _SHARED_COMPILED = swoosh_interp.lower(
-                _SHARED_PROGRAM, lh_live, loop_meta)
-        except ImportError:
-            _SHARED_COMPILED = None
+    try:
+        import swoosh_interp
+    except ImportError as exc:
+        raise ImportError(
+            "Rust native interpreter not built. Run: "
+            "cd interpreter/native && maturin develop --release"
+        ) from exc
+
+    lh_live = _build_loop_header_live(test_path)
+    loop_meta = _build_loop_metadata(test_path)
+    _SHARED_COMPILED = swoosh_interp.lower(_SHARED_PROGRAM, lh_live, loop_meta)
+    _SHARED_PREPARED = prepare_native(
+        _SHARED_PROGRAM,
+        test_path=test_path,
+        compiled=_SHARED_COMPILED,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -279,7 +454,9 @@ def compute_coverage(program, explored_blocks):
         "block_pct": round(100.0 * covered_blocks / total_blocks, 1) if total_blocks else 0,
         "stmt_pct": round(100.0 * covered_stmts / total_stmts, 1) if total_stmts else 0,
         "reachable_blocks_total": reachable_blocks_total,
+        "reachable_blocks_covered": reachable_covered,
         "reachable_stmts_total": reachable_stmts_total,
+        "reachable_stmts_covered": reachable_stmts_covered,
         "unreachable_blocks": unreachable_blocks,
         "reachable_block_pct": round(100.0 * reachable_covered / reachable_blocks_total, 1) if reachable_blocks_total else 0,
         "reachable_stmt_pct": round(100.0 * reachable_stmts_covered / reachable_stmts_total, 1) if reachable_stmts_total else 0,
@@ -325,315 +502,66 @@ def write_trace_binary(path, compact_trace):
 
 
 # ---------------------------------------------------------------------------
-# Python engine
+# Archived Python engine compatibility stubs
 # ---------------------------------------------------------------------------
 
 def run_python_result(program, program_inputs, test_name, input_name,
                       full_trace=False, no_read_trace=False,
                       debug_logger=None):
-    """Run the Python interpreter and return a structured engine result."""
-    from interpreter.python.Environment import Environment
-    from interpreter.python.interpreter import AssertViolation
-
-    debug = (debug_logger or DebugLogger.disabled()).bind(
-        engine="python", input_name=input_name)
-    debug.event("exec", "engine_start", engine="python",
-                full_trace=full_trace, log_read=not no_read_trace)
-
-    environment = Environment(test_name, input_name, debug_logger=debug)
-    environment.full_trace = full_trace
-    if no_read_trace:
-        environment.LOG_READ = False
-
-    interp = BoogieInterpreter(environment, program_inputs, input_name,
-                               debug_logger=debug)
-    interp.preprocess(program)
-
-    entry = find_entry_point(program)
-    assert entry is not None, "No entry point found"
-
-    result = {
-        "status": "ok",
-        "explored_blocks": set(),
-        "trace_path": environment._trace_path,
-    }
-    try:
-        interp.execute_procedure(entry)
-        result["explored_blocks"] = set(interp.explored_blocks)
-    except AssertViolation as exc:
-        result.update({
-            "status": "assert_violation",
-            "explored_blocks": set(interp.explored_blocks),
-            "violation_pc": exc.pc,
-            "violation_block": exc.block,
-            "message": exc.expr_str,
-        })
-    except AssertionError as exc:
-        msg = str(exc)
-        if "concrete assume failed" not in msg:
-            raise
-        result.update({
-            "status": "assume_violation",
-            "explored_blocks": set(interp.explored_blocks),
-            "violation_pc": getattr(environment, "pc", None),
-            "violation_block": getattr(environment, "curr_block", None),
-            "message": msg,
-        })
-    finally:
-        result["trace_records"] = getattr(environment, "_raw_log_count", None)
-        result["memory_summary"] = _memory_summary_from_env(environment)
-        close = getattr(interp, "close", None)
-        if close:
-            close()
-
-    result = _normalize_engine_result(result, engine="python", input_name=input_name)
-    debug.event("exec", "engine_end", engine="python",
-                status=result["status"],
-                explored_blocks=len(result["explored_blocks"]),
-                trace_records=result.get("trace_records"),
-                violation_pc=result.get("violation_pc"),
-                violation_block=result.get("violation_block"),
-                memory_maps=len(result.get("memory_summary") or {}))
-    return result
+    _legacy_python_runtime_disabled("run_python_result")
 
 
 def run_python(program, program_inputs, test_name, input_name, full_trace=False,
                no_read_trace=False, debug_logger=None):
-    """Run the Python interpreter. Returns (explored_blocks, compact_path)."""
-    result = run_python_result(
-        program,
-        program_inputs,
-        test_name,
-        input_name,
-        full_trace=full_trace,
-        no_read_trace=no_read_trace,
-        debug_logger=debug_logger,
-    )
-    status = result.get("status", "ok")
-    if status == "assert_violation":
-        from interpreter.python.interpreter import AssertViolation
+    _legacy_python_runtime_disabled("run_python")
+
+
+# ---------------------------------------------------------------------------
+# Native engine
+# ---------------------------------------------------------------------------
+
+def _finish_native_result(result, *, return_status):
+    if return_status:
+        return result
+
+    status = result.get('status', 'ok')
+    if status == 'assert_violation':
         raise AssertViolation(
             None,
-            pc=result.get("violation_pc"),
-            block=result.get("violation_block"),
-            expr_str=result.get("message") or "<python assertion>",
+            pc=result.get('violation_pc'),
+            block=result.get('violation_block'),
+            expr_str='<native assertion>',
         )
-    if status == "assume_violation":
-        raise AssertionError(result.get("message") or "concrete assume failed")
+    if status == 'assume_violation':
+        raise AssumeViolation(
+            result.get('violation_pc'),
+            result.get('violation_block'),
+            "concrete assume failed at "
+            f"pc={result.get('violation_pc')} "
+            f"block={result.get('violation_block')!r}",
+            reason=result.get("invalid_reason") or "assume",
+        )
+    if status == 'step_limit':
+        raise TimeoutError(
+            "native execution step limit reached at "
+            f"pc={result.get('violation_pc')} "
+            f"block={result.get('violation_block')!r}"
+        )
 
-    return result["explored_blocks"], result.get("trace_path")
-
-
-# ---------------------------------------------------------------------------
-# Native engine — 2 phase: Python init → Rust execution
-# ---------------------------------------------------------------------------
-
-def _init_python_state(program, program_inputs, test_name, input_name,
-                       no_read_trace=False, init_raw_log_path=None,
-                       debug_logger=None):
-    """Phase 1: Python initialization + concretization.
-    Returns initialized BoogieInterpreter (ready to execute, but not yet running)."""
-    from interpreter.python.Environment import Environment
-    from interpreter.parser.declaration import StorageDeclaration, ConstantDeclaration
-
-    debug = (debug_logger or DebugLogger.disabled()).bind(
-        engine="python-init", input_name=input_name)
-    debug.event("input", "python_init_start",
-                init_raw_log_path=init_raw_log_path)
-
-    environment = Environment(test_name, input_name, debug_logger=debug)
-    environment.full_trace = False
-    if no_read_trace:
-        environment.LOG_READ = False
-
-    interp = BoogieInterpreter(environment, program_inputs, input_name,
-                               debug_logger=debug)
-    interp.preprocess(program)
-
-    entry = find_entry_point(program)
-    assert entry is not None, "No entry point found"
-
-    # Warn about parameter mismatches before concretization
-    input_keys = set(program_inputs.keys()) if hasattr(program_inputs, 'keys') else set()
-    if not input_keys and hasattr(program_inputs, 'variables'):
-        input_keys = set(program_inputs.variables.keys())
-    expected_params = []
-    for param in entry.parameters:
-        assert len(param.names) == 1
-        name = param.names[0]
-        if not name.endswith('.shadow'):
-            expected_params.append(name)
-    missing = [p for p in expected_params if p not in input_keys]
-    if missing:
-        import sys
-        debug.event("input", "missing_parameters",
-                    missing=missing, available=sorted(input_keys))
-        print(f"WARNING: input file '{input_name}' is missing parameters: {missing}. "
-              f"Available: {sorted(input_keys)}. "
-              f"Check @params mapping in the .input file (use BPL names like $p0, $i2).",
-              file=sys.stderr)
-
-    # Optionally stream the init-phase trace to a separate raw log. The
-    # driver loads this file alongside the main ``.trace.raw.zst`` at
-    # verify time.
-    if init_raw_log_path is not None:
-        var_names = []
-        seen = set()
-        def _add(n):
-            if n and not n.endswith('.shadow') and n not in seen:
-                seen.add(n)
-                var_names.append(n)
-        for d in program.declarations:
-            if isinstance(d, StorageDeclaration):
-                for n in d.names:
-                    _add(n)
-            elif isinstance(d, ConstantDeclaration):
-                for n in d.names:
-                    _add(n)
-        if entry.body:
-            for local_decl in entry.body.locals:
-                if isinstance(local_decl, StorageDeclaration):
-                    for n in local_decl.names:
-                        _add(n)
-        for p in entry.parameters:
-            for n in p.names:
-                _add(n)
-        block_names = ['GLOBAL']
-        seen_b = {'GLOBAL'}
-        if entry.body:
-            for b in entry.body.blocks:
-                if b.name not in seen_b:
-                    seen_b.add(b.name)
-                    block_names.append(b.name)
-        environment._raw_log_path = Path(init_raw_log_path)
-        environment.enable_raw_log(var_names, block_names)
-
-    # Do all the initialization that execute_procedure does BEFORE the hot loop
-    interp._initialize_vars(entry.body.locals, kind="local")
-    interp.concretize_proc_inputs(entry)
-    interp.concretize_input_memory()
-    debug.event("input", "python_init_end",
-                scalars=sum(
-                    1 for v in interp.env.last_frame().var_store.values()
-                    if not hasattr(v, "memory")),
-                maps=sum(
-                    1 for v in interp.env.last_frame().var_store.values()
-                    if hasattr(v, "memory")))
-
-    return interp, entry
-
-
-def _extract_state(interp):
-    """Extract initialized state from Python interpreter as plain dicts for Rust."""
-    from interpreter.python.MemoryMap import MemoryMap
-
-    env = interp.env
-    var_store = {}
-    memory_maps = {}
-    mem_map_info = []
-
-    MASK_64 = (1 << 64) - 1
-    I64_MAX = (1 << 63) - 1
-
-    for key, value in env.last_frame().var_store.items():
-        if isinstance(value, MemoryMap):
-            memory_maps[key] = dict(value.memory)
-            mem_map_info.append((key, value.index_bit_width, value.element_bit_width))
-        elif isinstance(value, (int, bool)):
-            v = int(value)
-            # Clamp to signed i64 range for Rust
-            if v > I64_MAX or v < -(I64_MAX + 1):
-                v = v & MASK_64
-                if v > I64_MAX:
-                    v -= (1 << 64)
-            var_store[key] = v
-
-    # Capture $CurrAddr state
-    if env.alloc_addr:
-        var_store["$CurrAddr"] = env.alloc_addr
-    if env.alloc_addr_shadow:
-        var_store["$CurrAddr.shadow"] = env.alloc_addr_shadow
-
-    return var_store, memory_maps, mem_map_info
-
-
-def _extract_havoc_sequences(program_inputs):
-    if not hasattr(program_inputs, "variables"):
-        return {}
-    out = {}
-    for name, inp in program_inputs.variables.items():
-        seq = getattr(inp, "havoc_seq", None)
-        if seq is not None:
-            out[name] = [int(v) for v in seq]
-    return out
-
-
-
-
-def _validate_state_no_aliasing(interp, debug_logger=None):
-    """Defense-in-depth: verify no two buffers in the same memory map overlap.
-
-    Called after Python initialization, before handing state to Rust.
-    Re-derives ranges from interp.arr_inputs and current variable values.
-    Pointers declared equivalent via ``{:ptr_alias}`` are collapsed.
-    """
-    from collections import defaultdict
-    env = interp.env
-    aliases = getattr(interp, "ptr_aliases", {}) or {}
-    debug = debug_logger or DebugLogger.disabled()
-
-    def canon(p):
-        seen = set()
-        while p in aliases and p not in seen:
-            seen.add(p)
-            p = aliases[p]
-        return p
-
-    # Build map: mem_map -> {canonical_ptr: (base_addr, size)}; keep the max
-    # size per canonical pointer so aliased pointers do not appear twice.
-    per_map = defaultdict(dict)
-    for var_name, arr_infos in interp.arr_inputs.items():
-        if '.shadow' in var_name:
-            continue
-        for arr_info in arr_infos:
-            if '.shadow' in arr_info.mem_map:
-                continue
-            base_addr = env.get_concrete_value(arr_info.base_ptr)
-            if base_addr is None:
-                continue
-            if not isinstance(base_addr, int):
-                continue
-            size = arr_info.elem_size * arr_info.num_elements
-            c_ptr = canon(arr_info.base_ptr)
-            existing = per_map[arr_info.mem_map].get(c_ptr)
-            if existing is None or size > existing[1]:
-                per_map[arr_info.mem_map][c_ptr] = (base_addr, size)
-
-    for mem_map, ptr_dict in per_map.items():
-        ranges = [(p, a, a + s) for p, (a, s) in ptr_dict.items()]
-        ranges.sort(key=lambda x: x[1])
-        for i in range(len(ranges) - 1):
-            ptr_a, _, end_a = ranges[i]
-            ptr_b, start_b, _ = ranges[i + 1]
-            assert end_a <= start_b, (
-                f"BUFFER ALIASING at Rust handoff in {mem_map}: "
-                f"{ptr_a}[..{end_a}) overlaps {ptr_b}[{start_b}..)"
-            )
-    debug.event("mem", "native_handoff_alias_validation",
-                maps=len(per_map),
-                ranges=sum(len(v) for v in per_map.values()))
+    return result['explored_blocks']
 
 
 def run_native(program, program_inputs, test_name, input_name, raw_log_path,
                extra_data=None, log_read=True, compiled=None, no_trace=False,
                init_raw_log_path=None, return_status=False,
-               debug_logger=None):
+               debug_logger=None, prepared=None,
+               return_memory_summary=True, validate_handoff=True,
+               quiet=True, max_steps=0, return_scalar_summary=False):
     """Run the Rust native interpreter.
 
     ``raw_log_path`` is the ``.trace.raw.zst`` the Rust VM writes its
-    execution records to.  ``init_raw_log_path`` (optional) is a second
-    ``.init.raw.zst`` file the Python init phase streams concretization
-    records to — the driver loads both files into Redis at verify time.
+    execution records to.  ``init_raw_log_path`` is accepted for old callers
+    but no separate Python-init trace is produced in the Rust-only runtime.
 
     Returns ``explored_blocks`` by default. With ``return_status=True``, returns
     the native result dict including ``status`` and any violation metadata.
@@ -649,52 +577,73 @@ def run_native(program, program_inputs, test_name, input_name, raw_log_path,
         engine="native", input_name=input_name)
     debug.event("exec", "engine_start", engine="native",
                 raw_log_path=raw_log_path, no_trace=no_trace,
-                log_read=log_read)
+                log_read=log_read, prepared=prepared is not None,
+                return_memory_summary=return_memory_summary,
+                validate_handoff=validate_handoff,
+                init_raw_log_path=init_raw_log_path,
+                quiet=quiet,
+                return_scalar_summary=return_scalar_summary)
 
-    # Phase 1: Python initialization + concretization
-    interp, entry = _init_python_state(
-        program, program_inputs, test_name, input_name,
-        no_read_trace=not log_read,
-        init_raw_log_path=init_raw_log_path if not no_trace else None,
-        debug_logger=debug,
-    )
-    _validate_state_no_aliasing(interp, debug_logger=debug)
-    var_store, memory_maps, mem_map_info = _extract_state(interp)
-    debug.event(
-        "input",
-        "native_handoff_state",
-        scalars=len(var_store),
-        maps=len(memory_maps),
-        map_entries=sum(len(v) for v in memory_maps.values()),
-        mem_map_info=len(mem_map_info),
-    )
-    if not no_trace and init_raw_log_path is not None:
-        interp.env.flush_raw_log()
+    if not hasattr(swoosh_interp, "execute_inputs"):
+        raise RuntimeError(
+            "Installed Rust native module is too old: execute_inputs is missing. "
+            "Rebuild with: cd interpreter/native && maturin develop --release"
+        )
 
-    # Phase 2: Lower AST to Rust bytecode (skip if pre-compiled)
+    if prepared is None:
+        prepared = prepare_native(program, compiled=compiled)
+        compiled = prepared.compiled
+    else:
+        program = prepared.program
+        if compiled is None:
+            compiled = prepared.compiled
+
     if compiled is None:
         compiled = swoosh_interp.lower(program)
 
-    # Phase 3: Execute in Rust
     ext_data = extra_data
-    if ext_data is None and hasattr(interp, 'external_buffer') and interp.external_buffer.unread_bytes() > 0:
-        ext_data = bytes(interp.external_buffer._buf[interp.external_buffer._pos:])
+    if ext_data is None and hasattr(program_inputs, "extra_data"):
+        ext_data = program_inputs.extra_data
 
     env_updates = debug.native_env()
     old_env = {key: os.environ.get(key) for key in env_updates}
     try:
         os.environ.update(env_updates)
-        result = swoosh_interp.execute(
-            compiled,
-            var_store,
-            memory_maps,
-            mem_map_info,
-            str(raw_log_path),
-            extra_data=ext_data,
-            log_read=log_read,
-            no_trace=no_trace,
-            havoc_sequences=_extract_havoc_sequences(program_inputs),
-        )
+        try:
+            result = swoosh_interp.execute_inputs(
+                compiled,
+                prepared.native_meta,
+                program_inputs,
+                str(raw_log_path),
+                extra_data=ext_data,
+                log_read=log_read,
+                no_trace=no_trace,
+                return_memory_summary=return_memory_summary,
+                quiet=quiet,
+                max_steps=max_steps,
+                return_scalar_summary=return_scalar_summary,
+            )
+        except TypeError as exc:
+            if "return_scalar_summary" not in str(exc):
+                raise
+            if return_scalar_summary:
+                raise RuntimeError(
+                    "Installed Rust native module is too old for "
+                    "return_scalar_summary. Rebuild with: "
+                    "cd interpreter/native && maturin develop --release"
+                ) from exc
+            result = swoosh_interp.execute_inputs(
+                compiled,
+                prepared.native_meta,
+                program_inputs,
+                str(raw_log_path),
+                extra_data=ext_data,
+                log_read=log_read,
+                no_trace=no_trace,
+                return_memory_summary=return_memory_summary,
+                quiet=quiet,
+                max_steps=max_steps,
+            )
     finally:
         for key, old in old_env.items():
             if old is None:
@@ -703,6 +652,10 @@ def run_native(program, program_inputs, test_name, input_name, raw_log_path,
                 os.environ[key] = old
 
     result = _normalize_engine_result(result, engine="native", input_name=input_name)
+    result["init_ms"] = 0.0
+    result["handoff_ms"] = result.get("state_ms", 0.0)
+    result["prepared"] = True
+    result["rust_input_state"] = True
 
     debug.event(
         "exec",
@@ -711,31 +664,20 @@ def run_native(program, program_inputs, test_name, input_name, raw_log_path,
         status=result.get("status", "ok"),
         explored_blocks=len(result.get("explored_blocks") or []),
         trace_records=result.get("trace_records"),
+        exec_ms=result.get("exec_ms"),
+        state_ms=result.get("state_ms"),
+        init_ms=0.0,
+        handoff_ms=result.get("handoff_ms"),
+        prepared=True,
+        rust_input_state=True,
+        blocks_explored=result.get("blocks_explored"),
+        max_steps=max_steps,
         violation_pc=result.get("violation_pc"),
         violation_block=result.get("violation_block"),
         memory_maps=len(result.get("memory_summary") or {}),
     )
 
-    if return_status:
-        return result
-
-    status = result.get('status', 'ok')
-    if status == 'assert_violation':
-        from interpreter.python.interpreter import AssertViolation
-        raise AssertViolation(
-            None,
-            pc=result.get('violation_pc'),
-            block=result.get('violation_block'),
-            expr_str='<native assertion>',
-        )
-    if status == 'assume_violation':
-        raise AssertionError(
-            "concrete assume failed at "
-            f"pc={result.get('violation_pc')} "
-            f"block={result.get('violation_block')!r}"
-        )
-
-    return result['explored_blocks']
+    return _finish_native_result(result, return_status=return_status)
 
 
 # ---------------------------------------------------------------------------
@@ -744,118 +686,24 @@ def run_native(program, program_inputs, test_name, input_name, raw_log_path,
 
 def run_both(program, program_inputs, test_name, input_name, full_trace=False,
              no_read_trace=False, extra_data=None, raw_log_path=None,
-             init_raw_log_path=None, compiled=None, debug_logger=None):
-    """Run Python and native engines and assert matching structured results."""
-    debug = (debug_logger or DebugLogger.disabled()).bind(
-        engine="both", input_name=input_name)
-    debug.event("exec", "engine_start", engine="both")
-
-    py_result = run_python_result(
-        program,
-        program_inputs,
-        test_name,
-        input_name,
-        full_trace=full_trace,
-        no_read_trace=no_read_trace,
-        debug_logger=debug.bind(engine="python"),
-    )
-
-    temp_raw = None
-    native_no_trace = raw_log_path is None
-    if raw_log_path is None:
-        temp_raw = Path(tempfile.gettempdir()) / f"{test_name}_{input_name}.trace.raw.zst"
-        raw_log_path = temp_raw
-
-    native_result = run_native(
-        program,
-        program_inputs,
-        test_name,
-        input_name,
-        raw_log_path=raw_log_path,
-        extra_data=extra_data,
-        log_read=not no_read_trace,
-        compiled=compiled,
-        no_trace=native_no_trace,
-        init_raw_log_path=init_raw_log_path,
-        return_status=True,
-        debug_logger=debug.bind(engine="native"),
-    )
-    mismatches = {}
-    if py_result.get("status") != native_result.get("status"):
-        mismatches["status"] = {
-            "python": py_result.get("status"),
-            "native": native_result.get("status"),
-        }
-    if py_result.get("violation_pc") != native_result.get("violation_pc"):
-        mismatches["violation_pc"] = {
-            "python": py_result.get("violation_pc"),
-            "native": native_result.get("violation_pc"),
-        }
-    if py_result.get("violation_block") != native_result.get("violation_block"):
-        mismatches["violation_block"] = {
-            "python": py_result.get("violation_block"),
-            "native": native_result.get("violation_block"),
-        }
-
-    py_explored = set(py_result.get("explored_blocks") or [])
-    native_explored = set(native_result.get("explored_blocks") or [])
-    if py_explored != native_explored:
-        mismatches["explored_blocks"] = {
-            "only_python": sorted(py_explored - native_explored),
-            "only_native": sorted(native_explored - py_explored),
-        }
-
-    py_memory = py_result.get("memory_summary") or {}
-    native_memory = native_result.get("memory_summary") or {}
-    if py_memory and native_memory and py_memory != native_memory:
-        mismatches["memory_summary"] = {
-            "only_python_maps": sorted(set(py_memory) - set(native_memory)),
-            "only_native_maps": sorted(set(native_memory) - set(py_memory)),
-            "different_maps": sorted(
-                name for name in set(py_memory) & set(native_memory)
-                if py_memory[name] != native_memory[name]
-            ),
-        }
-
-    if mismatches:
-        debug.event("exec", "engine_mismatch", mismatches=mismatches)
-        raise AssertionError(
-            "Python/native engine mismatch: "
-            f"{mismatches}"
-        )
-
-    debug.event("exec", "engine_end", engine="both",
-                explored_blocks=len(py_explored),
-                trace_records=native_result.get("trace_records"),
-                status=py_result.get("status"),
-                memory_maps=len(py_memory))
-
-    if py_result.get("status") == "assert_violation":
-        from interpreter.python.interpreter import AssertViolation
-        raise AssertViolation(
-            None,
-            pc=py_result.get("violation_pc"),
-            block=py_result.get("violation_block"),
-            expr_str=py_result.get("message") or "<matched assertion>",
-        )
-    if py_result.get("status") == "assume_violation":
-        raise AssertionError(py_result.get("message") or "concrete assume failed")
-
-    return py_explored, native_result
+             init_raw_log_path=None, compiled=None, debug_logger=None,
+             prepared=None):
+    _legacy_python_runtime_disabled("run_both")
 
 
 # ---------------------------------------------------------------------------
 # Single-input processing
 # ---------------------------------------------------------------------------
 
-def process_single_input(input_file, test_name, test_path, engine='python',
+def process_single_input(input_file, test_name, test_path, engine='native',
                          force=False, full_trace=False, no_read_trace=False,
                          program=None, field_sizes=None, compiled=None,
-                         debug_logger=None):
+                         prepared=None, debug_logger=None):
     """Process a single input file with the chosen engine.
     Returns (input_name, coverage_dict, explored_blocks) or None if skipped.
     If program/field_sizes/compiled are provided, uses them instead of loading from disk."""
     try:
+        _reject_legacy_engine(engine)
         if program is None:
             with open(test_path, 'rb') as file:
                 program = pickle.load(file)
@@ -871,7 +719,7 @@ def process_single_input(input_file, test_name, test_path, engine='python',
             field_sizes = get_bpl_field_sizes(test_path.parent, program=program)
         program_inputs = parse_input_file(input_file, field_sizes=field_sizes)
 
-        trace_dir = Path("positive_examples") / test_name
+        trace_dir = current_layout().trace_dir(test_name)
         trace_dir.mkdir(parents=True, exist_ok=True)
         explored_path = trace_dir / f"{input_name}.explored_blocks.txt"
         raw_log_path = trace_dir / f"{input_name}.trace.raw.zst"
@@ -896,36 +744,17 @@ def process_single_input(input_file, test_name, test_path, engine='python',
             if p.exists() and not explored_path.exists():
                 p.unlink()
 
-        from interpreter.python.interpreter import AssertViolation
         try:
-            if engine == 'python':
-                explored, _ = run_python(program, program_inputs, test_name, input_name,
-                                         full_trace=full_trace,
-                                         no_read_trace=no_read_trace,
-                                         debug_logger=debug)
-            elif engine == 'native':
-                explored = run_native(
-                    program, program_inputs, test_name, input_name,
-                    raw_log_path=raw_log_path,
-                    init_raw_log_path=init_raw_log_path,
-                    extra_data=program_inputs.extra_data,
-                    log_read=not no_read_trace,
-                    compiled=compiled,
-                    debug_logger=debug,
-                )
-            elif engine == 'both':
-                explored, _ = run_both(
-                    program, program_inputs, test_name, input_name,
-                    raw_log_path=raw_log_path,
-                    init_raw_log_path=init_raw_log_path,
-                    full_trace=full_trace,
-                    no_read_trace=no_read_trace,
-                    extra_data=program_inputs.extra_data,
-                    compiled=compiled,
-                    debug_logger=debug,
-                )
-            else:
-                raise ValueError(f"Unknown engine: {engine}")
+            explored = run_native(
+                program, program_inputs, test_name, input_name,
+                raw_log_path=raw_log_path,
+                init_raw_log_path=init_raw_log_path,
+                extra_data=program_inputs.extra_data,
+                log_read=not no_read_trace,
+                compiled=compiled,
+                debug_logger=debug,
+                prepared=prepared,
+            )
         except AssertViolation as v:
             # Structured line for agent_loop's subprocess parser.  The
             # parent process reads child stdout to collect per-input
@@ -957,7 +786,7 @@ def process_single_input(input_file, test_name, test_path, engine='python',
         raise
 
 
-def _process_input_shared(input_file, test_name, test_path, engine='python',
+def _process_input_shared(input_file, test_name, test_path, engine='native',
                           force=False, full_trace=False, no_read_trace=False,
                           debug_logger=None):
     """Worker function that uses fork-inherited _SHARED_* globals."""
@@ -966,6 +795,7 @@ def _process_input_shared(input_file, test_name, test_path, engine='python',
         force=force, full_trace=full_trace, no_read_trace=no_read_trace,
         program=_SHARED_PROGRAM, field_sizes=_SHARED_FIELD_SIZES,
         compiled=_SHARED_COMPILED,
+        prepared=_SHARED_PREPARED,
         debug_logger=debug_logger,
     )
 
@@ -1018,7 +848,7 @@ def _print_coverage_summary(results, test_name, test_path):
           f"{agg['stmts_covered']}/{agg['stmts_total']} stmts ({agg['stmt_pct']}%)")
 
     # Write coverage.json
-    trace_dir = Path("positive_examples") / test_name
+    trace_dir = current_layout().trace_dir(test_name)
     trace_dir.mkdir(parents=True, exist_ok=True)
     coverage_data = {
         "per_input": per_input,
@@ -1033,10 +863,10 @@ def _print_coverage_summary(results, test_name, test_path):
 # ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description='Boogie interpreter runner')
+    parser = argparse.ArgumentParser(description='Rust Boogie interpreter runner')
     parser.add_argument('test_pkg_path', type=str, help='Path to the test package')
-    parser.add_argument('--engine', choices=['python', 'native', 'both'], default='python',
-                        help='Interpreter engine to use')
+    parser.add_argument('--engine', choices=['native', 'python', 'both'], default='native',
+                        help='Interpreter engine to use (python/both are archived)')
     parser.add_argument('--force', action='store_true', help='Force re-interpretation')
     parser.add_argument('--full-trace', action='store_true', help='Write full text trace')
     parser.add_argument('--no-read-trace', action='store_true', help='Skip read tracing')
@@ -1046,6 +876,10 @@ def main():
                         help='Comma-separated debug categories '
                              '(default: all; e.g. exec,branch,solver)')
     args = parser.parse_args()
+    try:
+        _reject_legacy_engine(args.engine)
+    except RuntimeError as exc:
+        parser.error(str(exc))
 
     test_pkg_dir = Path(args.test_pkg_path)
     test_name = test_pkg_dir.name.removesuffix("_pkg")
@@ -1059,9 +893,12 @@ def main():
     debug_logger.event("exec", "runner_start",
                        test_pkg_path=str(test_pkg_dir), engine=args.engine)
 
-    inline_bpl = Path("bpl_out") / test_name / f"{test_name}_inline.bpl"
-    hash_file = Path("positive_examples") / test_name / f"{test_name}.interp.hash"
-    trace_dir = Path("positive_examples") / test_name
+    inline_bpl = first_existing(
+        current_layout().bpl_out_dir / test_name / f"{test_name}_inline.bpl",
+        Path("bpl_out") / test_name / f"{test_name}_inline.bpl",
+    )
+    hash_file = current_layout().trace_dir(test_name) / f"{test_name}.interp.hash"
+    trace_dir = current_layout().trace_dir(test_name)
 
     if inline_bpl.exists():
         bpl_hash = hashlib.sha256(inline_bpl.read_bytes()).hexdigest()
@@ -1086,7 +923,10 @@ def main():
     if not args.force and bpl_hash and hash_file.exists() and trace_dir.exists():
         stored_hash = hash_file.read_text().strip()
         if stored_hash == bpl_hash:
-            input_directory_check = Path("test_input") / test_name
+            input_directory_check = first_existing(
+                current_layout().input_dir(test_name),
+                legacy_input_dir(test_name),
+            )
             input_files_check = list(input_directory_check.glob("*.input"))
             all_done = all(
                 (trace_dir / f"{p.stem}.explored_blocks.txt").exists()
@@ -1103,7 +943,10 @@ def main():
             if mem_trace_dir.exists():
                 shutil.rmtree(mem_trace_dir)
 
-    input_directory = Path("test_input") / test_name
+    input_directory = first_existing(
+        current_layout().input_dir(test_name),
+        legacy_input_dir(test_name),
+    )
     input_files = list(input_directory.glob("*.input"))
     assert len(input_files) > 0, f"No input files found in {input_directory}"
 
@@ -1138,8 +981,11 @@ def main():
     failed = False
     skipped = 0
     results = []
-    for input_file in input_files:
-        input_name = os.path.basename(input_file) if isinstance(input_file, str) else str(input_file)
+
+    pending = iter(input_files)
+    active = []
+
+    def _start_worker(input_file):
         result_recv, result_send = mp_context.Pipe(duplex=False)
         p = mp_context.Process(
             target=_run_worker_to_conn,
@@ -1147,20 +993,30 @@ def main():
         )
         p.start()
         result_send.close()
-        ready = wait_for_process_message(
-            [result_recv, p.sentinel],
-            timeout=per_input_timeout,
-        )
-        if result_recv in ready:
-            status, payload = result_recv.recv()
-        else:
-            status, payload = None, None
-        p.join(timeout=5)
+        return {
+            "input_file": input_file,
+            "input_name": Path(str(input_file)).name,
+            "process": p,
+            "conn": result_recv,
+            "started": time.monotonic(),
+        }
 
-        if status is None and p.is_alive():
-            print(f"TIMEOUT ({per_input_timeout}s) on {input_name} — killing (likely infinite loop)")
+    def _finish_worker(task, status, payload):
+        nonlocal failed, skipped
+        input_file = task["input_file"]
+        input_name = task["input_name"]
+        p = task["process"]
+        conn = task["conn"]
+        if status == "timeout" and p.is_alive():
             p.kill()
-            p.join(timeout=5)
+        p.join(timeout=5)
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+        if status == "timeout":
+            print(f"TIMEOUT ({per_input_timeout}s) on {input_name} — killing (likely infinite loop)")
             skipped += 1
             debug_logger.event("exec", "input_timeout",
                                input_file=str(input_file),
@@ -1179,17 +1035,65 @@ def main():
                                exitcode=p.exitcode,
                                error="worker exited without result")
             failed = True
+        elif status == "ok":
+            if payload is not None:
+                results.append(payload)
         else:
-            if status == "ok":
-                if payload is not None:
-                    results.append(payload)
-            else:
-                print(f"Worker failed on {input_name}: {payload}")
-                debug_logger.event("exec", "input_worker_failed",
-                                   input_file=str(input_file),
+            print(f"Worker failed on {input_name}: {payload}")
+            debug_logger.event("exec", "input_worker_failed",
+                               input_file=str(input_file),
                                error=payload)
-                failed = True
-        result_recv.close()
+            failed = True
+
+    # Keep a bounded set of forked workers active. This preserves the
+    # existing hard per-input timeout behavior while actually using the
+    # max_workers concurrency computed above.
+    while True:
+        while len(active) < max_workers:
+            try:
+                active.append(_start_worker(next(pending)))
+            except StopIteration:
+                break
+        if not active:
+            break
+
+        wait_objs = []
+        for task in active:
+            wait_objs.append(task["conn"])
+            wait_objs.append(task["process"].sentinel)
+        ready = wait_for_process_message(wait_objs, timeout=0.2)
+        now = time.monotonic()
+        done = []
+
+        for task in active:
+            conn = task["conn"]
+            p = task["process"]
+            status = payload = None
+            if conn in ready:
+                try:
+                    status, payload = conn.recv()
+                except EOFError:
+                    status, payload = None, None
+                done.append((task, status, payload))
+                continue
+            if p.sentinel in ready:
+                if conn.poll():
+                    try:
+                        status, payload = conn.recv()
+                    except EOFError:
+                        status, payload = None, None
+                done.append((task, status, payload))
+                continue
+            if per_input_timeout is not None and now - task["started"] >= per_input_timeout:
+                done.append((task, "timeout", None))
+
+        for task, status, payload in done:
+            if task in active:
+                active.remove(task)
+                _finish_worker(task, status, payload)
+
+    for task in active:
+        _finish_worker(task, "timeout", None)
 
     if failed and not results:
         print("Interpretation did not complete — run again to resume")

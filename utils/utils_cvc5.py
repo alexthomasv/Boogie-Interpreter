@@ -1063,8 +1063,11 @@ def deserialize_cvc5_term(state_cache, root_term):
                     res = mkConst(solver.mkArraySort(idx_sort, elem_sort), term.var_name)
                 else:
                     raise ValueError(f"Unknown sort: {sort_kind}")
-                from src.state.redis_keys import put_cvc5_var
-                put_cvc5_var(state_cache.redis, term.var_name, res)
+                put_runtime = getattr(state_cache, "put_runtime_cvc5_var", None)
+                if callable(put_runtime):
+                    put_runtime(term.var_name, res)
+                else:
+                    state_cache.cached_id_to_cvc5[term.var_name] = res
             memo[term] = res
             stack.pop()
             continue

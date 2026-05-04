@@ -25,6 +25,13 @@ class IntegerType(Type):
     def __repr__(self):
         return "int"
 
+class RealType(Type):
+    def __init__(self, **opts):
+        super().__init__(**opts)
+
+    def __repr__(self):
+        return "real"
+
 class BitvectorType(Type):
     width = None
 
@@ -45,11 +52,6 @@ class CustomType(Type):
     def __init__(self, **opts):
         super().__init__(**opts)
 
-    def expand(self):
-        if self.declaration and self.declaration.type:
-            return self.declaration.type.expand()
-        return self
-
     def __repr__(self):
         if self.arguments:
             args = " ".join(str(a) for a in self.arguments)
@@ -57,9 +59,8 @@ class CustomType(Type):
         return f"{self.name}"
 
     def hilite(self, yield_func):
-        color = 'blue' if self.declaration else 'red'
-        args = " ".join(yield_func(a) for a in self.arguments)
-        return f"{self.name} {args}".fmt()
+        args = " ".join(yield_func(a) for a in self.arguments or [])
+        return f"{self.name} {args}".strip()
 
 class MapType(Type):
     arguments = None
@@ -82,4 +83,3 @@ class MapType(Type):
         domain = ", ".join(str(d) for d in self.domain)
         range_ = str(self.range)
         return f"{args}[{domain}] {range_}"
-

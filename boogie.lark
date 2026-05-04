@@ -1,27 +1,10 @@
 // boogie.lark
-%import common.CNAME
 %import common.ESCAPED_STRING
 %import common.WS
-%import common.NUMBER
 %ignore WS
 
-PARSE_DECL: "$$PARSE_DECL$$"
-PARSE_PARAM: "$$PARSE_PARAM$$"
-PARSE_SPEC: "$$PARSE_SPEC$$"
-PARSE_BLOCKS: "$$PARSE_BLOCKS$$"
-PARSE_STMT: "$$PARSE_STMT$$"
-PARSE_EXPR: "$$PARSE_EXPR$$"
-PARSE_TYPE: "$$PARSE_TYPE$$"
-
 // Start rule
-?start: decl*
-    | PARSE_DECL decl -> parse_decl
-    | PARSE_PARAM param_decl -> parse_param
-    | PARSE_SPEC spec -> parse_spec
-    | PARSE_BLOCKS blocks -> parse_blocks
-    | PARSE_STMT stmt -> parse_stmt
-    | PARSE_EXPR expr -> parse_expr
-    | PARSE_TYPE type -> parse_type
+start: decl*
 
 decl: uses_block | axiom_decl | const_decl | func_decl | impl_decl | proc_decl | type_decl | var_decl
 
@@ -40,8 +23,7 @@ MLC: "/*" /(.|\n)*?/ "*/"
 finite_opt: "finite"
             | -> empty_finite
 
-tc_params: name tc_params
-    | -> empty_tc_params   
+tc_params: name*
 
 type_syn: "=" type 
         | -> empty_type_syn
@@ -55,7 +37,7 @@ parent_info: "<:" parent_edges_opt
             | -> empty_parent_info
 
 parent_edge: unique_opt ident
-parent_edges: parent_edge | parent_edge "," parent_edges
+parent_edges: parent_edge ("," parent_edge)*
 parent_edges_opt: parent_edges
                 | -> empty_parent_edges
 
@@ -79,7 +61,7 @@ fargs_opt: fargs
     | -> empty_fargs
 
 param_decl: typed_ids_where
-param_decls: param_decl | param_decl "," param_decls 
+param_decls: param_decl ("," param_decl)*
 param_decls_opt: param_decls
                 | -> empty_param_decls
 
@@ -87,8 +69,7 @@ param_decls_opt: param_decls
 spec: free_opt "requires" attrs_opt expr ";" -> spec_requires
     | free_opt "modifies" attrs_opt idents ";" -> spec_modifies
     | free_opt "ensures" attrs_opt expr ";" -> spec_ensures
-specs: spec specs 
-        | -> empty_specs
+specs: spec*
 pspec: ";" specs | specs body 
 
 
@@ -105,8 +86,7 @@ block: name ":" -> block_label
     
 wc_expr: expr 
         | "*" -> wildcard_expr 
-wc_exprs: wc_expr 
-        | wc_expr "," wc_exprs
+wc_exprs: wc_expr ("," wc_expr)*
 wc_exprs_opt: wc_exprs
             | -> empty_wc_exprs
 
@@ -129,27 +109,29 @@ stmt: "assert" attrs_opt expr ";" -> assert_cmd
     | "return" ";" -> return_cmd
     | "return" expr ";" -> return_expr_cmd
     | "goto" idents ";" -> goto_cmd
+    | while_stmt
     | if_stmt
-    | "pop" ";"?
+    | "pop" ";"? -> pop_cmd
 
 if_stmt: "if" "(" wc_expr ")" "{" blocks "}" else_stmt
 else_stmt: "else" "{" blocks "}" -> else_stmt_blocks
          | "else" if_stmt -> else_if_stmt
          | -> empty_else_stmt
 
-lhss: lhs | lhs "," lhss
+while_stmt: "while" guard (invariant | free_invariant)* "{" blocks "}" -> while_cmd
+
+lhss: lhs ("," lhs)*
 lhs: ident selects
 
 select: "[" exprs [ ":=" expr ] "]"
-selects: select selects
-        | -> empty_selects
+selects: select*
 
 par_call_cmd: "par" attrs_opt call_lhs ( "|" call_lhs )* ";"
 invariant: "invariant" attrs_opt expr ";"
 free_invariant: "free" "invariant" attrs_opt expr ";"
 call_lhs: ident 
     | idents ":=" ident
-guard: "(" ( "*" | expr ) ")"
+guard: "(" wc_expr ")"
 
 type: type_atom 
     | map_type
@@ -170,7 +152,6 @@ tc_args: type_atom tc_args
 map_type: type_args "[" types "]" type
 
 exprs: expr ("," expr)*
-proposition: expr
 
 // Expression precedence hierarchy (lowest to highest)
 ?expr: expr "<==>" expr_implies  -> binary_expr_iff
@@ -203,7 +184,7 @@ proposition: expr
      | expr_postfix
 ?expr_postfix: expr_postfix "[" exprs "]" -> index
      | expr_postfix "[" exprs ":=" expr "]" -> assign_index
-     | expr_postfix "[" NUMBER ":" NUMBER "]" -> range_index
+     | expr_postfix "[" DIGITS ":" DIGITS "]" -> range_index
      | expr_atom
 ?expr_atom: "if" expr "then" expr "else" expr -> if_then_else_expr
      | "old" "(" expr ")" -> old_expr
@@ -225,27 +206,12 @@ literal: bool_lit
          | bv_lit
 
 !bool_lit: "true" | "false"
-nat: DIGITS | NUMBER
-dec: DIGITS "e" ["-"] DIGITS
+nat: DIGITS
+dec: DIGITS EXP_PART
 float_lit: DIGITS "." DIGITS
 bv_lit: DIGITS "bv" DIGITS
-arith_coercion_expr: ( "int" "(" expr ")" | "real" "(" expr ")" )
 
-func_expr: ident "(" exprs ")"
-paren_expr: "(" expr ")"
-lambda_expr: "(" lambda quant_body ")"
 !quantifier: "forall" | "∀" | "exists" | "∃"
-
-lambda: "lambda" | "λ"
-quant_body: ( type_args bound_vars ) qsep attr* expr
-bound_vars: attr_typed_ids_wheres
-qsep: "::" | "•"
-if_then_else_expr: "if" expr "then" expr "else" expr
-code_expr: "|{" var_decl* spec_block* "}|"
-spec_block: ident ":" stmt* ( "goto" idents | "return" expr ) ";"
-
-attr_typed_ids_wheres: attr_typed_ids_where ("," attr_typed_ids_where)*
-attr_typed_ids_where: attrs_opt typed_ids_where
 
 typed_ids_where: typed_ids where_clause
 where_clause: "where" expr 
@@ -255,14 +221,14 @@ type_args: "<" names ">"
             | -> empty_type_args
 
 ens: string | expr
-enss: ens | ens "," enss 
+enss: ens ("," ens)*
 enss_opt: enss
         | -> empty_enss
 attr: "{:" name enss_opt "}"
 
 trigger: "{" exprs "}"
 ant: attr | trigger
-ants: ant ants
+ants: ant+
 ants_opt: ants
         | -> empty_ants
 
@@ -275,28 +241,10 @@ ident: IDENT
 idents: ident ("," ident)*
 
 name: IDENT 
-names: name 
-     | name ("," name)*
-
-!binary_op: "**"
-         | "==>"
-         | "||"
-         | "&&"
-         | "=="
-         | "!="
-         | "<"
-         | ">"
-         | "<="
-         | ">="
-         | "<:"
-         | "++"
-         | "+"
-         | "-"
-         | "*"
-         | "/"
-         | "%"
+names: name ("," name)*
 
 DIGITS: /[0-9]+/
+EXP_PART: /e-?[0-9]+/
 DOT: "."
 
 COMMENT: /\/\/[^\n]*/

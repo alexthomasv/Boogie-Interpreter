@@ -1,6 +1,7 @@
 mod builtins;
 mod concolic;
 mod debug_log;
+mod input_state;
 mod lowering;
 mod memory_map;
 mod opcodes;
@@ -12,9 +13,10 @@ mod vm;
 #[cfg(kani)]
 mod kani_proofs;
 
+use concolic::explore;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PySet, PyTuple};
-use concolic::explore;
+use std::time::Duration;
 use vm::ExecutionStatus;
 
 /// Lower a Python AST program into bytecode. Returns an opaque handle.
@@ -32,8 +34,7 @@ fn lower(
     loop_header_live: Option<&Bound<'_, PyDict>>,
     loop_metadata: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<PyObject> {
-    let compiled =
-        lowering::lower_program_full(py, program, loop_header_live, loop_metadata)?;
+    let compiled = lowering::lower_program_full(py, program, loop_header_live, loop_metadata)?;
     let wrapper = CompiledProgramWrapper { inner: compiled };
     Ok(Py::new(py, wrapper)?.into_py(py))
 }
@@ -80,6 +81,165 @@ fn memory_summary<'py>(py: Python<'py>, vm: &vm::VM) -> PyResult<Bound<'py, PyDi
     Ok(out)
 }
 
+fn scalar_summary<'py>(
+    py: Python<'py>,
+    program: &opcodes::CompiledProgram,
+    vm: &vm::VM,
+) -> PyResult<Bound<'py, PyDict>> {
+    let out = PyDict::new_bound(py);
+    for (idx, value) in vm.vars.iter().enumerate() {
+        if let vm::Value::Scalar(scalar) = value {
+            if let Some(name) = program.var_names.get(idx) {
+                out.set_item(name.as_str(), *scalar)?;
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn attach_raw_log(
+    program: &opcodes::CompiledProgram,
+    vm: &mut vm::VM,
+    raw_log_path: &str,
+) -> PyResult<()> {
+    let path = std::path::Path::new(raw_log_path);
+    let mut writer = raw_log::RawLogWriter::create(path).map_err(|e| {
+        pyo3::exceptions::PyIOError::new_err(format!(
+            "failed to create raw log at {}: {}",
+            path.display(),
+            e
+        ))
+    })?;
+    let block_names: Vec<String> = program.blocks.iter().map(|b| b.name.clone()).collect();
+    writer
+        .write_header(&program.var_names, &block_names)
+        .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("raw log header: {}", e)))?;
+    debug_log::event(
+        "trace",
+        "native_raw_log_open",
+        &[
+            ("path", raw_log_path.to_string()),
+            ("vars", program.var_names.len().to_string()),
+            ("blocks", block_names.len().to_string()),
+        ],
+    );
+    vm.trace.raw_log = Some(writer);
+    Ok(())
+}
+
+fn finish_vm_result(
+    py: Python<'_>,
+    program: &opcodes::CompiledProgram,
+    vm: &mut vm::VM,
+    status: &ExecutionStatus,
+    exec_elapsed: Duration,
+    return_memory_summary: bool,
+    return_scalar_summary: bool,
+    quiet: bool,
+) -> PyResult<PyObject> {
+    let result = PyDict::new_bound(py);
+
+    let blocks_set = PySet::empty_bound(py)?;
+    for block_id in &vm.explored_blocks {
+        let block = &program.blocks[*block_id as usize];
+        blocks_set.add(block.name.as_str())?;
+    }
+    result.set_item("explored_blocks", blocks_set)?;
+
+    let block_sequence = PyList::empty_bound(py);
+    for block_id in &vm.block_trace {
+        let block = &program.blocks[*block_id as usize];
+        block_sequence.append(block.name.as_str())?;
+    }
+    result.set_item("block_sequence", block_sequence)?;
+
+    match status {
+        ExecutionStatus::Completed => {
+            result.set_item("status", "ok")?;
+        }
+        ExecutionStatus::AssertViolation { pc, block } => {
+            result.set_item("status", "assert_violation")?;
+            result.set_item("violation_pc", *pc)?;
+            result.set_item("violation_block", block)?;
+        }
+        ExecutionStatus::AssumeViolation { pc, block, reason } => {
+            result.set_item("status", "assume_violation")?;
+            result.set_item("violation_pc", *pc)?;
+            result.set_item("violation_block", block)?;
+            result.set_item("invalid_input", true)?;
+            result.set_item("invalid_reason", *reason)?;
+        }
+        ExecutionStatus::StepLimit { pc, block } => {
+            result.set_item("status", "step_limit")?;
+            result.set_item("violation_pc", *pc)?;
+            result.set_item("violation_block", block)?;
+            result.set_item("message", "native execution step limit reached")?;
+        }
+    }
+
+    let record_count = if let Some(writer) = vm.trace.raw_log.take() {
+        let close_start = std::time::Instant::now();
+        let count = writer
+            .finish()
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("raw log finish: {}", e)))?;
+        if !quiet {
+            eprintln!(
+                "[native] Raw log close: {:.1?}, {} records",
+                close_start.elapsed(),
+                count
+            );
+        }
+        debug_log::event(
+            "trace",
+            "native_raw_log_close",
+            &[
+                ("elapsed_ms", close_start.elapsed().as_millis().to_string()),
+                ("records", count.to_string()),
+            ],
+        );
+        count
+    } else {
+        0
+    };
+    result.set_item("trace_records", record_count)?;
+    if return_memory_summary {
+        result.set_item("memory_summary", memory_summary(py, vm)?)?;
+    } else {
+        result.set_item("memory_summary", PyDict::new_bound(py))?;
+    }
+    if return_scalar_summary {
+        result.set_item("final_scalars", scalar_summary(py, program, vm)?)?;
+    }
+    result.set_item("external_consumed", vm.external_buffer_pos)?;
+    result.set_item("exec_ns", exec_elapsed.as_nanos() as u64)?;
+    result.set_item("exec_ms", exec_elapsed.as_secs_f64() * 1000.0)?;
+    result.set_item("blocks_explored", vm.explored_blocks.len())?;
+    result.set_item("block_sequence_len", vm.block_trace.len())?;
+    result.set_item("no_trace", vm.no_trace)?;
+    result.set_item("vars", program.var_names.len())?;
+    result.set_item("memory_map_count", vm.memory_maps.len())?;
+    debug_log::event(
+        "exec",
+        "native_result",
+        &[
+            (
+                "status",
+                match status {
+                    ExecutionStatus::Completed => "ok".to_string(),
+                    ExecutionStatus::AssertViolation { .. } => "assert_violation".to_string(),
+                    ExecutionStatus::AssumeViolation { .. } => "assume_violation".to_string(),
+                    ExecutionStatus::StepLimit { .. } => "step_limit".to_string(),
+                },
+            ),
+            ("trace_records", record_count.to_string()),
+            ("memory_maps", vm.memory_maps.len().to_string()),
+            ("external_consumed", vm.external_buffer_pos.to_string()),
+        ],
+    );
+
+    Ok(result.into())
+}
+
 /// Execute a pre-lowered program with pre-initialized state from Python.
 ///
 /// All trace output is streamed to `raw_log_path` in the
@@ -95,10 +255,12 @@ fn memory_summary<'py>(py: Python<'py>, vm: &vm::VM) -> PyResult<Bound<'py, PyDi
 ///   extra_data: optional bytes for read.cross_product
 ///   log_read: whether to log read ops in trace
 ///   no_trace: disable all tracing (raw_log_path must still be valid but won't be written to)
+///   return_memory_summary: whether to hash/summarize final memory maps
+///   quiet: suppress progress output on stderr
 ///
 /// Returns dict with 'explored_blocks' and 'trace_records' (count).
 #[pyfunction]
-#[pyo3(signature = (compiled, var_store, memory_maps, mem_map_info, raw_log_path, extra_data=None, log_read=true, no_trace=false, havoc_sequences=None))]
+#[pyo3(signature = (compiled, var_store, memory_maps, mem_map_info, raw_log_path, extra_data=None, log_read=true, no_trace=false, havoc_sequences=None, return_memory_summary=true, quiet=true, max_steps=0, return_scalar_summary=false))]
 fn execute(
     py: Python<'_>,
     compiled: &Bound<'_, PyAny>,
@@ -110,37 +272,27 @@ fn execute(
     log_read: bool,
     no_trace: bool,
     havoc_sequences: Option<&Bound<'_, PyDict>>,
+    return_memory_summary: bool,
+    quiet: bool,
+    max_steps: usize,
+    return_scalar_summary: bool,
 ) -> PyResult<PyObject> {
     let wrapper: PyRef<'_, CompiledProgramWrapper> = compiled.extract()?;
     let program = &wrapper.inner;
 
-    let mut vm = vm::VM::new(program);
+    let mut vm = if no_trace {
+        vm::VM::new_no_trace(program)
+    } else {
+        vm::VM::new(program)
+    };
     vm.log_read = log_read;
     vm.no_trace = no_trace;
     if let Some(data) = extra_data {
         vm.external_buffer = data;
     }
 
-    // Attach the raw-log sink BEFORE any state load so concretization
-    // writes land in the file too.
     if !no_trace {
-        let path = std::path::Path::new(&raw_log_path);
-        let mut writer = raw_log::RawLogWriter::create(path).map_err(|e| {
-            pyo3::exceptions::PyIOError::new_err(format!(
-                "failed to create raw log at {}: {}",
-                path.display(), e
-            ))
-        })?;
-        let block_names: Vec<String> = program.blocks.iter().map(|b| b.name.clone()).collect();
-        writer.write_header(&program.var_names, &block_names).map_err(|e| {
-            pyo3::exceptions::PyIOError::new_err(format!("raw log header: {}", e))
-        })?;
-        debug_log::event("trace", "native_raw_log_open", &[
-            ("path", raw_log_path.clone()),
-            ("vars", program.var_names.len().to_string()),
-            ("blocks", block_names.len().to_string()),
-        ]);
-        vm.trace.raw_log = Some(writer);
+        attach_raw_log(program, &mut vm, &raw_log_path)?;
     }
 
     // Initialize memory maps from Python-provided metadata
@@ -191,78 +343,142 @@ fn execute(
 
     // Execute
     let exec_start = std::time::Instant::now();
-    let status = vm.execute(program);
+    let status = vm.execute_with_limit(program, max_steps);
     let exec_elapsed = exec_start.elapsed();
-    eprintln!(
-        "[native] Execution: {:.1?}, {} blocks, {} trace entries",
-        exec_elapsed,
-        vm.explored_blocks.len(),
-        vm.trace.total
-    );
-    debug_log::event("exec", "native_execution_end", &[
-        ("elapsed_ms", exec_elapsed.as_millis().to_string()),
-        ("blocks", vm.explored_blocks.len().to_string()),
-        ("trace_entries", vm.trace.total.to_string()),
-    ]);
-
-    // Close the raw log and return a small summary dict.
-    let result = PyDict::new_bound(py);
-
-    let blocks_set = PySet::empty_bound(py)?;
-    for block in &vm.explored_blocks {
-        blocks_set.add(block.as_str())?;
-    }
-    result.set_item("explored_blocks", blocks_set)?;
-
-    match &status {
-        ExecutionStatus::Completed => {
-            result.set_item("status", "ok")?;
-        }
-        ExecutionStatus::AssertViolation { pc, block } => {
-            result.set_item("status", "assert_violation")?;
-            result.set_item("violation_pc", *pc)?;
-            result.set_item("violation_block", block)?;
-        }
-        ExecutionStatus::AssumeViolation { pc, block } => {
-            result.set_item("status", "assume_violation")?;
-            result.set_item("violation_pc", *pc)?;
-            result.set_item("violation_block", block)?;
-        }
-    }
-
-    let record_count = if let Some(writer) = vm.trace.raw_log.take() {
-        let close_start = std::time::Instant::now();
-        let count = writer.finish().map_err(|e| {
-            pyo3::exceptions::PyIOError::new_err(format!("raw log finish: {}", e))
-        })?;
+    if !quiet {
         eprintln!(
-            "[native] Raw log close: {:.1?}, {} records",
-            close_start.elapsed(),
-            count
+            "[native] Execution: {:.1?}, {} blocks, {} trace entries",
+            exec_elapsed,
+            vm.explored_blocks.len(),
+            vm.trace.total
         );
-        debug_log::event("trace", "native_raw_log_close", &[
-            ("elapsed_ms", close_start.elapsed().as_millis().to_string()),
-            ("records", count.to_string()),
-        ]);
-        count
-    } else {
-        0
-    };
-    result.set_item("trace_records", record_count)?;
-    result.set_item("memory_summary", memory_summary(py, &vm)?)?;
-    result.set_item("external_consumed", vm.external_buffer_pos)?;
-    debug_log::event("exec", "native_result", &[
-        ("status", match &status {
-            ExecutionStatus::Completed => "ok".to_string(),
-            ExecutionStatus::AssertViolation { .. } => "assert_violation".to_string(),
-            ExecutionStatus::AssumeViolation { .. } => "assume_violation".to_string(),
-        }),
-        ("trace_records", record_count.to_string()),
-        ("memory_maps", vm.memory_maps.len().to_string()),
-        ("external_consumed", vm.external_buffer_pos.to_string()),
-    ]);
+    }
+    debug_log::event(
+        "exec",
+        "native_execution_end",
+        &[
+            ("elapsed_ms", exec_elapsed.as_millis().to_string()),
+            ("blocks", vm.explored_blocks.len().to_string()),
+            ("trace_entries", vm.trace.total.to_string()),
+        ],
+    );
 
-    Ok(result.into())
+    finish_vm_result(
+        py,
+        program,
+        &mut vm,
+        &status,
+        exec_elapsed,
+        return_memory_summary,
+        return_scalar_summary,
+        quiet,
+    )
+}
+
+/// Execute a pre-lowered program by concretizing ProgramInputs directly in Rust.
+///
+/// This is the high-throughput native coverage entry point. It keeps one-time
+/// PyO3 AST lowering and removes per-input Environment construction and dict
+/// handoff.
+#[pyfunction]
+#[pyo3(signature = (compiled, native_meta, program_inputs, raw_log_path, extra_data=None, log_read=true, no_trace=false, return_memory_summary=true, quiet=true, max_steps=0, return_scalar_summary=false))]
+fn execute_inputs(
+    py: Python<'_>,
+    compiled: &Bound<'_, PyAny>,
+    native_meta: &Bound<'_, PyDict>,
+    program_inputs: &Bound<'_, PyAny>,
+    raw_log_path: String,
+    extra_data: Option<Vec<u8>>,
+    log_read: bool,
+    no_trace: bool,
+    return_memory_summary: bool,
+    quiet: bool,
+    max_steps: usize,
+    return_scalar_summary: bool,
+) -> PyResult<PyObject> {
+    let wrapper: PyRef<'_, CompiledProgramWrapper> = compiled.extract()?;
+    let program = &wrapper.inner;
+
+    let mut vm = if no_trace {
+        vm::VM::new_no_trace(program)
+    } else {
+        vm::VM::new(program)
+    };
+    vm.log_read = log_read;
+    vm.no_trace = no_trace;
+
+    if !no_trace {
+        attach_raw_log(program, &mut vm, &raw_log_path)?;
+    }
+
+    let state_start = std::time::Instant::now();
+    input_state::initialize_vm_from_inputs(
+        program,
+        &mut vm,
+        native_meta,
+        program_inputs,
+        extra_data,
+    )?;
+    let state_elapsed = state_start.elapsed();
+
+    let exec_start = std::time::Instant::now();
+    let status = vm.execute_with_limit(program, max_steps);
+    let exec_elapsed = exec_start.elapsed();
+    if !quiet {
+        eprintln!(
+            "[native] State: {:.1?}, execution: {:.1?}, {} blocks, {} trace entries",
+            state_elapsed,
+            exec_elapsed,
+            vm.explored_blocks.len(),
+            vm.trace.total
+        );
+    }
+    debug_log::event(
+        "exec",
+        "native_execution_end",
+        &[
+            ("state_ms", state_elapsed.as_millis().to_string()),
+            ("elapsed_ms", exec_elapsed.as_millis().to_string()),
+            ("blocks", vm.explored_blocks.len().to_string()),
+            ("trace_entries", vm.trace.total.to_string()),
+        ],
+    );
+
+    let result = finish_vm_result(
+        py,
+        program,
+        &mut vm,
+        &status,
+        exec_elapsed,
+        return_memory_summary,
+        return_scalar_summary,
+        quiet,
+    )?;
+    let result_dict = result.bind(py).downcast::<PyDict>()?;
+    result_dict.set_item("state_ns", state_elapsed.as_nanos() as u64)?;
+    result_dict.set_item("state_ms", state_elapsed.as_secs_f64() * 1000.0)?;
+    Ok(result)
+}
+
+#[pyfunction]
+#[pyo3(signature = (compiled, native_meta, program_inputs, extra_data=None, havoc_bound=8))]
+fn prepare_symbolic_inputs(
+    py: Python<'_>,
+    compiled: &Bound<'_, PyAny>,
+    native_meta: &Bound<'_, PyDict>,
+    program_inputs: &Bound<'_, PyAny>,
+    extra_data: Option<Vec<u8>>,
+    havoc_bound: usize,
+) -> PyResult<PyObject> {
+    let wrapper: PyRef<'_, CompiledProgramWrapper> = compiled.extract()?;
+    input_state::prepare_symbolic_state(
+        py,
+        &wrapper.inner,
+        native_meta,
+        program_inputs,
+        extra_data,
+        havoc_bound,
+    )
 }
 
 #[pyfunction]
@@ -273,7 +489,7 @@ fn get_var_names(py: Python<'_>, compiled: &Bound<'_, PyAny>) -> PyResult<PyObje
 }
 
 #[pyfunction]
-#[pyo3(signature = (compiled, var_store, memory_maps, mem_map_info, symbols, extra_data=None, covered_blocks=None, loop_bound=8, max_path_depth=512, max_solver_queries=10000, solver_timeout_ms=100))]
+#[pyo3(signature = (compiled, var_store, memory_maps, mem_map_info, symbols, extra_data=None, covered_blocks=None, loop_bound=8, max_path_depth=512, max_solver_queries=10000, solver_timeout_ms=100, branch_distance_policy="auto"))]
 fn concolic_suggest(
     py: Python<'_>,
     compiled: &Bound<'_, PyAny>,
@@ -287,6 +503,7 @@ fn concolic_suggest(
     max_path_depth: usize,
     max_solver_queries: usize,
     solver_timeout_ms: u64,
+    branch_distance_policy: &str,
 ) -> PyResult<PyObject> {
     concolic::suggest(
         py,
@@ -301,6 +518,7 @@ fn concolic_suggest(
         max_path_depth,
         max_solver_queries,
         solver_timeout_ms,
+        branch_distance_policy,
     )
 }
 
@@ -337,6 +555,8 @@ fn load_raw_log_to_redis(
 fn swoosh_interp(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(lower, m)?)?;
     m.add_function(wrap_pyfunction!(execute, m)?)?;
+    m.add_function(wrap_pyfunction!(execute_inputs, m)?)?;
+    m.add_function(wrap_pyfunction!(prepare_symbolic_inputs, m)?)?;
     m.add_function(wrap_pyfunction!(concolic_suggest, m)?)?;
     m.add_function(wrap_pyfunction!(explore, m)?)?;
     m.add_function(wrap_pyfunction!(get_var_names, m)?)?;

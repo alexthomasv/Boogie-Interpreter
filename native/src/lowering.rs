@@ -110,7 +110,7 @@ pub fn lower_program_full(
     for decl in decls.iter() {
         let type_name = decl.get_type().name()?.to_string();
         match type_name.as_str() {
-            "StorageDeclaration" => {
+            "StorageDeclaration" | "VariableDeclaration" => {
                 let names = decl.getattr("names")?;
                 let names_list: &Bound<'_, PyList> = names.downcast()?;
                 let type_obj = decl.getattr("type")?;
@@ -153,7 +153,7 @@ pub fn lower_program_full(
     let locals_list: &Bound<'_, PyList> = locals.downcast()?;
     for local_decl in locals_list.iter() {
         let type_name = local_decl.get_type().name()?.to_string();
-        if type_name == "StorageDeclaration" {
+        if type_name == "StorageDeclaration" || type_name == "VariableDeclaration" {
             let names = local_decl.getattr("names")?;
             let names_list: &Bound<'_, PyList> = names.downcast()?;
             let type_obj = local_decl.getattr("type")?;
@@ -213,7 +213,7 @@ pub fn lower_program_full(
     let mut pc: u32 = 1;
     for block_obj in body_blocks_list.iter() {
         let name: String = block_obj.getattr("name")?.extract()?;
-        let block_id = label_to_block[&name];
+        let block_id = blocks.len() as BlockId;
         let start_pc = pc;
 
         let stmts = block_obj.getattr("statements")?;
@@ -267,7 +267,13 @@ pub fn lower_program_full(
         let py_result = py_program_mod.call_method1("initialize_code_metadata", (&impl_d,))?;
         let py_tuple: &Bound<'_, PyTuple> = py_result.downcast()?;
         let py_label_to_pc = py_tuple.get_item(1)?;
-        for block in &blocks {
+        for (idx, block) in blocks.iter().enumerate() {
+            // Duplicate labels are legal in some generated SV-COMP/LEMUR
+            // packages. Python's label maps keep the last block for a label,
+            // so only validate the canonical block that branches can reach.
+            if label_to_block.get(&block.name).copied() != Some(idx as BlockId) {
+                continue;
+            }
             let py_pc_obj = py_label_to_pc.call_method1("__getitem__", (&block.name,))?;
             let py_pc: u32 = py_pc_obj.extract()?;
             assert_eq!(
@@ -281,9 +287,12 @@ pub fn lower_program_full(
     // Post-pass: resolve $CurrAddr alloc_size_var by scanning Python AST
     // For each HavocCurrAddr, look at the block's statements at offset+3 and offset+5
     // to find the `$n` variable.
-    for block_obj in body_blocks_list.iter() {
+    for (block_index, block_obj) in body_blocks_list.iter().enumerate() {
         let name: String = block_obj.getattr("name")?.extract()?;
         let block_id = label_to_block[&name];
+        if block_id as usize != block_index {
+            continue;
+        }
         let stmts = block_obj.getattr("statements")?;
         let stmts_list: &Bound<'_, PyList> = stmts.downcast()?;
 
@@ -387,9 +396,7 @@ pub fn lower_program_full(
             let block_name: String = key.extract()?;
             let var_names: Vec<String> = val.extract()?;
             if let Some(&bid) = label_to_block.get(&block_name) {
-                let var_ids: Vec<VarId> = var_names.iter()
-                    .filter_map(|n| intern.get(n))
-                    .collect();
+                let var_ids: Vec<VarId> = var_names.iter().filter_map(|n| intern.get(n)).collect();
                 if !var_ids.is_empty() {
                     lh_live.insert(bid, var_ids);
                 }
@@ -533,10 +540,13 @@ fn lower_stmt(
                 let val: bool = expr.getattr("value")?.extract()?;
                 if val {
                     // Check for loop_header attribute → LoopHeaderSnap
-                    let has_lh: bool = stmt.call_method1(
-                        "has_attribute", ("loop_header",))?.extract()?;
+                    let has_lh: bool = stmt
+                        .call_method1("has_attribute", ("loop_header",))?
+                        .extract()?;
                     if has_lh {
-                        return Ok(Stmt::LoopHeaderSnap { live_vars: Vec::new() });
+                        return Ok(Stmt::LoopHeaderSnap {
+                            live_vars: Vec::new(),
+                        });
                     }
                     return Ok(Stmt::AssumeTrue);
                 }
@@ -650,6 +660,7 @@ fn lower_call(py: Python<'_>, stmt: &Bound<'_, PyAny>, intern: &mut InternTable)
     if proc_name == "memset.cross_product"
         || proc_name == "mbedtls_aesni_has_support.cross_product"
         || proc_name == "generic_chacha.cross_product"
+        || proc_name == "SHA256_Transform.cross_product"
         || proc_name == "br_i31_decode_mod.cross_product"
         || proc_name.starts_with("CRYPTO_")
         || proc_name.starts_with("EVP_")
@@ -685,6 +696,11 @@ fn lower_call(py: Python<'_>, stmt: &Bound<'_, PyAny>, intern: &mut InternTable)
     if proc_name == "read.cross_product" {
         let args = lower_call_args(py, stmt, intern)?;
         return Ok(Stmt::CallRead { args });
+    }
+
+    if is_memtransfer_call(&proc_name) {
+        let args = lower_call_args(py, stmt, intern)?;
+        return Ok(Stmt::CallMemmove { args });
     }
 
     panic!("Unknown call: {}", proc_name);
@@ -760,14 +776,11 @@ fn is_ignored_call(name: &str) -> bool {
 fn is_nondet_call(name: &str) -> bool {
     name.starts_with("__VERIFIER_nondet_")
         || name == "__SMACK_nondet"
-        || name == "__SMACK_nondet_int"
-        || name == "__SMACK_nondet_long"
-        || name == "__SMACK_nondet_short"
-        || name == "__SMACK_nondet_char"
-        || name == "__SMACK_nondet_uint"
-        || name == "__SMACK_nondet_ulong"
-        || name == "__SMACK_nondet_ushort"
-        || name == "__SMACK_nondet_uchar"
+        || name.starts_with("__SMACK_nondet_")
+}
+
+fn is_memtransfer_call(name: &str) -> bool {
+    name.starts_with("llvm.memmove.") || name.starts_with("llvm.memcpy.")
 }
 
 /// Lower a quantified assume (memset/memcpy patterns).
@@ -846,6 +859,24 @@ fn lower_memset_assume(
         }
         "==>" => {
             let lhs = expression.getattr("lhs")?;
+            if lhs
+                .getattr("op")
+                .ok()
+                .and_then(|op| op.extract::<String>().ok())
+                .as_deref()
+                == Some("&&")
+            {
+                let m_ret = find_var_by_suffix_ref(&free_vars, "M.ret");
+                let dst = find_var_by_suffix_ref(&free_vars, "dst");
+                let len = find_var_by_suffix_ref(&free_vars, "len");
+                let val = find_var_by_suffix_ref(&free_vars, "val");
+                return Ok(Stmt::QuantMemsetWrite {
+                    m_ret,
+                    dst,
+                    len,
+                    val,
+                });
+            }
             let fn_name: String = if let Ok(fn_obj) = lhs.getattr("function") {
                 fn_obj.getattr("name")?.extract()?
             } else if let Ok(op) = lhs.getattr("op") {
@@ -877,7 +908,7 @@ fn lower_memset_assume(
                 })
             } else {
                 // Unknown quantified pattern (e.g. integer encoding binary ops)
-                // Treat as assume true (no-op) — the Python interpreter handles these
+                // Treat as assume true (no-op) until Rust lowering models it.
                 Ok(Stmt::AssumeTrue)
             }
         }
@@ -910,6 +941,26 @@ fn lower_memcpy_assume(
         }
         "==>" => {
             let lhs = expression.getattr("lhs")?;
+            if lhs
+                .getattr("op")
+                .ok()
+                .and_then(|op| op.extract::<String>().ok())
+                .as_deref()
+                == Some("&&")
+            {
+                let m_ret = find_var_by_suffix_slice(var_names, "$M.ret");
+                let m_src = find_var_by_suffix_slice(var_names, "$M.src");
+                let dst = find_var_by_suffix_slice(var_names, "$dst");
+                let src = find_var_by_suffix_slice(var_names, "$src");
+                let len = find_var_by_suffix_slice(var_names, "$len");
+                return Ok(Stmt::QuantMemcpyWrite {
+                    m_ret,
+                    m_src,
+                    dst,
+                    src,
+                    len,
+                });
+            }
             let fn_name: String = if let Ok(fn_obj) = lhs.getattr("function") {
                 fn_obj.getattr("name")?.extract()?
             } else if let Ok(op) = lhs.getattr("op") {
@@ -1056,7 +1107,12 @@ fn lower_expr_impl(
             // Store functions
             if matches!(
                 f_name.as_str(),
-                "$store.i8" | "$store.i16" | "$store.i32" | "$store.i64" | "$store.i128" | "$store.ref"
+                "$store.i8"
+                    | "$store.i16"
+                    | "$store.i32"
+                    | "$store.i64"
+                    | "$store.i128"
+                    | "$store.ref"
             ) {
                 let bw = store_load_bitwidth(&f_name);
                 let map = lower_expr_impl(py, &args_list.get_item(0)?, intern)?;
@@ -1173,6 +1229,16 @@ fn store_load_bitwidth(name: &str) -> u8 {
 
 /// Resolve a function name to a BuiltinFn.
 fn resolve_builtin(name: &str) -> Option<BuiltinFn> {
+    if let Some((src, dst)) = parse_bitwidth_cast(name, "$sext.") {
+        return Some(BuiltinFn::Sext { src, dst });
+    }
+    if let Some((src, dst)) = parse_bitwidth_cast(name, "$zext.") {
+        return Some(BuiltinFn::Zext { src, dst });
+    }
+    if let Some((_src, dst)) = parse_bitwidth_cast(name, "$trunc.") {
+        return Some(BuiltinFn::Trunc { dst });
+    }
+
     // This maps all entries from fn_map_to_op and generate_function_map
     let result = match name {
         // Mul
@@ -1341,6 +1407,17 @@ fn resolve_builtin(name: &str) -> Option<BuiltinFn> {
         _ => return None,
     };
     Some(result)
+}
+
+fn parse_bitwidth_cast(name: &str, prefix: &str) -> Option<(u8, u8)> {
+    let rest = name.strip_prefix(prefix)?;
+    let (src, dst) = rest.split_once('.')?;
+    Some((parse_int_bitwidth(src)?, parse_int_bitwidth(dst)?))
+}
+
+fn parse_int_bitwidth(token: &str) -> Option<u8> {
+    let bits = token.strip_prefix('i')?.parse::<u8>().ok()?;
+    matches!(bits, 1 | 8 | 16 | 32 | 64 | 128).then_some(bits)
 }
 
 /// Convert a Python MapType to (index_bw, element_bw).

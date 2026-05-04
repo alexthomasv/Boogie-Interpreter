@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 
 # This repo IS the `interpreter` package. Add the parent of the repo root
-# to sys.path so `import interpreter.python.*` works.
+# to sys.path so package imports work in local test runs.
 REPO_ROOT = Path(__file__).resolve().parent.parent
 PARENT = REPO_ROOT.parent
 if str(PARENT) not in sys.path:
@@ -13,9 +13,6 @@ if str(PARENT) not in sys.path:
 # Also add repo root for direct imports (parser, utils)
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
-
-from interpreter.python.interpreter import BoogieInterpreter, find_entry_point
-
 
 def pytest_addoption(parser):
     group = parser.getgroup("interpreter correctness")

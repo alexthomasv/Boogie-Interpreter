@@ -1,6 +1,4 @@
 from .node import Node
-from .binding import Binding
-from .scope import Scope
 from .specifications import ModifiesClause
 
 
@@ -41,24 +39,17 @@ class AxiomDeclaration(Declaration):
 # Storage Declaration and Variable Declaration
 class StorageDeclaration(Declaration):
     names = []
-    ids = []
     type = None
     where = None
     children = ["names", "type", "where"]
     prefix = None
 
-    def __init__(self, **opts):
-        super().__init__(**opts)
-        self.ids = self.idents()
-
     def set_prefix(self, prefix, indent):
         self.prefix = prefix
         self.indent = "  " * indent
-        for id in self.ids:
-            id.set_prefix(prefix, indent)
 
     def signature(self):
-        return f"{', '.join(self.names)}: {self.type_t}"
+        return f"{', '.join(self.names)}: {self.type}"
 
     def __repr__(self):
         names_str = ", ".join([str(name) for name in self.names]) + ": " if self.names else ""
@@ -69,17 +60,11 @@ class StorageDeclaration(Declaration):
         if not self.names:
             return self
         else:
-            return [self.__class__(names=[name], typ=self.typ, where=self.where) for name in self.names]
-
-    def idents(self):
-        from .expression import StorageIdentifier
-        ids = [StorageIdentifier(name=name, declaration=self) for name in self.names]
-        return ids
-
+            return [self.__class__(names=[name], type=self.type, where=self.where) for name in self.names]
 
 class VariableDeclaration(StorageDeclaration):
     def signature(self):
-        return f"var {', '.join(self.names)}: {self.typ}"
+        return f"var {', '.join(self.names)}: {self.type}"
 
     def __repr__(self,):
         return f"var {super().__repr__()};"
@@ -91,7 +76,7 @@ class ConstantDeclaration(StorageDeclaration):
     children = ["unique", "order_spec"]
 
     def signature(self):
-        return f"const {', '.join(self.names)}: {self.typ}"
+        return f"const {', '.join(self.names)}: {self.type}"
 
     def __repr__(self):
         names_str = ", ".join([str(name) for name in self.names]) + ": " if self.names else ""
@@ -104,7 +89,7 @@ class ConstantDeclaration(StorageDeclaration):
         return f"const {names_str} {str(self.type)}{ord_str};"
 
 # Procedure and Implementation Declaration
-class ProcedureDeclaration(Declaration, Scope):
+class ProcedureDeclaration(Declaration):
     name = None
     type_arguments = []
     parameters = []
@@ -171,7 +156,7 @@ class ImplementationDeclaration(ProcedureDeclaration):
     def __repr__(self):
         return f"implementation {self.sig()}\n{str(self.body)}"
 
-class FunctionDeclaration(Declaration, Scope):
+class FunctionDeclaration(Declaration):
     name = None
     type_arguments = []
     arguments = []

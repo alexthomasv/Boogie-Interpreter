@@ -1,3 +1,6 @@
+import copy as _copy
+
+
 class Node:
     indent = ""
 
@@ -18,10 +21,22 @@ class Node:
     attributes = []
 
     def __init__(self, **opts):
-        self.attributes = []
+        self._init_mutable_defaults()
         for k, v in opts.items():
             if hasattr(self, k):
                 setattr(self, k, v)
+
+    def _init_mutable_defaults(self):
+        for base in reversed(self.__class__.__mro__):
+            for name, value in base.__dict__.items():
+                if name == "children" or name.startswith("__"):
+                    continue
+                if isinstance(value, list):
+                    setattr(self, name, value.copy())
+                elif isinstance(value, dict):
+                    setattr(self, name, value.copy())
+                elif isinstance(value, set):
+                    setattr(self, name, value.copy())
 
     def has_attribute(self, key):
         return any(a.key == key for a in self.attributes)
@@ -43,15 +58,11 @@ class Node:
     def hilite(self):
         return self.show(lambda a: a.hilite())
 
+    def clone(self):
+        return _copy.deepcopy(self)
+
     def copy(self):
-        from .boogie_parser import bpl
-        other = bpl(str(self))
-        for mine, theirs in zip(self.each(), other.each()):
-            if mine.__class__ != theirs.__class__:
-                raise Exception(f"{mine.__class__} != {theirs.__class__} !?!?")
-            if hasattr(theirs, 'bind') and getattr(mine, 'declaration', None):
-                theirs.bind(mine.declaration)
-        return other
+        return self.clone()
 
     def each(self, preorder=True):
         return self.enumerate(preorder)

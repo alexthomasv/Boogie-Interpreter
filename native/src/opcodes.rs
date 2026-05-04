@@ -164,6 +164,8 @@ pub enum Stmt {
     },
     /// call read.cross_product
     CallRead { args: Vec<Expr> },
+    /// call llvm.memmove/llvm.memcpy intrinsic over byte-addressed memory maps
+    CallMemmove { args: Vec<Expr> },
     /// Quantified assume for memset (&&)
     QuantMemsetWrite {
         m_ret: VarId,
