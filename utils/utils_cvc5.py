@@ -1855,20 +1855,32 @@ def parse_constraint_tuple(tuple_str):
         "array": None
     }
 
-    # --- TYPE 4: Disjunction ---
+    # --- TYPE 4: Disjunction of constants ---
     if r"\/" in body:
-        parts = body.split(r"\/")
-        first_match = re.search(r"\((.*?)\)\s*==\s*\((.*?)\)", parts[0])
-        
-        if first_match:
-            result["variable"] = first_match.group(1).strip()
+        parts = [p.strip() for p in body.split(r"\/")]
+        disjuncts = []
+        for part in parts:
+            # This fast path is only for simple finite-domain predicates
+            # such as ``($i0) == (1) \/ ($i0) == (2)``.  Mixed Boolean
+            # formulas containing a top-level disjunction must fall through
+            # to the general infix parser; otherwise a left conjunction can
+            # be misread as the "variable" and later crash EQ_CONST.
+            match_const = re.fullmatch(
+                r"\(?\s*([\$\w.]+(?:\[[^\]]+\])?)\s*\)?"
+                r"\s*==\s*"
+                r"\(?\s*(-?\d+)\s*\)?",
+                part,
+            )
+            if not match_const:
+                disjuncts = []
+                break
+            disjuncts.append((match_const.group(1).strip(),
+                              int(match_const.group(2))))
+
+        if disjuncts and len({var for var, _c in disjuncts}) == 1:
+            result["variable"] = disjuncts[0][0]
             result["type"] = "disjunction_of_constants"
-            constants = []
-            for p in parts:
-                c_match = re.search(r"==\s*\(\s*(\d+)\s*\)", p)
-                if c_match:
-                    constants.append(int(c_match.group(1)))
-            result["allowed_values"] = constants
+            result["allowed_values"] = [c for _var, c in disjuncts]
             return result
 
     # --- EQUALITIES ---
@@ -1965,7 +1977,7 @@ def parse_constraint_tuple(tuple_str):
 
         # --- TYPE 1: Constant Comparison ---
         # Generic fallback for standard variables (e.g. ($i6640) == (18))
-        if is_digit_rhs and "[" not in lhs:
+        if is_digit_rhs and "[" not in lhs and re.match(r'^[\$\w.]+$', lhs):
             result["type"] = "constant_comparison"
             result["variable"] = lhs
             result["constant"] = int(rhs)
@@ -1997,14 +2009,18 @@ def _parse_infix_expr(s, state_cache):
         '==': Kind.EQUAL, '!=': Kind.DISTINCT,
     }
 
-    # Logical (Bool-theory) operators — agent-authored invariants
-    # commonly use ``||``, ``&&``, and Boogie's ``==>`` to combine
-    # comparison predicates.  When both operands are Bool we route
-    # through the Bool-theory Kind instead of the BV one.
+    # Logical (Bool-theory) operators.  Agent-authored invariants
+    # commonly use ``||``, ``&&``, and Boogie's ``==>``; Swoosh's
+    # term renderer emits ``\/``, ``/\``, and ``=>``.  Accept both
+    # spellings so rendered proof targets round-trip through this
+    # parser instead of treating ``/`` as BV division.
     _BOOL_OPS = {
         '||': Kind.OR,
+        '\\/': Kind.OR,
         '&&': Kind.AND,
+        '/\\': Kind.AND,
         '==>': Kind.IMPLIES,
+        '=>': Kind.IMPLIES,
     }
 
     # Operator precedence (lower = binds tighter, but all >= 0 so the
@@ -2012,8 +2028,8 @@ def _parse_infix_expr(s, state_cache):
     # connectives are the loosest so ``a < b || c <= d`` parses as
     # ``(a < b) || (c <= d)``; ``==>`` is looser than ``||`` / ``&&``.
     _PREC = {
-        '==>': 0,
-        '||': 1, '&&': 1,
+        '==>': 0, '=>': 0,
+        '||': 1, '\\/': 1, '&&': 1, '/\\': 1,
         '==': 2, '!=': 2,
         '<': 3, '>': 3, '<=': 3, '>=': 3,
         '+': 4, '-': 4,
@@ -2056,7 +2072,10 @@ def _parse_infix_expr(s, state_cache):
         elif s[i:i+3] in ('==>',):
             tokens.append(('OP', s[i:i+3]))
             i += 3
-        elif s[i:i+2] in ('>>', '<<', '<=', '>=', '==', '!=', '||', '&&'):
+        elif s[i:i+2] in (
+            '>>', '<<', '<=', '>=', '==', '!=',
+            '||', '\\/', '&&', '/\\', '=>',
+        ):
             tokens.append(('OP', s[i:i+2]))
             i += 2
         elif s[i] in '+-*/%<>&^~':
@@ -2162,6 +2181,66 @@ def _parse_infix_expr(s, state_cache):
         except Exception:
             return False
 
+    def _parse_call_args():
+        args = []
+        expect('(')
+        if peek()[0] == ')':
+            advance()
+            return args
+        while True:
+            args.append(parse_expr(0))
+            typ, _val = peek()
+            if typ == ',':
+                advance()
+                continue
+            expect(')')
+            return args
+
+    def _mk_function_call(name, args):
+        fn_map = get_fn_map()
+        if name not in fn_map:
+            raise ValueError(f"Unknown function: {name}")
+        cvc5_op, expected_args, op_bit_width, output_type = fn_map[name][:4]
+        if expected_args is not None and len(args) != expected_args:
+            raise ValueError(
+                f"{name} expects {expected_args} args, got {len(args)}")
+
+        if _INTEGER_ENCODING and op_bit_width is None:
+            fixed_args = []
+            for arg in args:
+                if arg.getSort().isBoolean():
+                    fixed_args.append(solver.mkTerm(
+                        Kind.ITE, arg, solver.mkInteger(1),
+                        solver.mkInteger(0)))
+                else:
+                    fixed_args.append(arg)
+            if cvc5_op is None:
+                if len(fixed_args) != 1:
+                    raise ValueError(f"{name} identity cast needs one arg")
+                return fixed_args[0]
+            if output_type == "int_cmp":
+                cond = solver.mkTerm(cvc5_op, *fixed_args)
+                if not cond.getSort().isBoolean():
+                    cond = cvc5_cast_to_bool(solver, cond)
+                return solver.mkTerm(
+                    Kind.ITE, cond, solver.mkInteger(1),
+                    solver.mkInteger(0))
+            ret = solver.mkTerm(cvc5_op, *fixed_args)
+            if output_type == bool and not ret.getSort().isBoolean():
+                ret = cvc5_cast_to_bool(solver, ret)
+            return ret
+
+        fixed_args = [cvc5_cast_to_bv(solver, arg, op_bit_width)
+                      for arg in args]
+        if cvc5_op is None:
+            if len(fixed_args) != 1:
+                raise ValueError(f"{name} identity cast needs one arg")
+            return fixed_args[0]
+        ret = solver.mkTerm(cvc5_op, *fixed_args)
+        if output_type == bool:
+            return cvc5_cast_to_bool(solver, ret)
+        return cvc5_cast_to_bv(solver, ret, output_type)
+
     def parse_expr(min_prec=0):
         left = parse_primary()
         while True:
@@ -2232,6 +2311,9 @@ def _parse_infix_expr(s, state_cache):
                 expect(']')
                 return solver.mkTerm(Kind.SELECT, expr, idx)
             return expr
+        elif typ == 'ID' and val in ('true', 'false'):
+            advance()
+            return solver.mkBoolean(val == 'true')
         elif typ == 'ID' and val == 'STORE':
             advance()
             expect('(')
@@ -2244,6 +2326,8 @@ def _parse_infix_expr(s, state_cache):
             return solver.mkTerm(Kind.STORE, arr, idx, v)
         elif typ == 'ID':
             advance()
+            if peek()[0] == '(':
+                return _mk_function_call(val, _parse_call_args())
             term = state_cache.cvc5_var(val)
             if term is None:
                 raise ValueError(f"Unknown variable: {val}")
@@ -2270,6 +2354,9 @@ def _parse_infix_expr(s, state_cache):
             advance()
             operand = parse_primary()
             try:
+                unwrapped = _unwrap_bool_or_bv1(operand)
+                if unwrapped is not None and unwrapped.getSort().isBoolean():
+                    return solver.mkTerm(Kind.NOT, unwrapped)
                 if operand.getSort().isBoolean():
                     return solver.mkTerm(Kind.NOT, operand)
             except Exception:
