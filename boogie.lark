@@ -154,7 +154,10 @@ map_type: type_args "[" types "]" type
 exprs: expr ("," expr)*
 
 // Expression precedence hierarchy (lowest to highest)
-?expr: expr "<==>" expr_implies  -> binary_expr_iff
+?expr: expr_ternary
+?expr_ternary: expr_iff QMARK expr COLON expr_ternary -> c_ternary_expr
+     | expr_iff
+?expr_iff: expr_iff "<==>" expr_implies  -> binary_expr_iff
      | expr_implies
 ?expr_implies: expr_implies "==>" expr_or  -> binary_expr_implies
      | expr_or
@@ -245,6 +248,8 @@ names: name ("," name)*
 
 DIGITS: /[0-9]+/
 EXP_PART: /e-?[0-9]+/
+QMARK.10: "?"
+COLON: ":"
 DOT: "."
 
 COMMENT: /\/\/[^\n]*/

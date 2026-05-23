@@ -651,6 +651,18 @@ class BoogieToObjectTransformer(Transformer):
         combined = {"condition": cond, "then": then_expr, "else_": else_expr}
         return IfExpression(**combined)
 
+    def c_ternary_expr(self, items):
+        if len(items) == 5:
+            cond = items[0]
+            then_expr = items[2]
+            else_expr = items[4]
+        else:
+            cond = items[0]
+            then_expr = items[1]
+            else_expr = items[2]
+        combined = {"condition": cond, "then": then_expr, "else_": else_expr}
+        return IfExpression(**combined)
+
     def old_expr(self, items):
         return OldExpression(expression=items[0])
 

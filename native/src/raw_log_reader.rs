@@ -106,7 +106,7 @@ enum FlushCmd {
 #[derive(Default)]
 struct Counters {
     bytes_decoded: AtomicU64,   // raw bytes out of the zstd decoder
-    records_parsed: AtomicU64,  // records unpacked by parsers (incl. shadow-skipped)
+    records_parsed: AtomicU64,  // records unpacked by parsers
     members_flushed: AtomicU64, // 12-byte or registry members ACKed by workers
 }
 
@@ -156,8 +156,6 @@ pub fn load_raw_log_to_redis(path: &Path, redis_url: &str, iter_id_offset: u32) 
         parse_header_from_frame0(&mmap_arc[frame_ranges[0].clone()])?;
     let var_names = Arc::new(var_names);
     let block_names = Arc::new(block_names);
-    let is_shadow: Arc<Vec<bool>> =
-        Arc::new(var_names.iter().map(|n| n.ends_with(".shadow")).collect());
     let n_vars = var_names.len();
 
     // Build the list of record-bearing frame ranges. In a multi-frame
@@ -207,7 +205,6 @@ pub fn load_raw_log_to_redis(path: &Path, redis_url: &str, iter_id_offset: u32) 
         let tx = flush_tx.clone();
         let var_names = Arc::clone(&var_names);
         let block_names = Arc::clone(&block_names);
-        let is_shadow = Arc::clone(&is_shadow);
         let c = Arc::clone(&counters);
         parser_handles.push(thread::spawn(move || {
             parser_loop(
@@ -215,7 +212,6 @@ pub fn load_raw_log_to_redis(path: &Path, redis_url: &str, iter_id_offset: u32) 
                 tx,
                 var_names,
                 block_names,
-                is_shadow,
                 n_vars,
                 iter_id_offset,
                 c,
@@ -578,7 +574,6 @@ fn parser_loop(
     flush_tx: Sender<FlushCmd>,
     var_names: Arc<Vec<String>>,
     block_names: Arc<Vec<String>>,
-    is_shadow: Arc<Vec<bool>>,
     n_vars: usize,
     iter_id_offset: u32,
     counters: Arc<Counters>,
@@ -641,10 +636,6 @@ fn parser_loop(
             ]);
             off += RECORD_SIZE;
             parsed_this_chunk += 1;
-
-            if is_shadow[var_id as usize] {
-                continue;
-            }
 
             let eff_iter = if iter_id > 0 {
                 iter_id.wrapping_add(iter_id_offset)

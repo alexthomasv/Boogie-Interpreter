@@ -32,6 +32,10 @@ from interpreter.utils.inputs import Input, ProgramInputs, preprocess_external_i
 from interpreter.utils.input_parser import get_bpl_field_sizes
 from interpreter.utils.program import find_entry_point
 
+DEFAULT_MAX_STEPS_PER_INPUT = int(
+    os.environ.get("SWOOSH_COVERAGE_FUZZ_MAX_STEPS", "100000")
+)
+
 
 # ---------------------------------------------------------------------------
 # Parameter metadata extraction
@@ -399,13 +403,18 @@ def _inputs_to_input_str(param_info, program_inputs):
 class CoverageFuzzer:
     """Coverage-guided input generator using Hypothesis target()."""
 
-    def __init__(self, name, max_examples=200, target_pct=100.0, engine='native'):
+    def __init__(self, name, max_examples=200, target_pct=100.0,
+                 engine='native', max_steps_per_input=None):
         if engine != "native":
             raise ValueError("coverage_fuzz is Rust-only; use engine='native'")
         self.name = name
         self.max_examples = max_examples
         self.target_pct = target_pct
         self.engine = engine
+        self.max_steps_per_input = (
+            DEFAULT_MAX_STEPS_PER_INPUT
+            if max_steps_per_input is None else int(max_steps_per_input)
+        )
 
         self.pkg_path = Path("test_packages") / f"{name}_pkg"
         assert self.pkg_path.is_dir(), f"Package not found: {self.pkg_path}"
@@ -467,6 +476,7 @@ class CoverageFuzzer:
                 return_memory_summary=False,
                 validate_handoff=False,
                 quiet=True,
+                max_steps=self.max_steps_per_input,
             )
             if result.get("status") == "ok":
                 return set(result.get("explored_blocks") or [])

@@ -192,7 +192,7 @@ def _build_trace_name_tables(program, entry):
     seen = set()
 
     def add_var(name):
-        if name and not name.endswith('.shadow') and name not in seen:
+        if name and name not in seen:
             seen.add(name)
             var_names.append(name)
 
@@ -240,8 +240,15 @@ class PreparedNativeProgram:
         )
         from interpreter.utils.inputs import preprocess_external_inputs, gather_ptr_aliases
         from interpreter.utils.program import generate_label_to_block, initialize_code_metadata
+        from interpreter.parser.desugar import desugar_while_statements
 
         self.program = program
+        # Rewrite any structured `while` loops into goto-form blocks before
+        # we read PC/label metadata or invoke the Rust lowering — the native
+        # interpreter has no opcode for `WhileStatement`, and downstream
+        # passes (initialize_code_metadata, swoosh_interp.lower) must agree
+        # on the block list. The pass is a no-op for SMACK-generated input.
+        desugar_while_statements(self.program)
         self.test_path = Path(test_path) if test_path is not None else None
 
         impl_decls = [

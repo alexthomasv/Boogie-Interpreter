@@ -8,6 +8,7 @@ mod opcodes;
 mod raw_log;
 mod raw_log_reader;
 mod trace;
+mod trace_index;
 mod vm;
 
 #[cfg(kani)]
@@ -551,6 +552,36 @@ fn load_raw_log_to_redis(
     .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))
 }
 
+/// Build the production SQLite trace-evidence index from raw trace logs.
+///
+/// This is the native equivalent of
+/// `src.state.trace_evidence.build_trace_index_from_raw_logs`.
+#[pyfunction]
+#[pyo3(signature = (raw_paths, sqlite_path, bench=None))]
+fn build_trace_index_sqlite(
+    py: Python<'_>,
+    raw_paths: Vec<String>,
+    sqlite_path: String,
+    bench: Option<String>,
+) -> PyResult<PyObject> {
+    let paths: Vec<std::path::PathBuf> = raw_paths.into_iter().map(Into::into).collect();
+    let sqlite_path_buf = std::path::PathBuf::from(sqlite_path);
+    let result = py
+        .allow_threads(|| {
+            trace_index::build_trace_index_sqlite(&paths, &sqlite_path_buf, bench.as_deref())
+        })
+        .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
+
+    let out = PyDict::new_bound(py);
+    out.set_item("path", result.path)?;
+    out.set_item("rows", result.rows)?;
+    out.set_item("records", result.records)?;
+    out.set_item("raw_files", result.raw_files)?;
+    out.set_item("source", "raw_log")?;
+    out.set_item("builder", "native_sqlite_sorted_runs")?;
+    Ok(out.into_py(py))
+}
+
 #[pymodule]
 fn swoosh_interp(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(lower, m)?)?;
@@ -561,6 +592,7 @@ fn swoosh_interp(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(explore, m)?)?;
     m.add_function(wrap_pyfunction!(get_var_names, m)?)?;
     m.add_function(wrap_pyfunction!(load_raw_log_to_redis, m)?)?;
+    m.add_function(wrap_pyfunction!(build_trace_index_sqlite, m)?)?;
     m.add_class::<CompiledProgramWrapper>()?;
     Ok(())
 }

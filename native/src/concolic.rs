@@ -1746,6 +1746,55 @@ impl<'a> Engine<'a> {
                 let boundary = self.vm.get_scalar_silent(*dst) + self.vm.get_scalar_silent(*len);
                 self.copy_filtered(*m_ret, *m_src, |addr, boundary| addr >= boundary, boundary);
             }
+            Stmt::If { cond, then_body, else_body } => {
+                // Concolic execution of structured if: pick the branch based
+                // on the concrete value, recurse. Path constraint over
+                // ``cond`` is recorded so the solver can flip branches in a
+                // future replay (mirroring the Stmt::Assume pattern).
+                let ev = self.eval_bool(cond);
+                if let Some(sym) = ev.sym.clone() {
+                    if let Some(bool_expr) = sym_bool_text(&sym) {
+                        self.path_constraints.push(if ev.value {
+                            bool_expr
+                        } else {
+                            format!("(not {})", bool_expr)
+                        });
+                    }
+                }
+                let body: &Vec<Stmt> = if ev.value { then_body } else { else_body };
+                for inner in body {
+                    if !self.execute_stmt(inner) {
+                        return false;
+                    }
+                }
+            }
+            Stmt::While { cond, body } => {
+                // Concolic execution of structured loop. Iterate concretely;
+                // record a path constraint per iteration boundary. Bounded
+                // by `step_limit` (inherited via `vm.consume_step` calls
+                // inside execute_stmt's leaf operations) — the loop itself
+                // doesn't add a special budget here.
+                loop {
+                    let ev = self.eval_bool(cond);
+                    if let Some(sym) = ev.sym.clone() {
+                        if let Some(bool_expr) = sym_bool_text(&sym) {
+                            self.path_constraints.push(if ev.value {
+                                bool_expr
+                            } else {
+                                format!("(not {})", bool_expr)
+                            });
+                        }
+                    }
+                    if !ev.value {
+                        break;
+                    }
+                    for inner in body {
+                        if !self.execute_stmt(inner) {
+                            return false;
+                        }
+                    }
+                }
+            }
             Stmt::Goto { .. } | Stmt::Return => return false,
         }
         true

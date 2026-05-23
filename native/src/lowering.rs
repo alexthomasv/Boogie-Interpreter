@@ -7,7 +7,6 @@ use rustc_hash::FxHashMap;
 pub struct InternTable {
     pub map: FxHashMap<String, VarId>,
     names: Vec<String>,
-    shadows: Vec<bool>,
 }
 
 impl InternTable {
@@ -15,7 +14,6 @@ impl InternTable {
         Self {
             map: FxHashMap::default(),
             names: Vec::new(),
-            shadows: Vec::new(),
         }
     }
 
@@ -25,7 +23,6 @@ impl InternTable {
         }
         let id = self.names.len() as VarId;
         self.names.push(name.to_string());
-        self.shadows.push(name.ends_with(".shadow"));
         self.map.insert(name.to_string(), id);
         id
     }
@@ -36,10 +33,6 @@ impl InternTable {
 
     pub fn names(&self) -> &[String] {
         &self.names
-    }
-
-    pub fn shadows(&self) -> &[bool] {
-        &self.shadows
     }
 
     pub fn len(&self) -> u32 {
@@ -471,7 +464,6 @@ pub fn lower_program_full(
         label_to_block,
         var_names: intern.names().to_vec(),
         name_to_var: intern.map.clone(),
-        is_shadow: intern.shadows().to_vec(),
         entry_block: 0,
         entry_preconditions,
         mem_maps,
@@ -610,8 +602,104 @@ fn lower_stmt(
         }
         "ReturnStatement" => Ok(Stmt::Return),
         "CallStatement" => lower_call(py, stmt, intern),
+        "IfStatement" => lower_if(py, stmt, intern, label_map),
+        "WhileStatement" => lower_while(py, stmt, intern, label_map),
         _ => panic!("Unknown statement type: {}", type_name),
     }
+}
+
+
+/// Lower a Python ``WhileStatement`` to ``Stmt::While``.
+///
+/// Used for nested while-statements that survive desugar (top-level
+/// while-blocks are still goto-desugared by `desugar_while_statements`).
+/// Body must contain only non-terminator stmts.
+fn lower_while(
+    py: Python<'_>,
+    stmt: &Bound<'_, PyAny>,
+    intern: &mut InternTable,
+    label_map: &FxHashMap<String, BlockId>,
+) -> PyResult<Stmt> {
+    let cond_py = stmt.getattr("condition")?;
+    let cond = lower_expr(py, &cond_py, intern)?;
+
+    // ``WhileStatement.blocks`` is a Python list[Block]; each block has
+    // a ``statements`` field. Concatenate all body stmts.
+    let blocks_attr = stmt.getattr("blocks")?;
+    let blocks_py: &Bound<'_, PyList> = blocks_attr.downcast()?;
+    let mut body: Vec<Stmt> = Vec::new();
+    for blk in blocks_py.iter() {
+        let stmts_attr = blk.getattr("statements")?;
+        let stmts_py: &Bound<'_, PyList> = stmts_attr.downcast()?;
+        for s in stmts_py.iter() {
+            body.push(lower_stmt(py, &s, intern, label_map)?);
+        }
+    }
+
+    debug_assert!(
+        body.iter().all(|s| !matches!(s, Stmt::Goto { .. } | Stmt::Return)),
+        "Stmt::While body must not contain Goto/Return"
+    );
+
+    Ok(Stmt::While { cond, body })
+}
+
+
+/// Lower a Python `IfStatement` to `Stmt::If`.
+///
+/// The Boogie parser produces:
+///   - `condition`: Expression
+///   - `blocks`: list[Statement]  (the THEN body — flat stmt list)
+///   - `else_`: None | IfStatement (else-if chain) | list[Statement]
+///
+/// Body vectors must contain only non-terminator stmts (no Goto/Return);
+/// `bpl_emit::_emit_structured_if` honors this. We assert it here so a
+/// broken caller fails loudly instead of producing silently-wrong code.
+fn lower_if(
+    py: Python<'_>,
+    stmt: &Bound<'_, PyAny>,
+    intern: &mut InternTable,
+    label_map: &FxHashMap<String, BlockId>,
+) -> PyResult<Stmt> {
+    let cond_py = stmt.getattr("condition")?;
+    let cond = lower_expr(py, &cond_py, intern)?;
+
+    let then_attr = stmt.getattr("blocks")?;
+    let then_py: &Bound<'_, PyList> = then_attr.downcast()?;
+    let mut then_body: Vec<Stmt> = Vec::with_capacity(then_py.len());
+    for item in then_py.iter() {
+        then_body.push(lower_stmt(py, &item, intern, label_map)?);
+    }
+
+    let else_attr = stmt.getattr("else_")?;
+    let else_body: Vec<Stmt> = if else_attr.is_none() {
+        Vec::new()
+    } else {
+        let else_type = else_attr.get_type().name()?.to_string();
+        if else_type == "IfStatement" {
+            // else-if chain: lower the inner IfStatement as a single
+            // nested Stmt::If — execute_stmt recurses.
+            vec![lower_stmt(py, &else_attr, intern, label_map)?]
+        } else {
+            let else_py: &Bound<'_, PyList> = else_attr.downcast()?;
+            let mut acc: Vec<Stmt> = Vec::with_capacity(else_py.len());
+            for item in else_py.iter() {
+                acc.push(lower_stmt(py, &item, intern, label_map)?);
+            }
+            acc
+        }
+    };
+
+    debug_assert!(
+        then_body.iter().all(|s| !matches!(s, Stmt::Goto { .. } | Stmt::Return)),
+        "Stmt::If then_body must not contain Goto/Return"
+    );
+    debug_assert!(
+        else_body.iter().all(|s| !matches!(s, Stmt::Goto { .. } | Stmt::Return)),
+        "Stmt::If else_body must not contain Goto/Return"
+    );
+
+    Ok(Stmt::If { cond, then_body, else_body })
 }
 
 /// Lower a call statement.
@@ -703,7 +791,18 @@ fn lower_call(py: Python<'_>, stmt: &Bound<'_, PyAny>, intern: &mut InternTable)
         return Ok(Stmt::CallMemmove { args });
     }
 
-    panic!("Unknown call: {}", proc_name);
+    // Unknown procedure (e.g. user-defined helper from a multi-function
+    // C source like Codeflaws). Treat as a non-deterministic call:
+    // the assignments (if any) become havoc-equivalent. This matches
+    // Boogie's stub-procedure semantics — calls to declarations
+    // without bodies are non-deterministic. Previously this branch
+    // panicked, which killed the Rust thread mid-benchmark.
+    let assignments = lower_call_assignments(stmt, intern)?;
+    if assignments.is_empty() {
+        Ok(Stmt::CallIgnored)
+    } else {
+        Ok(Stmt::CallNondet { assignments })
+    }
 }
 
 fn lower_call_args(

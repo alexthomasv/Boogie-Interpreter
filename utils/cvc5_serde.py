@@ -43,6 +43,11 @@ _SERDE_STATS = {
     "deserialize_cache_writes": 0,
     "sort_cache_hits": 0,
     "sort_cache_misses": 0,
+    "canonical_calls": 0,
+    "canonical_hits": 0,
+    "canonical_misses": 0,
+    "canonical_nodes": 0,
+    "canonical_ms": 0.0,
 }
 
 
@@ -65,6 +70,13 @@ def get_serde_stats(*, reset: bool = False) -> dict[str, int | float | dict]:
         "misses": info.misses,
         "maxsize": info.maxsize,
         "currsize": info.currsize,
+    }
+    canonical_info = _canonical_term_bytes_cached.cache_info()
+    stats["canonical_cache"] = {
+        "hits": canonical_info.hits,
+        "misses": canonical_info.misses,
+        "maxsize": canonical_info.maxsize,
+        "currsize": canonical_info.currsize,
     }
     if reset:
         reset_serde_stats()
@@ -522,7 +534,24 @@ def _lookup_free_const(state_cache, node: SerializedNode):
     cvc5_var = getattr(state_cache, "cvc5_var", None)
     if cvc5_var is None:
         return None
-    return cvc5_var(node.symbol)
+    term = cvc5_var(node.symbol)
+    if term is not None and not _free_const_matches_node(term, node):
+        return None
+    return term
+
+
+def _free_const_matches_node(term: Term, node: SerializedNode) -> bool:
+    """Return whether a cached free-constant term still has node's symbol.
+
+    Serialized CONSTANT nodes preserve program symbols such as ``$0``.  A cache
+    entry keyed by that symbol must not be allowed to point at a BV literal
+    value ``0``; otherwise decode collapses a program variable/constant into a
+    literal and the agent sees a different proof obligation vocabulary.
+    """
+    try:
+        return term.getSymbol() == node.symbol
+    except Exception:
+        return False
 
 
 def _remember_free_const(state_cache, name: str, term: Term):
@@ -530,6 +559,22 @@ def _remember_free_const(state_cache, name: str, term: Term):
     if callable(put_runtime):
         put_runtime(name, term)
         return
+    cache = getattr(state_cache, "cached_id_to_cvc5", None)
+    if isinstance(cache, MutableMapping):
+        cache[name] = term
+
+
+def _lookup_bound_var(state_cache, node: SerializedNode):
+    cache = getattr(state_cache, "cached_id_to_cvc5", None)
+    if not isinstance(cache, MutableMapping):
+        return None
+    existing = cache.get(node.symbol)
+    if existing is not None and existing.getKind() == Kind.VARIABLE:
+        return existing
+    return None
+
+
+def _remember_bound_var(state_cache, name: str, term: Term):
     cache = getattr(state_cache, "cached_id_to_cvc5", None)
     if isinstance(cache, MutableMapping):
         cache[name] = term
@@ -562,11 +607,15 @@ def deserialize_cvc5_term(state_cache, root_term: SerializedCvc5TermV2 | Term) -
         cache_key = cache_keys[idx]
         cached = global_cache.get(cache_key)
         if cached is not None:
-            memo[idx] = cached
-            _SERDE_STATS["deserialize_cache_hits"] += 1
-            _SERDE_STATS["deserialize_subterm_cache_hits"] += 1
-            _SERDE_STATS["deserialize_nodes_skipped"] += 1
-            continue
+            if node.kind == "CONSTANT" and not _free_const_matches_node(
+                    cached, node):
+                cached = None
+            else:
+                memo[idx] = cached
+                _SERDE_STATS["deserialize_cache_hits"] += 1
+                _SERDE_STATS["deserialize_subterm_cache_hits"] += 1
+                _SERDE_STATS["deserialize_nodes_skipped"] += 1
+                continue
         try:
             child_terms = [memo[child] for child in node.children]
             kind = Kind[node.kind]
@@ -577,7 +626,20 @@ def deserialize_cvc5_term(state_cache, root_term: SerializedCvc5TermV2 | Term) -
                     res = solver.mkConst(_sort_from_signature_cached(state_cache, node.sort), node.symbol)
                     _remember_free_const(state_cache, node.symbol, res)
             elif node.kind == "VARIABLE":
-                res = solver.mkVar(_sort_from_signature_cached(state_cache, node.sort), node.symbol)
+                # Bound variables must be rebuilt through the same registry as
+                # source conversion.  If a forall's VARIABLE_LIST and body are
+                # deserialized from separate nodes/calls, fresh mkVar() calls
+                # with the same symbol are not interchangeable to cvc5; the
+                # body leaf is then reported as a free variable.  This is the
+                # bound-var-wins policy used by convert_expr_cvc5: cache by
+                # binder name and promote any same-name entry to VARIABLE.
+                res = _lookup_bound_var(state_cache, node)
+                if res is None:
+                    res = solver.mkVar(
+                        _sort_from_signature_cached(state_cache, node.sort),
+                        node.symbol,
+                    )
+                    _remember_bound_var(state_cache, node.symbol, res)
             elif node.kind == "CONST_BITVECTOR":
                 res = solver.mkBitVector(subterm.bitwidth, int(node.value))
             elif node.kind == "CONST_BOOLEAN":
@@ -645,9 +707,26 @@ def _canonical_node_obj(term: SerializedCvc5TermV2, idx: int):
     return (node.kind, _sort_to_obj(node.sort), node.op_indices, children)
 
 
+@lru_cache(maxsize=200000)
+def _canonical_term_bytes_cached(term: SerializedCvc5TermV2) -> bytes:
+    return term.canonical_bytes()
+
+
 def canonical_term_bytes(term: Term | SerializedCvc5TermV2) -> bytes:
     serialized = serialize_cvc5_term(term)
-    return serialized.canonical_bytes()
+    _SERDE_STATS["canonical_calls"] += 1
+    before = _canonical_term_bytes_cached.cache_info()
+    t0 = time.perf_counter()
+    out = _canonical_term_bytes_cached(serialized)
+    elapsed_ms = (time.perf_counter() - t0) * 1000
+    after = _canonical_term_bytes_cached.cache_info()
+    if after.hits > before.hits:
+        _SERDE_STATS["canonical_hits"] += 1
+    elif after.misses > before.misses:
+        _SERDE_STATS["canonical_misses"] += 1
+    _SERDE_STATS["canonical_nodes"] += len(serialized.nodes)
+    _SERDE_STATS["canonical_ms"] += elapsed_ms
+    return out
 
 
 def canonical_term_fingerprint(term: Term | SerializedCvc5TermV2) -> str:

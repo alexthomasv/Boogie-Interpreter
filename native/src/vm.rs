@@ -41,8 +41,6 @@ pub struct VM {
     pub vars: Vec<Value>,
     /// Variable names for trace output
     pub var_names: Vec<String>,
-    /// Is this variable a shadow? (precomputed)
-    pub is_shadow: Vec<bool>,
     /// Memory maps, indexed by map_index in Value::Map
     pub memory_maps: Vec<MemoryMap>,
     /// Which VarId is a memory map? VarId → Some(map_index)
@@ -111,7 +109,6 @@ impl VM {
         Self {
             vars,
             var_names: program.var_names.clone(),
-            is_shadow: program.is_shadow.clone(),
             memory_maps: Vec::new(),
             var_to_map,
             pc: 0,
@@ -199,7 +196,7 @@ impl VM {
         } else if Some(var_id) == self.curr_addr_shadow_id {
             self.alloc_addr_shadow = value;
         }
-        if !self.no_trace && !silent && !self.is_shadow[vid] {
+        if !self.no_trace && !silent {
             self.trace
                 .record(var_id, value, self.pc, self.curr_block_id, OP_WRITE);
         }
@@ -213,7 +210,7 @@ impl VM {
         match &self.vars[vid] {
             Value::Scalar(v) => {
                 let v = *v;
-                if !self.no_trace && self.log_read && !self.is_shadow[vid] {
+                if !self.no_trace && self.log_read {
                     self.trace
                         .record(var_id, v, self.pc, self.curr_block_id, OP_READ);
                 }
@@ -498,10 +495,8 @@ impl VM {
                 if !self.no_trace {
                     for &vid in live_vars {
                         if let Value::Scalar(val) = self.vars[vid as usize] {
-                            if !self.is_shadow[vid as usize] {
-                                self.trace
-                                    .record(vid, val, self.pc, self.curr_block_id, OP_WRITE);
-                            }
+                            self.trace
+                                .record(vid, val, self.pc, self.curr_block_id, OP_WRITE);
                         }
                     }
                 }
@@ -733,6 +728,28 @@ impl VM {
                     self.memory_maps[dst_idx].set(addr, val);
                 }
             }
+            Stmt::If { cond, then_body, else_body } => {
+                // Evaluate condition; pick branch; recursively execute its body.
+                // Both bodies are guaranteed (by lowering) to contain no
+                // terminator stmts, so recursion stays inside this block.
+                let take_then = self.eval_bool(cond, program);
+                let body: &Vec<Stmt> = if take_then { then_body } else { else_body };
+                for inner in body {
+                    self.execute_stmt(inner, program)?;
+                    self.pc += 1;
+                }
+            }
+            Stmt::While { cond, body } => {
+                // Structured loop emitted by diffprod reify when a corerel
+                // body contained a nested PWhile. Concrete execution loops
+                // until the guard is false.
+                while self.eval_bool(cond, program) {
+                    for inner in body {
+                        self.execute_stmt(inner, program)?;
+                        self.pc += 1;
+                    }
+                }
+            }
             Stmt::Goto { .. } | Stmt::Return => {
                 panic!("Terminator should not be in body statements")
             }
@@ -792,7 +809,7 @@ impl VM {
                 match &self.vars[vid] {
                     Value::Scalar(v) => {
                         let v = *v;
-                        if !self.no_trace && self.log_read && !self.is_shadow[vid] {
+                        if !self.no_trace && self.log_read {
                             self.trace
                                 .record(*var_id, v, self.pc, self.curr_block_id, OP_READ);
                         }
