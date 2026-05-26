@@ -1,38 +1,37 @@
 use crate::opcodes::{BlockId, VarId};
 use crate::raw_log::RawLogWriter;
 
-/// op_type constants matching Python: 'W' = write, 'R' = read
+/// op_type constants matching Python: 'W' = write, 'R' = read.
+/// 'I' defines an exact loop-iteration context used by subsequent
+/// value records.
 pub const OP_WRITE: u8 = b'W';
 pub const OP_READ: u8 = b'R';
-
-/// Saturating cap for the 16-bit `iter_count` sub-field in packed iter_id.
-const ITER_COUNT_MAX: u32 = 0xFFFF;
+pub const OP_ITER_CONTEXT: u8 = b'I';
 
 /// Streaming-only trace sink.
 ///
-/// Each trace record carries a packed `iter_id: u32`:
+/// Each trace value record carries an opaque `iter_id: u32`:
 ///
 ///   ```
-///   iter_id = (header_block_id << 16) | (iter_count & 0xFFFF)
+///   iter_id = exact active loop-context id
 ///   ```
 ///
-/// where `header_block_id` is the BlockId of the loop header that
-/// iteration count refers to.  `iter_id = 0` means "not in any loop".
+/// where `iter_id = 0` means "not in any loop".  Nonzero ids are
+/// defined by `OP_ITER_CONTEXT` records:
 ///
-/// A single variable write emits ONE record per enclosing loop —
-/// outer-loop writes tag their iter with the outer header; inner-loop
-/// writes tag their iter with the inner header.  Downstream consumers
-/// that want to compare variables at matching outer-loop iterations
-/// simply intersect iter_id sets as before; the packed representation
-/// preserves set-intersection semantics without changing the 12-byte
-/// member format.
+///   `var_id=context_id, pc=parent_context_id, block_id=header,
+///    value=iter_count, iter_id=depth`
+///
+/// The parent chain reconstructs the full nested stack, so a value in
+/// `(outer=3, inner=5)` receives a distinct id from `(outer=4, inner=5)`.
 pub struct TraceAccumulator {
     /// Total number of trace entries (reads + writes, counting all
     /// per-loop-level records).
     pub total: u64,
     /// Active loop stack — one frame per enclosing loop, outer-first.
-    /// Each frame is `(header_block_id, iter_count_at_this_level)`.
-    stack: Vec<(BlockId, u32)>,
+    stack: Vec<StackFrame>,
+    /// Next nonzero exact loop-context id to allocate.
+    next_context_id: u32,
     /// `is_loop_header[block_id]` — whether that block is the header
     /// of some loop.  Sized to `num_blocks`.
     is_loop_header: Vec<bool>,
@@ -51,6 +50,7 @@ impl Clone for TraceAccumulator {
         Self {
             total: self.total,
             stack: self.stack.clone(),
+            next_context_id: self.next_context_id,
             is_loop_header: self.is_loop_header.clone(),
             block_innermost_header: self.block_innermost_header.clone(),
             loop_parent_header: self.loop_parent_header.clone(),
@@ -67,6 +67,7 @@ impl TraceAccumulator {
         Self {
             total: 0,
             stack: Vec::new(),
+            next_context_id: 1,
             is_loop_header: Vec::new(),
             block_innermost_header: Vec::new(),
             loop_parent_header: Vec::new(),
@@ -118,13 +119,13 @@ impl TraceAccumulator {
     ///     ancestor of block.
     pub fn on_block_enter(&mut self, block_id: BlockId) {
         // Pop frames whose header does NOT contain `block_id`.
-        while let Some(&(top_header, _)) = self.stack.last() {
-            if top_header == block_id {
+        while let Some(top) = self.stack.last() {
+            if top.header == block_id {
                 // Special-case: about to re-enter the same loop header
                 // — keep the frame and increment it below.
                 break;
             }
-            if self.header_contains_block(top_header, block_id) {
+            if self.header_contains_block(top.header, block_id) {
                 break;
             }
             self.stack.pop();
@@ -140,23 +141,46 @@ impl TraceAccumulator {
         }
 
         // Block is a header.  Two cases: back-edge or new loop.
-        if let Some(top) = self.stack.last_mut() {
-            if top.0 == block_id {
+        if self
+            .stack
+            .last()
+            .map(|top| top.header == block_id)
+            .unwrap_or(false)
+        {
+            let depth = self.stack.len() as u32;
+            let parent_context_id = if self.stack.len() >= 2 {
+                self.stack[self.stack.len() - 2].context_id
+            } else {
+                0
+            };
+            let count = self
+                .stack
+                .last()
+                .map(|frame| frame.count.saturating_add(1))
+                .unwrap_or(0);
+            let context_id = self.allocate_context(parent_context_id, block_id, count, depth);
+            if let Some(top) = self.stack.last_mut() {
                 // Back-edge — increment (saturating).
-                top.1 = top.1.saturating_add(1);
-                return;
+                top.count = count;
+                top.context_id = context_id;
             }
+            return;
         }
         // New loop entry.  The pop-loop above already removed any
         // frames that don't contain this block; now push ours.
-        self.stack.push((block_id, 0));
+        let parent_context_id = self.stack.last().map(|frame| frame.context_id).unwrap_or(0);
+        let depth = self.stack.len() as u32 + 1;
+        let context_id = self.allocate_context(parent_context_id, block_id, 0, depth);
+        self.stack.push(StackFrame {
+            header: block_id,
+            count: 0,
+            context_id,
+        });
     }
 
-    /// Record a trace entry.  Writes emit ONE record per enclosing
-    /// loop level (each tagged with that level's packed iter_id); a
-    /// write outside all loops emits a single record with iter_id=0.
-    /// Reads behave identically but share the current iter_count
-    /// without ticking anything.
+    /// Record a trace entry.  A write/read inside any loop emits a
+    /// single value record tagged with the exact active nested context;
+    /// outside loops it emits `iter_id=0`.
     #[inline]
     pub fn record(&mut self, var_id: VarId, value: i64, pc: u32, block_id: u32, op_type: u8) {
         // The total counter still reflects logical write/read events,
@@ -168,20 +192,45 @@ impl TraceAccumulator {
             None => return,
         };
 
-        if self.stack.is_empty() {
-            if let Err(e) = w.record(op_type, var_id, pc, block_id, value, 0) {
-                panic!("raw trace log write failed: {}", e);
-            }
-            return;
-        }
-
-        for &(header, count) in self.stack.iter() {
-            let packed = ((header as u32) << 16) | (count.min(ITER_COUNT_MAX));
-            if let Err(e) = w.record(op_type, var_id, pc, block_id, value, packed) {
-                panic!("raw trace log write failed: {}", e);
-            }
+        let context_id = self.stack.last().map(|frame| frame.context_id).unwrap_or(0);
+        if let Err(e) = w.record(op_type, var_id, pc, block_id, value, context_id) {
+            panic!("raw trace log write failed: {}", e);
         }
     }
+
+    fn allocate_context(
+        &mut self,
+        parent_context_id: u32,
+        header: BlockId,
+        count: u32,
+        depth: u32,
+    ) -> u32 {
+        let context_id = self.next_context_id;
+        self.next_context_id = self
+            .next_context_id
+            .checked_add(1)
+            .expect("trace loop context id overflow");
+        if let Some(w) = self.raw_log.as_mut() {
+            if let Err(e) = w.record(
+                OP_ITER_CONTEXT,
+                context_id,
+                parent_context_id,
+                header,
+                count as i64,
+                depth,
+            ) {
+                panic!("raw trace loop-context write failed: {}", e);
+            }
+        }
+        context_id
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct StackFrame {
+    header: BlockId,
+    count: u32,
+    context_id: u32,
 }
 
 #[cfg(test)]
@@ -192,6 +241,17 @@ mod tests {
         let mut a = TraceAccumulator::new();
         a.set_loop_metadata(meta.0, meta.1, meta.2);
         a
+    }
+
+    fn stack_pairs(a: &TraceAccumulator) -> Vec<(BlockId, u32)> {
+        a.stack
+            .iter()
+            .map(|frame| (frame.header, frame.count))
+            .collect()
+    }
+
+    fn stack_contexts(a: &TraceAccumulator) -> Vec<u32> {
+        a.stack.iter().map(|frame| frame.context_id).collect()
     }
 
     /// Simple flat loop: block 1 is a loop header containing block 2.
@@ -210,14 +270,14 @@ mod tests {
         a.on_block_enter(0);
         assert!(a.stack.is_empty());
         a.on_block_enter(1);
-        assert_eq!(a.stack, vec![(1, 0)]);
+        assert_eq!(stack_pairs(&a), vec![(1, 0)]);
         a.on_block_enter(2);
-        assert_eq!(a.stack, vec![(1, 0)]);
+        assert_eq!(stack_pairs(&a), vec![(1, 0)]);
         a.on_block_enter(1); // back-edge
-        assert_eq!(a.stack, vec![(1, 1)]);
+        assert_eq!(stack_pairs(&a), vec![(1, 1)]);
         a.on_block_enter(2);
         a.on_block_enter(1); // back-edge
-        assert_eq!(a.stack, vec![(1, 2)]);
+        assert_eq!(stack_pairs(&a), vec![(1, 2)]);
         // Exit loop
         a.on_block_enter(0);
         assert!(a.stack.is_empty());
@@ -241,19 +301,23 @@ mod tests {
         let mut a = acc_with((is_h, bih, lph));
 
         a.on_block_enter(1);
-        assert_eq!(a.stack, vec![(1, 0)]);
+        assert_eq!(stack_pairs(&a), vec![(1, 0)]);
         a.on_block_enter(2);
-        assert_eq!(a.stack, vec![(1, 0), (2, 0)]);
+        assert_eq!(stack_pairs(&a), vec![(1, 0), (2, 0)]);
+        let inner_first_context = stack_contexts(&a)[1];
         a.on_block_enter(3);
         a.on_block_enter(2); // inner back-edge
-        assert_eq!(a.stack, vec![(1, 0), (2, 1)]);
+        assert_eq!(stack_pairs(&a), vec![(1, 0), (2, 1)]);
+        assert_ne!(stack_contexts(&a)[1], inner_first_context);
         a.on_block_enter(3);
         a.on_block_enter(2); // inner back-edge
-        assert_eq!(a.stack, vec![(1, 0), (2, 2)]);
+        assert_eq!(stack_pairs(&a), vec![(1, 0), (2, 2)]);
+        let inner_outer_zero_count_two_context = stack_contexts(&a)[1];
         a.on_block_enter(1); // outer back-edge → pop inner frame
-        assert_eq!(a.stack, vec![(1, 1)]);
+        assert_eq!(stack_pairs(&a), vec![(1, 1)]);
         a.on_block_enter(2);
-        assert_eq!(a.stack, vec![(1, 1), (2, 0)]);
+        assert_eq!(stack_pairs(&a), vec![(1, 1), (2, 0)]);
+        assert_ne!(stack_contexts(&a)[1], inner_outer_zero_count_two_context);
     }
 
     #[test]
@@ -263,5 +327,38 @@ mod tests {
         // No raw_log attached, just exercise bookkeeping.
         a.record(0, 42, 0, 0, OP_WRITE);
         assert_eq!(a.total, 1);
+    }
+
+    #[test]
+    fn context_defs_are_written_before_nested_value() {
+        let n = 3usize;
+        let mut is_h = vec![false; n];
+        is_h[1] = true;
+        is_h[2] = true;
+        let mut bih: Vec<Option<BlockId>> = vec![None; n];
+        bih[1] = Some(1);
+        bih[2] = Some(2);
+        let mut lph: Vec<Option<BlockId>> = vec![None; n];
+        lph[2] = Some(1);
+        let mut a = acc_with((is_h, bih, lph));
+
+        let path = std::env::temp_dir().join(format!(
+            "swoosh_trace_context_{}_{}.raw.zst",
+            std::process::id(),
+            1
+        ));
+        let mut writer = RawLogWriter::create(&path).unwrap();
+        writer
+            .write_header(&["$x".to_string()], &["b0".to_string()])
+            .unwrap();
+        a.raw_log = Some(writer);
+
+        a.on_block_enter(1);
+        a.on_block_enter(2);
+        a.record(0, 42, 7, 2, OP_WRITE);
+
+        let count = a.raw_log.take().unwrap().finish().unwrap();
+        let _ = std::fs::remove_file(path);
+        assert_eq!(count, 3);
     }
 }

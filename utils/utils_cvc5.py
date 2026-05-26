@@ -1539,16 +1539,8 @@ class HollowCvc5Term:
 
 def deserialize_state_key(state_cache, state_key):
     from src.state.proof_obligation import ProofObligation
-    from src.abduction.wp_depth import restore_or_record_wp_depth, wp_depth_of
     pc, predicate = pickle.loads(state_key)
     predicate.predicate = deserialize_cvc5_term(state_cache, predicate.predicate)
-    restore_or_record_wp_depth(
-        state_cache,
-        pc,
-        predicate,
-        default=wp_depth_of(predicate),
-        source="deserialize_state_key",
-    )
     return ProofObligation(pc, predicate)
 
 
@@ -2196,7 +2188,7 @@ def _parse_infix_expr(s, state_cache):
         ):
             tokens.append(('OP', s[i:i+2]))
             i += 2
-        elif s[i] in '+-*/%<>&^~':
+        elif s[i] in '+-*/%<>&^~!':
             tokens.append(('OP', s[i]))
             i += 1
         elif s[i] in '()[],:?':
@@ -2494,8 +2486,9 @@ def _parse_infix_expr(s, state_cache):
             # scalar width.  _match_bv_sorts will resize on sort
             # mismatch when the other operand is BV64 etc.
             return solver.mkBitVector(32, int(val))
-        elif typ == 'OP' and val == '~':
-            # Boogie-style negation: ``~(expr)``.  The operand's sort
+        elif typ == 'OP' and val in ('~', '!'):
+            # Boogie-style negation: ``~(expr)`` or ``!(expr)``.
+            # The operand's sort
             # decides whether to emit a Bool NOT or a BV NOT.
             # Predicates like ``~($i1 >= 0)`` land here with a Bool
             # operand (after fix #3 unwrapped the top-level

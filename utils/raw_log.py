@@ -4,19 +4,19 @@ On-disk layout (little-endian throughout):
 
   Header (in frame 0):
     magic         = b"SWRL"           4 bytes
-    version       = 1                 1 byte
+    version       = 2                 1 byte
     var_table_len (u32)               4 bytes
     var_table = [len:u16, bytes]*     variable
     block_table_len (u32)             4 bytes
     block_table = [len:u16, bytes]*   variable
 
   Record (repeated across all frames):
-    kind (u8)    1 byte    — b'W' write / b'R' read
-    var_id (u32) 4 bytes   — index into var_table
-    pc (u32)     4 bytes
-    block_id(u32)4 bytes   — index into block_table
+    kind (u8)    1 byte    — b'W' write / b'R' read / b'I' iter context
+    var_id (u32) 4 bytes   — var-table index, or context id for b'I'
+    pc (u32)     4 bytes   — pc, or parent context id for b'I'
+    block_id(u32)4 bytes   — block-table index, or header block id for b'I'
     value(i64)   8 bytes
-    iter_id(u32) 4 bytes
+    iter_id(u32) 4 bytes   — context id, or depth for b'I'
   = 25 bytes/record
 
 The byte stream is wrapped in one or more zstd frames, all concatenated
@@ -46,7 +46,7 @@ import zstandard as zstd
 
 
 MAGIC = b"SWRL"
-VERSION = 1
+VERSION = 2
 RECORD_SIZE = 1 + 4 + 4 + 4 + 8 + 4
 
 # Uncompressed-bytes threshold at which we close the current zstd frame

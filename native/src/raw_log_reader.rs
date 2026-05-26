@@ -207,15 +207,7 @@ pub fn load_raw_log_to_redis(path: &Path, redis_url: &str, iter_id_offset: u32) 
         let block_names = Arc::clone(&block_names);
         let c = Arc::clone(&counters);
         parser_handles.push(thread::spawn(move || {
-            parser_loop(
-                rx,
-                tx,
-                var_names,
-                block_names,
-                n_vars,
-                iter_id_offset,
-                c,
-            );
+            parser_loop(rx, tx, var_names, block_names, n_vars, iter_id_offset, c);
         }));
     }
     drop(chunk_rx);
@@ -403,7 +395,7 @@ fn parse_header_from_frame0(frame_bytes: &[u8]) -> io::Result<(Vec<String>, Vec<
     }
     let mut ver = [0u8; 1];
     reader.read_exact(&mut ver)?;
-    if ver[0] != VERSION {
+    if ver[0] != 1 && ver[0] != VERSION {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("raw log: unsupported version {}", ver[0]),
@@ -637,8 +629,17 @@ fn parser_loop(
             off += RECORD_SIZE;
             parsed_this_chunk += 1;
 
+            if kind == b'I' {
+                continue;
+            }
+            if var_id as usize >= n_vars || blk_id as usize >= block_names.len() {
+                continue;
+            }
+
             let eff_iter = if iter_id > 0 {
-                iter_id.wrapping_add(iter_id_offset)
+                iter_id
+                    .checked_add(iter_id_offset)
+                    .expect("trace iteration context id overflow")
             } else {
                 0
             };

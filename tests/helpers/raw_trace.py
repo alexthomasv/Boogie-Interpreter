@@ -14,7 +14,7 @@ def raw_trace_summary(path: Path) -> dict:
         data = reader.read()
 
     assert data[:4] == b"SWRL"
-    assert data[4] == 1
+    assert data[4] in (1, 2)
     offset = 5
     var_names, offset = _read_name_table(data, offset)
     block_names, offset = _read_name_table(data, offset)

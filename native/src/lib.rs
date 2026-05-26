@@ -577,6 +577,8 @@ fn build_trace_index_sqlite(
     out.set_item("rows", result.rows)?;
     out.set_item("records", result.records)?;
     out.set_item("raw_files", result.raw_files)?;
+    out.set_item("skipped_shadow", result.skipped_shadow)?;
+    out.set_item("contexts", result.contexts)?;
     out.set_item("source", "raw_log")?;
     out.set_item("builder", "native_sqlite_sorted_runs")?;
     Ok(out.into_py(py))

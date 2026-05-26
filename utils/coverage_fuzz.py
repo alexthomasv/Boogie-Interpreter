@@ -31,6 +31,7 @@ from interpreter.runner import prepare_native, run_native
 from interpreter.utils.inputs import Input, ProgramInputs, preprocess_external_inputs
 from interpreter.utils.input_parser import get_bpl_field_sizes
 from interpreter.utils.program import find_entry_point
+from swoosh_cli.layout import current_layout, first_existing, legacy_package_dir
 
 DEFAULT_MAX_STEPS_PER_INPUT = int(
     os.environ.get("SWOOSH_COVERAGE_FUZZ_MAX_STEPS", "100000")
@@ -416,7 +417,10 @@ class CoverageFuzzer:
             if max_steps_per_input is None else int(max_steps_per_input)
         )
 
-        self.pkg_path = Path("test_packages") / f"{name}_pkg"
+        self.pkg_path = first_existing(
+            current_layout().package_dir(name),
+            legacy_package_dir(name),
+        )
         assert self.pkg_path.is_dir(), f"Package not found: {self.pkg_path}"
 
         self.output_dir = Path("test_input") / name
