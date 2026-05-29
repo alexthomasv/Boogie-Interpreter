@@ -868,8 +868,12 @@ impl VM {
                 let val = self.eval_i64(value, program);
                 let bw = *bit_width as u8;
                 let ew = self.memory_maps[map_idx].element_bit_width;
-                if bw == ew {
-                    self.memory_maps[map_idx].set(idx_val, val);
+                if bw <= ew {
+                    // Single cell. bw == ew is the common byte store; bw < ew is a
+                    // sub-element store (e.g. $store.i1 of a bool into a byte-addressed
+                    // map) — keep it one cell, masking the value to bw bits.
+                    let v = if bw < ew { val & ((1i64 << bw) - 1) } else { val };
+                    self.memory_maps[map_idx].set(idx_val, v);
                 } else {
                     let ew_mask = self.memory_maps[map_idx].element_mask();
                     let count = bw / ew;
@@ -892,8 +896,11 @@ impl VM {
                 let idx_val = self.eval_i64(index, program);
                 let bw = *bit_width as u8;
                 let ew = self.memory_maps[map_idx].element_bit_width;
-                if bw == ew {
-                    EvalResult::Scalar(self.memory_maps[map_idx].get(idx_val))
+                if bw <= ew {
+                    // Single cell; mask to bw bits for a sub-element load ($load.i1).
+                    let raw = self.memory_maps[map_idx].get(idx_val);
+                    let v = if bw < ew { raw & ((1i64 << bw) - 1) } else { raw };
+                    EvalResult::Scalar(v)
                 } else {
                     let mut result: i64 = 0;
                     let count = bw / ew;

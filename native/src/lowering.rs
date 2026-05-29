@@ -1206,7 +1206,8 @@ fn lower_expr_impl(
             // Store functions
             if matches!(
                 f_name.as_str(),
-                "$store.i8"
+                "$store.i1"
+                    | "$store.i8"
                     | "$store.i16"
                     | "$store.i32"
                     | "$store.i64"
@@ -1228,7 +1229,7 @@ fn lower_expr_impl(
             // Load functions
             if matches!(
                 f_name.as_str(),
-                "$load.i8" | "$load.i16" | "$load.i32" | "$load.i64" | "$load.i128" | "$load.ref"
+                "$load.i1" | "$load.i8" | "$load.i16" | "$load.i32" | "$load.i64" | "$load.i128" | "$load.ref"
             ) {
                 let bw = store_load_bitwidth(&f_name);
                 let map = lower_expr_impl(py, &args_list.get_item(0)?, intern)?;
@@ -1317,6 +1318,7 @@ fn lower_expr_impl(
 /// Get bit width from store/load function name.
 fn store_load_bitwidth(name: &str) -> u8 {
     match name.rsplit('.').next().unwrap() {
+        "i1" => 1,
         "i8" => 8,
         "i16" => 16,
         "i32" => 32,
