@@ -3,8 +3,10 @@ pub type VarId = u32;
 /// Block ID — index into the VM's block array.
 pub type BlockId = u32;
 
+use serde::{Deserialize, Serialize};
+
 /// A compiled expression — tree of Rust enums, no Python objects.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Expr {
     /// Variable lookup by interned ID
     Var(VarId),
@@ -46,7 +48,7 @@ pub enum Expr {
 }
 
 /// Binary operators at the Boogie level.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BinOp {
     Eq,
     Ne,
@@ -64,7 +66,7 @@ pub enum BinOp {
 }
 
 /// All builtin functions from generate_function_map + fn_map_to_op.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BuiltinFn {
     // Arithmetic
     Add { bits: u8 },
@@ -120,7 +122,7 @@ pub enum BuiltinFn {
 }
 
 /// A compiled statement.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Stmt {
     /// `if (cond) { then_body } else { else_body }` — structured
     /// branching emitted by the diffprod corerel reify path for
@@ -228,7 +230,7 @@ pub enum Stmt {
 }
 
 /// A compiled block.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Block {
     pub name: String,
     pub id: BlockId,
@@ -243,7 +245,7 @@ pub struct Block {
 }
 
 /// Metadata for a memory map variable.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemMapInfo {
     pub name: String,
     pub var_id: VarId,
@@ -252,15 +254,17 @@ pub struct MemMapInfo {
 }
 
 /// A compiled program ready for VM execution.
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct CompiledProgram {
     /// All blocks, indexed by BlockId
     pub blocks: Vec<Block>,
-    /// Block name → BlockId
+    /// Block name → BlockId (derived; rebuilt on load via `rebuild_lookup_maps`, not serialized)
+    #[serde(skip)]
     pub label_to_block: rustc_hash::FxHashMap<String, BlockId>,
     /// Variable name list indexed by VarId
     pub var_names: Vec<String>,
-    /// Variable name → VarId (O(1) lookup)
+    /// Variable name → VarId (derived; rebuilt on load via `rebuild_lookup_maps`, not serialized)
+    #[serde(skip)]
     pub name_to_var: rustc_hash::FxHashMap<String, VarId>,
     /// Entry block ID
     pub entry_block: BlockId,
@@ -290,4 +294,32 @@ pub struct CompiledProgram {
     /// loop header, or None if it is a top-level loop.  Indexed by the
     /// header's own BlockId; entries are None for non-header blocks.
     pub loop_parent_header: Vec<Option<BlockId>>,
+    /// Compile-time-known scalar seed values `(VarId, value)`, applied at VM
+    /// init. Baked into the `.swcp` package so a concrete run is self-contained
+    /// (no Python-AST-derived `native_meta.static_scalars` needed). Empty for the
+    /// in-memory `lower()` path, which still takes static scalars via native_meta.
+    #[serde(default)]
+    pub static_scalars: Vec<(VarId, i64)>,
+}
+
+impl CompiledProgram {
+    /// Rebuild the derived lookup maps (`label_to_block`, `name_to_var`) after
+    /// deserialization, where they are `#[serde(skip)]` and arrive empty. For
+    /// duplicate block labels the *last* block wins, matching the live build in
+    /// `lowering::lower_program_full` and Python's `initialize_code_metadata`.
+    pub fn rebuild_lookup_maps(&mut self) {
+        let mut label_to_block: rustc_hash::FxHashMap<String, BlockId> =
+            rustc_hash::FxHashMap::default();
+        for b in &self.blocks {
+            label_to_block.insert(b.name.clone(), b.id);
+        }
+        self.label_to_block = label_to_block;
+
+        let mut name_to_var: rustc_hash::FxHashMap<String, VarId> =
+            rustc_hash::FxHashMap::default();
+        for (i, n) in self.var_names.iter().enumerate() {
+            name_to_var.insert(n.clone(), i as VarId);
+        }
+        self.name_to_var = name_to_var;
+    }
 }

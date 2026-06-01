@@ -393,7 +393,15 @@ def _find_havoc_vars(program):
                         name = str(getattr(ident, "name", ident))
                         if ".shadow" in name or name in seen:
                             continue
-                        if "__VERIFIER_nondet" not in name and "__SMACK_nondet" not in name:
+                        # The enclosing call is already confirmed nondet by
+                        # proc_name above. Under LLVM 12 the assignee carried
+                        # the nondet name (inline$__VERIFIER_nondet_int$...);
+                        # under LLVM 22's new pass manager it is a plain SSA
+                        # temp ($i12). Accept both so uninitialized-variable
+                        # nondets remain seedable via int_seq.
+                        if not (re.match(r"\$i\d+$", name)
+                                or "__VERIFIER_nondet" in name
+                                or "__SMACK_nondet" in name):
                             continue
                         seen.add(name)
                         names.append(name)

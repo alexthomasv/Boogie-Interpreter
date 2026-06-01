@@ -3,10 +3,23 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyTuple};
 use rustc_hash::FxHashMap;
 
+pub(crate) mod inline;
+
+/// An active inlining frame. While lowering an inlined callee's body, its
+/// local/param/return names are renamed with `prefix` (e.g. `inline$Q$3$`) so
+/// each inline instance gets fresh, collision-free variables. Globals (names
+/// not in `locals`) pass through untouched, keeping observable state shared.
+pub struct Frame {
+    pub prefix: String,
+    pub locals: rustc_hash::FxHashSet<String>,
+}
+
 /// Intern table: variable name → VarId
 pub struct InternTable {
     pub map: FxHashMap<String, VarId>,
     names: Vec<String>,
+    /// Active inlining frame (None at top level / the non-inlining lowering path).
+    frame: Option<Frame>,
 }
 
 impl InternTable {
@@ -14,10 +27,27 @@ impl InternTable {
         Self {
             map: FxHashMap::default(),
             names: Vec::new(),
+            frame: None,
         }
     }
 
+    /// Intern a variable name, applying the active inlining frame: a name that
+    /// is a callee-local under the current frame is renamed with the instance
+    /// prefix before interning. Globals (and the top-level path) pass through.
     pub fn intern(&mut self, name: &str) -> VarId {
+        let renamed: Option<String> = match &self.frame {
+            Some(f) if f.locals.contains(name) => Some(format!("{}{}", f.prefix, name)),
+            _ => None,
+        };
+        match renamed {
+            Some(r) => self.intern_raw(&r),
+            None => self.intern_raw(name),
+        }
+    }
+
+    /// Intern a name verbatim, bypassing the active frame (used by the inliner
+    /// when it already holds a fully-resolved, prefixed name).
+    pub fn intern_raw(&mut self, name: &str) -> VarId {
         if let Some(&id) = self.map.get(name) {
             return id;
         }
@@ -25,6 +55,28 @@ impl InternTable {
         self.names.push(name.to_string());
         self.map.insert(name.to_string(), id);
         id
+    }
+
+    /// Apply the active frame's prefix to a block label (a callee's own labels
+    /// are renamed per instance). Identity at the top level.
+    pub fn apply_label(&self, name: &str) -> String {
+        match &self.frame {
+            Some(f) => format!("{}{}", f.prefix, name),
+            None => name.to_string(),
+        }
+    }
+
+    /// Install `frame` as the active inlining frame, returning the previous one
+    /// so the caller can restore it after lowering the callee body.
+    pub fn set_frame(&mut self, frame: Option<Frame>) -> Option<Frame> {
+        std::mem::replace(&mut self.frame, frame)
+    }
+
+    /// The active frame's prefix (e.g. `inline$$memcpy.i8.cross_product$3$`), or
+    /// None at top level. Used to classify a callee's quantified assumes whose
+    /// own variable names (M.ret/dst/len) don't carry the proc name pre-inline.
+    pub fn frame_prefix(&self) -> Option<&str> {
+        self.frame.as_ref().map(|f| f.prefix.as_str())
     }
 
     pub fn get(&self, name: &str) -> Option<VarId> {
@@ -476,6 +528,7 @@ pub fn lower_program_full(
         is_loop_header,
         block_innermost_header,
         loop_parent_header,
+        static_scalars: Vec::new(),
     })
 }
 
@@ -645,6 +698,31 @@ fn lower_while(
 }
 
 
+/// Lower one then/else body item. The diffprod-reified `IfStatement` shape has
+/// `.blocks` = a flat list of Statements; the shadowing-constructed shape (e.g.
+/// `$$alloc.cross_product`) wraps the body in a single `Block`. Handle both:
+/// a `Block` item is unwrapped to its statements. (Boogie desugars the latter
+/// during inlining, so the post-inline lowering path never hits it — but the
+/// native inliner works on the un-inlined program, which still has it.)
+fn lower_body_item(
+    py: Python<'_>,
+    item: &Bound<'_, PyAny>,
+    intern: &mut InternTable,
+    label_map: &FxHashMap<String, BlockId>,
+    out: &mut Vec<Stmt>,
+) -> PyResult<()> {
+    if item.get_type().name()? == "Block" {
+        let stmts = item.getattr("statements")?;
+        let stmts: &Bound<'_, PyList> = stmts.downcast()?;
+        for s in stmts.iter() {
+            out.push(lower_stmt(py, &s, intern, label_map)?);
+        }
+    } else {
+        out.push(lower_stmt(py, item, intern, label_map)?);
+    }
+    Ok(())
+}
+
 /// Lower a Python `IfStatement` to `Stmt::If`.
 ///
 /// The Boogie parser produces:
@@ -668,7 +746,7 @@ fn lower_if(
     let then_py: &Bound<'_, PyList> = then_attr.downcast()?;
     let mut then_body: Vec<Stmt> = Vec::with_capacity(then_py.len());
     for item in then_py.iter() {
-        then_body.push(lower_stmt(py, &item, intern, label_map)?);
+        lower_body_item(py, &item, intern, label_map, &mut then_body)?;
     }
 
     let else_attr = stmt.getattr("else_")?;
@@ -684,7 +762,7 @@ fn lower_if(
             let else_py: &Bound<'_, PyList> = else_attr.downcast()?;
             let mut acc: Vec<Stmt> = Vec::with_capacity(else_py.len());
             for item in else_py.iter() {
-                acc.push(lower_stmt(py, &item, intern, label_map)?);
+                lower_body_item(py, &item, intern, label_map, &mut acc)?;
             }
             acc
         }
@@ -905,8 +983,12 @@ fn lower_quantified_assume(
         var_names.push((name, var_id));
     }
 
-    let is_memset = var_names.iter().any(|(n, _)| n.contains("memset"));
-    let is_memcpy = var_names.iter().any(|(n, _)| n.contains("memcpy"));
+    // Classify by the inlining frame prefix too: pre-inline, a callee's own
+    // quantifier vars (M.ret/dst/len) don't carry "memset"/"memcpy" — only the
+    // enclosing proc name does (e.g. inline$$memcpy.i8.cross_product$N$).
+    let frame_pfx: String = intern.frame_prefix().unwrap_or("").to_string();
+    let is_memset = frame_pfx.contains("memset") || var_names.iter().any(|(n, _)| n.contains("memset"));
+    let is_memcpy = frame_pfx.contains("memcpy") || var_names.iter().any(|(n, _)| n.contains("memcpy"));
 
     if is_memset {
         lower_memset_assume(py, &expression, &op, &var_names, intern, q_expr)
@@ -1098,9 +1180,23 @@ fn lower_memcpy_assume(
 }
 
 /// Find a variable by suffix match in a slice of (name, var_id) tuples.
+/// Match a variable name against a memset/memcpy operand suffix. Handles both
+/// the post-inline shape (Boogie-renamed `inline$…$M.ret`, matched by the `$`-led
+/// suffix `$M.ret`) and the pre-inline shape (bare `M.ret`, which the native
+/// inliner sees). The `$`/bare distinction is what keeps `$dst` from matching
+/// `M.dst`, so we match the bare *core* by EQUALITY, not a loose `ends_with`.
+fn suffix_matches(name: &str, suffix: &str) -> bool {
+    let core = suffix.strip_prefix('$').unwrap_or(suffix);
+    let core_shadow = format!("{}.shadow", core);
+    name.ends_with(suffix)
+        || name.ends_with(&format!("{}.shadow", suffix))
+        || name == core
+        || name == core_shadow.as_str()
+}
+
 fn find_var_by_suffix_slice(vars: &[(String, VarId)], suffix: &str) -> VarId {
     for (name, var_id) in vars {
-        if name.ends_with(suffix) || name.ends_with(&format!("{}.shadow", suffix)) {
+        if suffix_matches(name, suffix) {
             return *var_id;
         }
     }
@@ -1110,7 +1206,7 @@ fn find_var_by_suffix_slice(vars: &[(String, VarId)], suffix: &str) -> VarId {
 /// Find a variable by suffix match in a Vec of references.
 fn find_var_by_suffix_ref(vars: &[&(String, VarId)], suffix: &str) -> VarId {
     for (name, var_id) in vars {
-        if name.ends_with(suffix) || name.ends_with(&format!("{}.shadow", suffix)) {
+        if suffix_matches(name, suffix) {
             return *var_id;
         }
     }
@@ -1120,7 +1216,7 @@ fn find_var_by_suffix_ref(vars: &[&(String, VarId)], suffix: &str) -> VarId {
 fn find_var_by_suffix_either_ref(vars: &[&(String, VarId)], suffixes: &[&str]) -> VarId {
     for (name, var_id) in vars {
         for suffix in suffixes {
-            if name.ends_with(suffix) || name.ends_with(&format!("{}.shadow", suffix)) {
+            if suffix_matches(name, suffix) {
                 return *var_id;
             }
         }

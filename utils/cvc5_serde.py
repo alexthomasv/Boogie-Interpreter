@@ -50,6 +50,62 @@ _SERDE_STATS = {
     "canonical_ms": 0.0,
 }
 
+_MSGPACK_MIN_INT = -(1 << 63)
+_MSGPACK_MAX_UINT = (1 << 64) - 1
+_MSGPACK_BIGINT_EXT_CODE = 42
+
+
+def _msgpack_bigint_ext_hook(code: int, data: bytes):
+    if code != _MSGPACK_BIGINT_EXT_CODE:
+        return msgpack.ExtType(code, data)
+    try:
+        return int(data.decode("ascii"))
+    except Exception as exc:
+        raise Cvc5SerdeError("invalid cvc5 serde bigint extension") from exc
+
+
+def _msgpack_safe_obj(value):
+    """Convert Python ints outside msgpack's native range into ext payloads."""
+    if isinstance(value, bool) or value is None:
+        return value
+    if isinstance(value, int):
+        if _MSGPACK_MIN_INT <= value <= _MSGPACK_MAX_UINT:
+            return value
+        return msgpack.ExtType(_MSGPACK_BIGINT_EXT_CODE,
+                               str(value).encode("ascii"))
+    if isinstance(value, tuple):
+        return tuple(_msgpack_safe_obj(item) for item in value)
+    if isinstance(value, list):
+        return [_msgpack_safe_obj(item) for item in value]
+    if isinstance(value, dict):
+        return {
+            _msgpack_safe_obj(key): _msgpack_safe_obj(item)
+            for key, item in value.items()
+        }
+    return value
+
+
+def _pack_msgpack_obj(value, *, context: str) -> bytes:
+    try:
+        return msgpack.packb(_msgpack_safe_obj(value), use_bin_type=True)
+    except Cvc5SerdeError:
+        raise
+    except Exception as exc:
+        raise Cvc5SerdeError(
+            f"failed to msgpack-encode cvc5 serde payload: {context}"
+        ) from exc
+
+
+def _unpack_msgpack_obj(data: bytes, *, context: str):
+    try:
+        return msgpack.unpackb(data, raw=False, ext_hook=_msgpack_bigint_ext_hook)
+    except Cvc5SerdeError:
+        raise
+    except Exception as exc:
+        raise Cvc5SerdeError(
+            f"failed to msgpack-decode cvc5 serde payload: {context}"
+        ) from exc
+
 
 def reset_serde_stats() -> None:
     """Reset process-local cvc5 serialization counters."""
@@ -314,13 +370,19 @@ class SerializedCvc5TermV2:
         return (self.version, self.root, tuple(node.to_obj() for node in self.nodes))
 
     def to_bytes(self) -> bytes:
-        return msgpack.packb(self.to_obj(), use_bin_type=True)
+        return _pack_msgpack_obj(
+            self.to_obj(),
+            context=f"term bytes root={self.root} nodes={len(self.nodes)}",
+        )
 
     def exact_fingerprint(self) -> str:
         return hashlib.sha256(self.to_bytes()).hexdigest()
 
     def canonical_bytes(self) -> bytes:
-        return msgpack.packb(_canonical_node_obj(self, self.root), use_bin_type=True)
+        return _pack_msgpack_obj(
+            _canonical_node_obj(self, self.root),
+            context=f"canonical term bytes root={self.root} nodes={len(self.nodes)}",
+        )
 
     def canonical_fingerprint(self) -> str:
         return hashlib.sha256(self.canonical_bytes()).hexdigest()
@@ -504,7 +566,14 @@ def _subterm_cache_keys(root_term: SerializedCvc5TermV2):
             node.symbol,
             tuple(digests[child] for child in node.children),
         )
-        digest = hashlib.sha256(msgpack.packb(payload, use_bin_type=True)).hexdigest()
+        packed = _pack_msgpack_obj(
+            payload,
+            context=(
+                f"subterm cache key idx={idx} kind={node.kind} "
+                f"sort={node.sort} value={node.value!r}"
+            ),
+        )
+        digest = hashlib.sha256(packed).hexdigest()
         digests[idx] = digest
         keys[idx] = ("hollow-v2-subterm", digest)
     return keys
@@ -590,7 +659,13 @@ def deserialize_cvc5_term(state_cache, root_term: SerializedCvc5TermV2 | Term) -
     _SERDE_STATS["deserialize_nodes"] += len(root_term.nodes)
     t0 = time.perf_counter()
     global_cache = _ensure_term_cache(state_cache)
-    cache_keys = _subterm_cache_keys(root_term)
+    try:
+        cache_keys = _subterm_cache_keys(root_term)
+    except Cvc5SerdeError as exc:
+        raise Cvc5SerdeError(
+            "failed to compute cvc5 deserialize cache keys "
+            f"root={root_term.root} nodes={len(root_term.nodes)}"
+        ) from exc
     root_cache_key = cache_keys[root_term.root]
     if root_cache_key in global_cache:
         _SERDE_STATS["deserialize_cache_hits"] += 1
@@ -818,7 +893,10 @@ def classify_hollow(predicate) -> str:
 
 
 def term_from_bytes(data: bytes) -> SerializedCvc5TermV2:
-    version, root, raw_nodes = msgpack.unpackb(data, raw=False)
+    version, root, raw_nodes = _unpack_msgpack_obj(
+        data,
+        context="serialized cvc5 term bytes",
+    )
     nodes = []
     for kind, sort_obj, op_indices, value, symbol, children in raw_nodes:
         nodes.append(

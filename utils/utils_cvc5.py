@@ -2270,9 +2270,55 @@ def _parse_infix_expr(s, state_cache):
         expression is Int-theory — ``$u0 * -1`` must multiply by -1,
         not by 2**32 - 1.
         """
+        def _fold_const_bv_expr(term):
+            try:
+                if not term.getSort().isBitVector():
+                    return None
+                width = term.getSort().getBitVectorSize()
+                modulus = 1 << width
+                if term.isBitVectorValue():
+                    return int(term.getBitVectorValue(10)) % modulus
+                kind = term.getKind()
+                if kind in {
+                        Kind.BITVECTOR_ADD,
+                        Kind.BITVECTOR_SUB,
+                        Kind.BITVECTOR_MULT}:
+                    values = [
+                        _fold_const_bv_expr(term[i])
+                        for i in range(term.getNumChildren())
+                    ]
+                    if any(v is None for v in values):
+                        return None
+                    acc = int(values[0])
+                    for value in values[1:]:
+                        if kind == Kind.BITVECTOR_ADD:
+                            acc += int(value)
+                        elif kind == Kind.BITVECTOR_SUB:
+                            acc -= int(value)
+                        else:
+                            acc *= int(value)
+                    return acc % modulus
+                if kind == Kind.BITVECTOR_NEG and term.getNumChildren() == 1:
+                    value = _fold_const_bv_expr(term[0])
+                    if value is None:
+                        return None
+                    return (-int(value)) % modulus
+            except Exception:
+                return None
+            return None
+
         try:
             if t.getSort().isInteger():
                 return t
+            if t.getSort().isBoolean():
+                return solver.mkTerm(
+                    Kind.ITE, t, solver.mkInteger(1), solver.mkInteger(0))
+            folded = _fold_const_bv_expr(t)
+            if folded is not None:
+                width = t.getSort().getBitVectorSize()
+                if folded >= (1 << (width - 1)):
+                    folded -= (1 << width)
+                return solver.mkInteger(folded)
             if t.isBitVectorValue():
                 width = t.getSort().getBitVectorSize()
                 raw_val = int(t.getBitVectorValue(10))
@@ -2281,6 +2327,16 @@ def _parse_infix_expr(s, state_cache):
                 if raw_val >= (1 << (width - 1)):
                     raw_val -= (1 << width)
                 return solver.mkInteger(raw_val)
+            if (t.getKind() == Kind.ITE
+                    and t.getNumChildren() == 3
+                    and t[0].getSort().isBoolean()
+                    and t[1].isBitVectorValue()
+                    and t[2].isBitVectorValue()):
+                return solver.mkTerm(
+                    Kind.ITE,
+                    t[0],
+                    _coerce_to_int(t[1]),
+                    _coerce_to_int(t[2]))
         except Exception:
             pass
         return t

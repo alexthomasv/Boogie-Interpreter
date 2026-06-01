@@ -45,6 +45,56 @@ pub(crate) struct CompiledProgramWrapper {
     pub(crate) inner: opcodes::CompiledProgram,
 }
 
+/// Inline `{:inline}` procedures and lower straight to bytecode, returning the
+/// opaque CompiledProgram handle. Like `lower`, but the input is the *un-inlined*
+/// shadowed AST — inlining happens natively in Rust (no Boogie, no reparse).
+/// Used by the differential test harness and the in-memory interpret path.
+#[pyfunction]
+fn inline_lower(py: Python<'_>, program: &Bound<'_, PyAny>) -> PyResult<PyObject> {
+    let compiled = lowering::inline::inline_lower_program(py, program, None)?;
+    let wrapper = CompiledProgramWrapper { inner: compiled };
+    Ok(Py::new(py, wrapper)?.into_py(py))
+}
+
+/// Inline + lower + serialize (bincode, zstd-compressed) to `path` as a `.swcp`
+/// bytecode package — the compact, Python-AST-free artifact the interpreter
+/// loads directly via `load_compiled`. `static_scalars` (name→value, computed in
+/// Python from the un-inlined program) is baked in so a concrete run needs no
+/// Python-AST-derived native_meta.
+#[pyfunction]
+#[pyo3(signature = (program, path, static_scalars=None))]
+fn inline_lower_to_file(
+    py: Python<'_>,
+    program: &Bound<'_, PyAny>,
+    path: &str,
+    static_scalars: Option<&Bound<'_, PyDict>>,
+) -> PyResult<()> {
+    let compiled = lowering::inline::inline_lower_program(py, program, static_scalars)?;
+    let bytes = bincode::serialize(&compiled)
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("bincode serialize: {}", e)))?;
+    let compressed = zstd::encode_all(&bytes[..], 3)
+        .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("zstd compress: {}", e)))?;
+    std::fs::write(path, compressed)
+        .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("write {}: {}", path, e)))?;
+    Ok(())
+}
+
+/// Load a `.swcp` bytecode package (zstd + bincode), rebuild the derived lookup
+/// maps, and return the opaque CompiledProgram handle for `execute`.
+#[pyfunction]
+fn load_compiled(py: Python<'_>, path: &str) -> PyResult<PyObject> {
+    let compressed = std::fs::read(path)
+        .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("read {}: {}", path, e)))?;
+    let bytes = zstd::decode_all(&compressed[..])
+        .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("zstd decompress: {}", e)))?;
+    let mut compiled: opcodes::CompiledProgram = bincode::deserialize(&bytes).map_err(|e| {
+        pyo3::exceptions::PyValueError::new_err(format!("bincode deserialize: {}", e))
+    })?;
+    compiled.rebuild_lookup_maps();
+    let wrapper = CompiledProgramWrapper { inner: compiled };
+    Ok(Py::new(py, wrapper)?.into_py(py))
+}
+
 const FNV64_OFFSET: u64 = 0xcbf29ce484222325;
 const FNV64_PRIME: u64 = 0x100000001b3;
 
@@ -78,6 +128,22 @@ fn memory_summary<'py>(py: Python<'py>, vm: &vm::VM) -> PyResult<Bound<'py, PyDi
         summary.set_item("index_bit_width", map.index_bit_width)?;
         summary.set_item("element_bit_width", map.element_bit_width)?;
         out.set_item(map.name.as_str(), summary)?;
+    }
+    Ok(out)
+}
+
+/// Full sparse contents of every memory map as `{map_name: {addr: value}}`.
+/// Unlike `memory_summary` (which only hashes/bounds), this exposes raw bytes
+/// so callers can read specific addresses (e.g. an output buffer) back out.
+/// Opt-in (`return_raw_memory`) because it can be large for big runs.
+fn raw_memory<'py>(py: Python<'py>, vm: &vm::VM) -> PyResult<Bound<'py, PyDict>> {
+    let out = PyDict::new_bound(py);
+    for map in &vm.memory_maps {
+        let m = PyDict::new_bound(py);
+        for (addr, value) in &map.memory {
+            m.set_item(*addr, *value)?;
+        }
+        out.set_item(map.name.as_str(), m)?;
     }
     Ok(out)
 }
@@ -136,6 +202,7 @@ fn finish_vm_result(
     exec_elapsed: Duration,
     return_memory_summary: bool,
     return_scalar_summary: bool,
+    return_raw_memory: bool,
     quiet: bool,
 ) -> PyResult<PyObject> {
     let result = PyDict::new_bound(py);
@@ -211,6 +278,9 @@ fn finish_vm_result(
     if return_scalar_summary {
         result.set_item("final_scalars", scalar_summary(py, program, vm)?)?;
     }
+    if return_raw_memory {
+        result.set_item("memory_raw", raw_memory(py, vm)?)?;
+    }
     result.set_item("external_consumed", vm.external_buffer_pos)?;
     result.set_item("exec_ns", exec_elapsed.as_nanos() as u64)?;
     result.set_item("exec_ms", exec_elapsed.as_secs_f64() * 1000.0)?;
@@ -261,7 +331,7 @@ fn finish_vm_result(
 ///
 /// Returns dict with 'explored_blocks' and 'trace_records' (count).
 #[pyfunction]
-#[pyo3(signature = (compiled, var_store, memory_maps, mem_map_info, raw_log_path, extra_data=None, log_read=true, no_trace=false, havoc_sequences=None, return_memory_summary=true, quiet=true, max_steps=0, return_scalar_summary=false))]
+#[pyo3(signature = (compiled, var_store, memory_maps, mem_map_info, raw_log_path, extra_data=None, log_read=true, no_trace=false, havoc_sequences=None, return_memory_summary=true, quiet=true, max_steps=0, return_scalar_summary=false, return_raw_memory=false))]
 fn execute(
     py: Python<'_>,
     compiled: &Bound<'_, PyAny>,
@@ -277,6 +347,7 @@ fn execute(
     quiet: bool,
     max_steps: usize,
     return_scalar_summary: bool,
+    return_raw_memory: bool,
 ) -> PyResult<PyObject> {
     let wrapper: PyRef<'_, CompiledProgramWrapper> = compiled.extract()?;
     let program = &wrapper.inner;
@@ -372,6 +443,7 @@ fn execute(
         exec_elapsed,
         return_memory_summary,
         return_scalar_summary,
+        return_raw_memory,
         quiet,
     )
 }
@@ -382,7 +454,7 @@ fn execute(
 /// PyO3 AST lowering and removes per-input Environment construction and dict
 /// handoff.
 #[pyfunction]
-#[pyo3(signature = (compiled, native_meta, program_inputs, raw_log_path, extra_data=None, log_read=true, no_trace=false, return_memory_summary=true, quiet=true, max_steps=0, return_scalar_summary=false))]
+#[pyo3(signature = (compiled, native_meta, program_inputs, raw_log_path, extra_data=None, log_read=true, no_trace=false, return_memory_summary=true, quiet=true, max_steps=0, return_scalar_summary=false, return_raw_memory=false))]
 fn execute_inputs(
     py: Python<'_>,
     compiled: &Bound<'_, PyAny>,
@@ -396,6 +468,7 @@ fn execute_inputs(
     quiet: bool,
     max_steps: usize,
     return_scalar_summary: bool,
+    return_raw_memory: bool,
 ) -> PyResult<PyObject> {
     let wrapper: PyRef<'_, CompiledProgramWrapper> = compiled.extract()?;
     let program = &wrapper.inner;
@@ -453,6 +526,7 @@ fn execute_inputs(
         exec_elapsed,
         return_memory_summary,
         return_scalar_summary,
+        return_raw_memory,
         quiet,
     )?;
     let result_dict = result.bind(py).downcast::<PyDict>()?;
@@ -587,6 +661,9 @@ fn build_trace_index_sqlite(
 #[pymodule]
 fn swoosh_interp(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(lower, m)?)?;
+    m.add_function(wrap_pyfunction!(inline_lower, m)?)?;
+    m.add_function(wrap_pyfunction!(inline_lower_to_file, m)?)?;
+    m.add_function(wrap_pyfunction!(load_compiled, m)?)?;
     m.add_function(wrap_pyfunction!(execute, m)?)?;
     m.add_function(wrap_pyfunction!(execute_inputs, m)?)?;
     m.add_function(wrap_pyfunction!(prepare_symbolic_inputs, m)?)?;

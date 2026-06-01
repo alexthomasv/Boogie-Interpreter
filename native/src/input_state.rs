@@ -37,6 +37,11 @@ pub fn initialize_vm_from_inputs(
 ) -> PyResult<()> {
     init_memory_maps(program, vm);
     load_static_scalars(program, vm, native_meta)?;
+    // Seed scalars baked into the package (the self-contained `.swcp` path).
+    // Empty for the in-memory `lower()` path, which seeds via native_meta above.
+    for &(vid, value) in &program.static_scalars {
+        vm.set_scalar(vid, value, true);
+    }
 
     if let Some(data) = extra_data.or_else(|| extract_extra_data(program_inputs).ok().flatten()) {
         vm.external_buffer = data;

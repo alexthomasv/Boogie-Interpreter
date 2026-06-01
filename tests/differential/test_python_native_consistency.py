@@ -171,4 +171,4 @@ def test_native_no_trace_fast_options_skip_files_and_memory_summary(tmp_path):
     assert result["init_ms"] == 0.0
     assert result["memory_summary"] == {}
     assert not (tmp_path / "mem_ops_traces").exists()
-    assert not (tmp_path / "positive_examples").exists()
+    assert not (tmp_path / "target" / "swoosh" / "traces").exists()

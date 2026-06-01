@@ -563,7 +563,8 @@ def run_native(program, program_inputs, test_name, input_name, raw_log_path,
                init_raw_log_path=None, return_status=False,
                debug_logger=None, prepared=None,
                return_memory_summary=True, validate_handoff=True,
-               quiet=True, max_steps=0, return_scalar_summary=False):
+               quiet=True, max_steps=0, return_scalar_summary=False,
+               return_raw_memory=False):
     """Run the Rust native interpreter.
 
     ``raw_log_path`` is the ``.trace.raw.zst`` the Rust VM writes its
@@ -629,14 +630,16 @@ def run_native(program, program_inputs, test_name, input_name, raw_log_path,
                 quiet=quiet,
                 max_steps=max_steps,
                 return_scalar_summary=return_scalar_summary,
+                return_raw_memory=return_raw_memory,
             )
         except TypeError as exc:
-            if "return_scalar_summary" not in str(exc):
+            msg = str(exc)
+            if "return_scalar_summary" not in msg and "return_raw_memory" not in msg:
                 raise
-            if return_scalar_summary:
+            if return_scalar_summary or return_raw_memory:
                 raise RuntimeError(
                     "Installed Rust native module is too old for "
-                    "return_scalar_summary. Rebuild with: "
+                    "return_scalar_summary/return_raw_memory. Rebuild with: "
                     "cd interpreter/native && maturin develop --release"
                 ) from exc
             result = swoosh_interp.execute_inputs(

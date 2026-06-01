@@ -14,6 +14,8 @@ from pathlib import Path
 
 import pytest
 
+from swoosh_cli.layout import current_layout
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 BEARSSL_DIR = PROJECT_ROOT / "examples" / "bearssl"
 BEARSSL_SRC = BEARSSL_DIR / "src"
@@ -260,7 +262,7 @@ def _run_interpreter_subprocess(pkg_name):
     if not pkg_dir.exists():
         return None
 
-    trace_dir = Path(f"positive_examples/{pkg_name}")
+    trace_dir = current_layout().trace_dir(pkg_name)
     compact_files = list(trace_dir.glob("*.trace.raw.zst")) if trace_dir.exists() else []
     if compact_files:
         # Already have traces, no need to re-run
@@ -326,7 +328,7 @@ class TestPkcsI15Interpreter:
             f"Interpreter should produce a raw trace (rc={result.get('returncode')})"
 
     def test_raw_trace_has_data(self):
-        trace_dir = Path("positive_examples/bearssl_test_pkcs1_i15")
+        trace_dir = current_layout().trace_dir("bearssl_test_pkcs1_i15")
         trace_files = list(trace_dir.glob("*.trace.raw.zst")) if trace_dir.exists() else []
         if not trace_files:
             pytest.skip("No raw trace available")
