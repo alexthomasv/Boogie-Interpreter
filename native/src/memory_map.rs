@@ -1,6 +1,6 @@
 use rustc_hash::FxHashMap;
 
-/// Sparse memory map — same semantics as Python MemoryMap.
+/// Sparse memory map used by the Rust VM.
 /// Uninitialized addresses return 0.
 #[derive(Debug, Clone)]
 pub struct MemoryMap {

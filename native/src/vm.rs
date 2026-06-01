@@ -2,7 +2,7 @@ use crate::builtins;
 use crate::memory_map::MemoryMap;
 use crate::opcodes::*;
 use crate::trace::{TraceAccumulator, OP_READ, OP_WRITE};
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashSet;
 
 const MASK_64: i64 = -1i64; // all bits set = u64::MAX as i64
 
@@ -19,8 +19,19 @@ pub enum Value {
 #[derive(Debug, Clone)]
 pub enum ExecutionStatus {
     Completed,
-    AssertViolation { pc: u32, block: String },
-    AssumeViolation { pc: u32, block: String },
+    AssertViolation {
+        pc: u32,
+        block: String,
+    },
+    AssumeViolation {
+        pc: u32,
+        block: String,
+        reason: &'static str,
+    },
+    StepLimit {
+        pc: u32,
+        block: String,
+    },
 }
 
 /// The virtual machine that executes compiled Boogie programs.
@@ -30,8 +41,6 @@ pub struct VM {
     pub vars: Vec<Value>,
     /// Variable names for trace output
     pub var_names: Vec<String>,
-    /// Is this variable a shadow? (precomputed)
-    pub is_shadow: Vec<bool>,
     /// Memory maps, indexed by map_index in Value::Map
     pub memory_maps: Vec<MemoryMap>,
     /// Which VarId is a memory map? VarId → Some(map_index)
@@ -42,10 +51,10 @@ pub struct VM {
     pub curr_block: String,
     /// Current block ID (for trace — avoids string allocation)
     pub curr_block_id: u32,
-    /// Previous block name
-    pub last_block: String,
-    /// Explored block names
-    pub explored_blocks: FxHashSet<String>,
+    /// Explored block IDs. Names are materialized only at the Python boundary.
+    pub explored_blocks: FxHashSet<BlockId>,
+    /// Ordered block entries for lightweight path/edge coverage.
+    pub block_trace: Vec<BlockId>,
     /// Compact trace accumulator
     pub trace: TraceAccumulator,
     /// Whether to log reads
@@ -68,36 +77,45 @@ pub struct VM {
     pub m0_id: Option<VarId>,
     pub m0_shadow_id: Option<VarId>,
     /// Per-variable nondet schedules loaded from .input int_seq entries.
-    pub havoc_sequences: FxHashMap<VarId, Vec<i64>>,
-    pub havoc_counts: FxHashMap<VarId, usize>,
+    pub havoc_sequences: Vec<Option<Vec<i64>>>,
+    pub havoc_counts: Vec<usize>,
 }
 
 impl VM {
     pub fn new(program: &CompiledProgram) -> Self {
+        Self::new_with_trace(program, true)
+    }
+
+    pub fn new_no_trace(program: &CompiledProgram) -> Self {
+        Self::new_with_trace(program, false)
+    }
+
+    fn new_with_trace(program: &CompiledProgram, trace_enabled: bool) -> Self {
         let n = program.num_vars as usize;
         let vars = vec![Value::Scalar(0); n];
         let var_to_map = vec![None; n];
         let mut trace = TraceAccumulator::new();
-        // Install loop metadata so packed iter_id emission works.  The
-        // vectors are parallel to `program.blocks` and already include
-        // the non-loop defaults (all false / None) when the compile
-        // pipeline didn't pass metadata.
-        trace.set_loop_metadata(
-            program.is_loop_header.clone(),
-            program.block_innermost_header.clone(),
-            program.loop_parent_header.clone(),
-        );
+        if trace_enabled {
+            // Install loop metadata so packed iter_id emission works.  The
+            // vectors are parallel to `program.blocks` and already include
+            // the non-loop defaults (all false / None) when the compile
+            // pipeline didn't pass metadata.
+            trace.set_loop_metadata(
+                program.is_loop_header.clone(),
+                program.block_innermost_header.clone(),
+                program.loop_parent_header.clone(),
+            );
+        }
         Self {
             vars,
             var_names: program.var_names.clone(),
-            is_shadow: program.is_shadow.clone(),
             memory_maps: Vec::new(),
             var_to_map,
             pc: 0,
             curr_block: String::new(),
             curr_block_id: 0,
-            last_block: String::new(),
             explored_blocks: FxHashSet::default(),
+            block_trace: Vec::new(),
             trace,
             log_read: true,
             alloc_addr: 0,
@@ -110,26 +128,52 @@ impl VM {
             external_buffer_pos: 0,
             m0_id: program.m0_id,
             m0_shadow_id: program.m0_shadow_id,
-            no_trace: false,
-            havoc_sequences: FxHashMap::default(),
-            havoc_counts: FxHashMap::default(),
+            no_trace: !trace_enabled,
+            havoc_sequences: vec![None; n],
+            havoc_counts: vec![0; n],
         }
     }
 
     pub fn set_havoc_sequence(&mut self, var_id: VarId, seq: Vec<i64>) {
-        self.havoc_sequences.insert(var_id, seq);
-        self.havoc_counts.insert(var_id, 0);
+        let vid = var_id as usize;
+        if vid >= self.havoc_sequences.len() {
+            return;
+        }
+        self.havoc_sequences[vid] = Some(seq);
+        self.havoc_counts[vid] = 0;
+    }
+
+    #[inline]
+    pub fn havoc_count(&self, var_id: VarId) -> usize {
+        self.havoc_counts.get(var_id as usize).copied().unwrap_or(0)
+    }
+
+    pub fn set_havoc_value_at(&mut self, var_id: VarId, idx: usize, value: i64) {
+        let vid = var_id as usize;
+        if vid >= self.havoc_sequences.len() {
+            return;
+        }
+        let seq = self.havoc_sequences[vid].get_or_insert_with(Vec::new);
+        if seq.len() <= idx {
+            seq.resize(idx + 1, 0);
+        }
+        seq[idx] = value;
+        self.havoc_counts[vid] = 0;
     }
 
     #[inline]
     pub fn next_havoc_value(&mut self, var_id: VarId) -> i64 {
-        let count = *self.havoc_counts.get(&var_id).unwrap_or(&0);
+        let vid = var_id as usize;
+        let Some(count) = self.havoc_counts.get_mut(vid) else {
+            return 0;
+        };
         let value = self
             .havoc_sequences
-            .get(&var_id)
-            .and_then(|seq| seq.get(count).copied())
+            .get(vid)
+            .and_then(|seq| seq.as_ref())
+            .and_then(|seq| seq.get(*count).copied())
             .unwrap_or(0);
-        self.havoc_counts.insert(var_id, count + 1);
+        *count += 1;
         value
     }
 
@@ -152,7 +196,7 @@ impl VM {
         } else if Some(var_id) == self.curr_addr_shadow_id {
             self.alloc_addr_shadow = value;
         }
-        if !self.no_trace && !silent && !self.is_shadow[vid] {
+        if !self.no_trace && !silent {
             self.trace
                 .record(var_id, value, self.pc, self.curr_block_id, OP_WRITE);
         }
@@ -166,7 +210,7 @@ impl VM {
         match &self.vars[vid] {
             Value::Scalar(v) => {
                 let v = *v;
-                if !self.no_trace && self.log_read && !self.is_shadow[vid] {
+                if !self.no_trace && self.log_read {
                     self.trace
                         .record(var_id, v, self.pc, self.curr_block_id, OP_READ);
                 }
@@ -221,25 +265,101 @@ impl VM {
         self.external_buffer[start..end].to_vec()
     }
 
+    fn memmove_i8_maps(&mut self, dst: i64, dst_shadow: i64, src: i64, src_shadow: i64, len: i64) {
+        if len <= 0 {
+            return;
+        }
+        for map_idx in 0..self.memory_maps.len() {
+            if self.memory_maps[map_idx].element_bit_width != 8 {
+                continue;
+            }
+            let is_shadow = self.memory_maps[map_idx].name.ends_with(".shadow");
+            let (dst_base, src_base) = if is_shadow {
+                (dst_shadow, src_shadow)
+            } else {
+                (dst, src)
+            };
+            self.memmove_sparse_map(map_idx, dst_base, src_base, len);
+        }
+    }
+
+    fn memmove_sparse_map(&mut self, map_idx: usize, dst: i64, src: i64, len: i64) {
+        let Some(src_end) = src.checked_add(len) else {
+            return;
+        };
+        let Some(dst_end) = dst.checked_add(len) else {
+            return;
+        };
+
+        let copied: Vec<(i64, i64)> = self.memory_maps[map_idx]
+            .memory
+            .iter()
+            .filter_map(|(&addr, &value)| {
+                if addr >= src && addr < src_end {
+                    Some((dst + (addr - src), value))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let clear: Vec<i64> = self.memory_maps[map_idx]
+            .memory
+            .keys()
+            .filter(|&&addr| addr >= dst && addr < dst_end)
+            .copied()
+            .collect();
+
+        let map = &mut self.memory_maps[map_idx];
+        for addr in clear {
+            map.memory.remove(&addr);
+        }
+        for (addr, value) in copied {
+            map.set(addr, value);
+        }
+    }
+
     /// Execute the program starting from the entry block.
     pub fn execute(&mut self, program: &CompiledProgram) -> ExecutionStatus {
+        self.execute_with_limit(program, 0)
+    }
+
+    /// Execute with an optional instruction/block-entry budget.
+    ///
+    /// ``max_steps == 0`` keeps the historical unbounded behavior.  Corpus and
+    /// benchmark harnesses pass a finite budget so intentionally nonterminating
+    /// inputs become a structured result instead of hanging the process.
+    pub fn execute_with_limit(
+        &mut self,
+        program: &CompiledProgram,
+        max_steps: usize,
+    ) -> ExecutionStatus {
         let mut block_id = program.entry_block;
+        let mut steps = 0usize;
         if let Some(status) = self.check_entry_preconditions(program) {
             return status;
         }
 
         loop {
             let block = &program.blocks[block_id as usize];
-            self.explored_blocks.insert(block.name.clone());
-            self.last_block = std::mem::replace(&mut self.curr_block, block.name.clone());
+            self.explored_blocks.insert(block_id);
+            self.block_trace.push(block_id);
+            self.curr_block.clone_from(&block.name);
             self.curr_block_id = block_id;
             self.pc = block.start_pc;
             // Let the trace accumulator update its loop stack for this
             // block entry — drives the packed iter_id semantics.
-            self.trace.on_block_enter(block_id);
+            if !self.no_trace {
+                self.trace.on_block_enter(block_id);
+            }
+            if let Some(status) = self.consume_step(&mut steps, max_steps) {
+                return status;
+            }
 
             // Execute body statements
             for stmt in &block.body {
+                if let Some(status) = self.consume_step(&mut steps, max_steps) {
+                    return status;
+                }
                 if let Err(status) = self.execute_stmt(stmt, program) {
                     return status;
                 }
@@ -264,12 +384,27 @@ impl VM {
         }
     }
 
+    #[inline(always)]
+    fn consume_step(&self, steps: &mut usize, max_steps: usize) -> Option<ExecutionStatus> {
+        if max_steps == 0 {
+            return None;
+        }
+        if *steps >= max_steps {
+            return Some(ExecutionStatus::StepLimit {
+                pc: self.pc,
+                block: self.curr_block.clone(),
+            });
+        }
+        *steps += 1;
+        None
+    }
+
     fn check_entry_preconditions(&mut self, program: &CompiledProgram) -> Option<ExecutionStatus> {
         if program.entry_preconditions.is_empty() {
             return None;
         }
         let entry = &program.blocks[program.entry_block as usize];
-        self.curr_block = entry.name.clone();
+        self.curr_block.clone_from(&entry.name);
         self.curr_block_id = program.entry_block;
         self.pc = entry.start_pc;
         for expr in &program.entry_preconditions {
@@ -277,6 +412,7 @@ impl VM {
                 return Some(ExecutionStatus::AssumeViolation {
                     pc: self.pc,
                     block: self.curr_block.clone(),
+                    reason: "requires",
                 });
             }
         }
@@ -309,6 +445,7 @@ impl VM {
         taken.ok_or_else(|| ExecutionStatus::AssumeViolation {
             pc: self.pc,
             block: self.curr_block.clone(),
+            reason: "infeasible_goto",
         })
     }
 
@@ -348,6 +485,7 @@ impl VM {
                         return Err(ExecutionStatus::AssumeViolation {
                             pc: self.pc,
                             block: self.curr_block.clone(),
+                            reason: "assume",
                         });
                     }
                 }
@@ -357,10 +495,8 @@ impl VM {
                 if !self.no_trace {
                     for &vid in live_vars {
                         if let Value::Scalar(val) = self.vars[vid as usize] {
-                            if !self.is_shadow[vid as usize] {
-                                self.trace.record(
-                                    vid, val, self.pc, self.curr_block_id, OP_WRITE);
-                            }
+                            self.trace
+                                .record(vid, val, self.pc, self.curr_block_id, OP_WRITE);
                         }
                     }
                 }
@@ -471,6 +607,21 @@ impl VM {
                     }
                 }
             }
+            Stmt::CallMemmove { args } => {
+                let vals: Vec<i64> = args.iter().map(|a| self.eval_i64(a, program)).collect();
+                if vals.len() >= 6 {
+                    let len = vals[4];
+                    let len_shadow = vals[5];
+                    if len != len_shadow || len < 0 {
+                        return Err(ExecutionStatus::AssumeViolation {
+                            pc: self.pc,
+                            block: self.curr_block.clone(),
+                            reason: "invalid_memmove",
+                        });
+                    }
+                    self.memmove_i8_maps(vals[0], vals[1], vals[2], vals[3], len);
+                }
+            }
             // Quantified assumes for memset/memcpy
             Stmt::QuantMemsetWrite {
                 m_ret,
@@ -577,6 +728,28 @@ impl VM {
                     self.memory_maps[dst_idx].set(addr, val);
                 }
             }
+            Stmt::If { cond, then_body, else_body } => {
+                // Evaluate condition; pick branch; recursively execute its body.
+                // Both bodies are guaranteed (by lowering) to contain no
+                // terminator stmts, so recursion stays inside this block.
+                let take_then = self.eval_bool(cond, program);
+                let body: &Vec<Stmt> = if take_then { then_body } else { else_body };
+                for inner in body {
+                    self.execute_stmt(inner, program)?;
+                    self.pc += 1;
+                }
+            }
+            Stmt::While { cond, body } => {
+                // Structured loop emitted by diffprod reify when a corerel
+                // body contained a nested PWhile. Concrete execution loops
+                // until the guard is false.
+                while self.eval_bool(cond, program) {
+                    for inner in body {
+                        self.execute_stmt(inner, program)?;
+                        self.pc += 1;
+                    }
+                }
+            }
             Stmt::Goto { .. } | Stmt::Return => {
                 panic!("Terminator should not be in body statements")
             }
@@ -636,7 +809,7 @@ impl VM {
                 match &self.vars[vid] {
                     Value::Scalar(v) => {
                         let v = *v;
-                        if !self.no_trace && self.log_read && !self.is_shadow[vid] {
+                        if !self.no_trace && self.log_read {
                             self.trace
                                 .record(*var_id, v, self.pc, self.curr_block_id, OP_READ);
                         }
@@ -695,8 +868,12 @@ impl VM {
                 let val = self.eval_i64(value, program);
                 let bw = *bit_width as u8;
                 let ew = self.memory_maps[map_idx].element_bit_width;
-                if bw == ew {
-                    self.memory_maps[map_idx].set(idx_val, val);
+                if bw <= ew {
+                    // Single cell. bw == ew is the common byte store; bw < ew is a
+                    // sub-element store (e.g. $store.i1 of a bool into a byte-addressed
+                    // map) — keep it one cell, masking the value to bw bits.
+                    let v = if bw < ew { val & ((1i64 << bw) - 1) } else { val };
+                    self.memory_maps[map_idx].set(idx_val, v);
                 } else {
                     let ew_mask = self.memory_maps[map_idx].element_mask();
                     let count = bw / ew;
@@ -719,8 +896,11 @@ impl VM {
                 let idx_val = self.eval_i64(index, program);
                 let bw = *bit_width as u8;
                 let ew = self.memory_maps[map_idx].element_bit_width;
-                if bw == ew {
-                    EvalResult::Scalar(self.memory_maps[map_idx].get(idx_val))
+                if bw <= ew {
+                    // Single cell; mask to bw bits for a sub-element load ($load.i1).
+                    let raw = self.memory_maps[map_idx].get(idx_val);
+                    let v = if bw < ew { raw & ((1i64 << bw) - 1) } else { raw };
+                    EvalResult::Scalar(v)
                 } else {
                     let mut result: i64 = 0;
                     let count = bw / ew;
@@ -782,7 +962,7 @@ impl VM {
     /// (n==0 → vals[0] panic).
     fn execute_printf(&mut self, args: &[Expr], program: &CompiledProgram) {
         if args.is_empty() {
-            return;  // malformed printf without format string — skip silently
+            return; // malformed printf without format string — skip silently
         }
         let vals: Vec<i64> = args.iter().map(|a| self.eval_i64(a, program)).collect();
 
@@ -927,8 +1107,7 @@ fn format_printf(fmt: &str, args: &[i64], m0: &crate::memory_map::MemoryMap) -> 
                         if flag_minus {
                             let _ = write!(result, "{}{:<width$}", prefix, hex, width = pad_width);
                         } else if flag_zero {
-                            let _ =
-                                write!(result, "{}{:0>width$}", prefix, hex, width = pad_width);
+                            let _ = write!(result, "{}{:0>width$}", prefix, hex, width = pad_width);
                         } else {
                             let _ = write!(result, "{}{:>width$}", prefix, hex, width = pad_width);
                         }
@@ -943,8 +1122,7 @@ fn format_printf(fmt: &str, args: &[i64], m0: &crate::memory_map::MemoryMap) -> 
                     if width > 0 {
                         let pad_width = width.saturating_sub(prefix.len());
                         if flag_zero {
-                            let _ =
-                                write!(result, "{}{:0>width$}", prefix, hex, width = pad_width);
+                            let _ = write!(result, "{}{:0>width$}", prefix, hex, width = pad_width);
                         } else {
                             let _ = write!(result, "{}{:>width$}", prefix, hex, width = pad_width);
                         }
@@ -1030,7 +1208,9 @@ fn expr_contains_is_external(expr: &Expr) -> bool {
             expr_contains_is_external(lhs) || expr_contains_is_external(rhs)
         }
         Expr::Builtin { args, .. } => args.iter().any(expr_contains_is_external),
-        Expr::Store { map, index, value, .. } => {
+        Expr::Store {
+            map, index, value, ..
+        } => {
             expr_contains_is_external(map)
                 || expr_contains_is_external(index)
                 || expr_contains_is_external(value)

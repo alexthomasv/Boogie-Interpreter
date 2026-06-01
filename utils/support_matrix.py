@@ -51,16 +51,16 @@ BOOGIE_SUPPORT_MATRIX = {
     },
     "execution_engines": {
         "supported": [
-            "Python concrete interpreter",
             "Rust native concrete interpreter",
-            "Python/native differential block comparison",
+            "Rust ProgramInputs concretization",
         ],
         "partial": [
-            "Python/native memory summary comparison",
-            "native bounded concolic branch negation",
-            "native bounded symbolic worklist exploration",
+            "Rust memory summary checks",
         ],
         "unsupported": [
+            "archived legacy concrete runtime",
+            "native bounded concolic branch negation",
+            "native bounded symbolic worklist exploration",
             "unbounded all-path symbolic execution",
             "interprocedural symbolic execution",
         ],
@@ -80,4 +80,3 @@ def support_matrix_summary() -> dict:
             for key, values in groups.items()
         }
     return summary
-

@@ -3,11 +3,11 @@ import pytest
 from interpreter.tests.helpers.boogie_cases import (
     assert_ok,
     assert_violation,
-    run_python_case,
+    run_native_case,
     scalar_inputs,
 )
 
-pytestmark = [pytest.mark.interpreter]
+pytestmark = [pytest.mark.interpreter, pytest.mark.native]
 
 
 def test_branch_selection_records_expected_path(tmp_path):
@@ -25,7 +25,7 @@ def test_branch_selection_records_expected_path(tmp_path):
     }
     """
 
-    result = run_python_case(
+    result = run_native_case(
         source,
         scalar_inputs({"$x": 11}),
         tmp_path=tmp_path,
@@ -51,7 +51,7 @@ def test_assert_violation_has_structured_location(tmp_path):
     }
     """
 
-    result = run_python_case(
+    result = run_native_case(
         source,
         scalar_inputs({"$x": 5}),
         tmp_path=tmp_path,
@@ -59,6 +59,7 @@ def test_assert_violation_has_structured_location(tmp_path):
     )
 
     assert_violation(result, "assert_violation", "bad")
+    assert result["invalid_input"] is False
     assert "bad" in result["explored_blocks"]
 
 
@@ -72,7 +73,7 @@ def test_requires_violation_is_reported_as_assume_violation(tmp_path):
     }
     """
 
-    result = run_python_case(
+    result = run_native_case(
         source,
         scalar_inputs({"$x": 0}),
         tmp_path=tmp_path,
@@ -80,3 +81,77 @@ def test_requires_violation_is_reported_as_assume_violation(tmp_path):
     )
 
     assert_violation(result, "assume_violation", "entry")
+    assert result["invalid_input"] is True
+    assert result["invalid_reason"] == "requires"
+
+
+def test_assume_violation_is_reported_as_invalid_input(tmp_path):
+    source = """
+    procedure main($x: int);
+    implementation {:entrypoint} main($x: int) {
+    entry:
+      assume $x == 1;
+      return;
+    }
+    """
+
+    result = run_native_case(
+        source,
+        scalar_inputs({"$x": 0}),
+        tmp_path=tmp_path,
+        test_name="assume_invalid_case",
+    )
+
+    assert_violation(result, "assume_violation", "entry")
+    assert result["invalid_input"] is True
+    assert result["invalid_reason"] == "assume"
+
+
+def test_infeasible_goto_is_reported_as_invalid_input(tmp_path):
+    source = """
+    procedure main($x: int);
+    implementation {:entrypoint} main($x: int) {
+    entry:
+      goto left, right;
+    left:
+      assume $x == 1;
+      return;
+    right:
+      assume $x == 2;
+      return;
+    }
+    """
+
+    result = run_native_case(
+        source,
+        scalar_inputs({"$x": 0}),
+        tmp_path=tmp_path,
+        test_name="goto_invalid_case",
+    )
+
+    assert_violation(result, "assume_violation", "entry")
+    assert result["invalid_input"] is True
+    assert result["invalid_reason"] == "infeasible_goto"
+
+
+def test_final_scalar_summary_reports_return_values(tmp_path):
+    source = """
+    procedure main($x: int) returns ($r: int);
+    implementation {:entrypoint} main($x: int) returns ($r: int) {
+    entry:
+      $r := $x + 7;
+      return;
+    }
+    """
+
+    result = run_native_case(
+        source,
+        scalar_inputs({"$x": 5}),
+        tmp_path=tmp_path,
+        test_name="final_scalar_case",
+        return_scalar_summary=True,
+    )
+
+    assert_ok(result, blocks={"entry"})
+    assert result["final_scalars"]["$x"] == 5
+    assert result["final_scalars"]["$r"] == 12

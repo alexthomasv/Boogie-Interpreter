@@ -1,8 +1,7 @@
 # Assuming necessary imports and base classes are defined elsewhere
 from .declaration import VariableDeclaration, ConstantDeclaration
 from .node import Node
-from .scope import Scope
-class Program(Node, Scope):
+class Program(Node):
     declarations = []
     children = ["declarations"]
 

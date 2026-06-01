@@ -3,13 +3,13 @@ from __future__ import annotations
 from contextlib import contextmanager
 import os
 from pathlib import Path
-from typing import Mapping
+from typing import Iterable, Mapping
 
 import pytest
 
 from interpreter.coverage_gen.evaluator import Evaluator
 from interpreter.parser.boogie_parser import parse_boogie
-from interpreter.runner import run_both, run_native, run_python_result
+from interpreter.runner import run_native
 from interpreter.utils.inputs import Input, ProgramInputs
 
 
@@ -53,24 +53,11 @@ def havoc_inputs(values: Mapping[str, list[int]], *,
     )
 
 
-def run_python_case(source: str, inputs: ProgramInputs | dict | None = None,
-                    *, tmp_path: Path | None = None,
-                    test_name: str = "case",
-                    input_name: str = "input_0") -> dict:
-    with isolated_cwd(tmp_path):
-        return run_python_result(
-            make_program(source),
-            inputs or {},
-            test_name,
-            input_name,
-            no_read_trace=True,
-        )
-
-
 def run_native_case(source: str, inputs: ProgramInputs | dict | None = None,
                     *, tmp_path: Path | None = None,
                     test_name: str = "case",
-                    input_name: str = "input_0") -> dict:
+                    input_name: str = "input_0",
+                    return_scalar_summary: bool = False) -> dict:
     pytest.importorskip("swoosh_interp")
     with isolated_cwd(tmp_path):
         raw_log = Path("native.trace.raw.zst")
@@ -83,21 +70,7 @@ def run_native_case(source: str, inputs: ProgramInputs | dict | None = None,
             no_trace=True,
             log_read=False,
             return_status=True,
-        )
-
-
-def run_both_case(source: str, inputs: ProgramInputs | dict | None = None,
-                  *, tmp_path: Path | None = None,
-                  test_name: str = "case",
-                  input_name: str = "input_0"):
-    pytest.importorskip("swoosh_interp")
-    with isolated_cwd(tmp_path):
-        return run_both(
-            make_program(source),
-            inputs or {},
-            test_name,
-            input_name,
-            no_read_trace=True,
+            return_scalar_summary=return_scalar_summary,
         )
 
 
@@ -106,7 +79,8 @@ def concolic_candidates(source: str, inputs: ProgramInputs,
                         *, tmp_path: Path | None = None,
                         test_name: str = "symbolic_case",
                         input_name: str = "seed",
-                        max_solver_queries: int = 16):
+                        max_solver_queries: int = 16,
+                        branch_distance_policy: str = "auto"):
     pytest.importorskip("swoosh_interp")
     with isolated_cwd(tmp_path):
         program = make_program(source)
@@ -116,6 +90,7 @@ def concolic_candidates(source: str, inputs: ProgramInputs,
             input_name,
             covered_blocks,
             max_solver_queries=max_solver_queries,
+            branch_distance_policy=branch_distance_policy,
         )
 
 
@@ -125,7 +100,8 @@ def symbolic_candidates(source: str, inputs: ProgramInputs,
                         test_name: str = "symbolic_case",
                         input_name: str = "seed",
                         max_solver_queries: int = 16,
-                        max_states: int = 16):
+                        max_states: int = 16,
+                        branch_distance_policy: str = "auto"):
     pytest.importorskip("swoosh_interp")
     with isolated_cwd(tmp_path):
         program = make_program(source)
@@ -136,7 +112,64 @@ def symbolic_candidates(source: str, inputs: ProgramInputs,
             covered_blocks,
             max_solver_queries=max_solver_queries,
             max_states=max_states,
+            branch_distance_policy=branch_distance_policy,
         )
+
+
+def replay_candidates(source: str, candidates: Iterable[ProgramInputs],
+                      *, tmp_path: Path | None = None,
+                      test_name: str = "replay") -> list[dict]:
+    return [
+        run_native_case(
+            source,
+            candidate,
+            tmp_path=tmp_path,
+            test_name=f"{test_name}_{idx}",
+            input_name=f"candidate_{idx}",
+        )
+        for idx, candidate in enumerate(candidates)
+    ]
+
+
+def replayed_coverage(results: Iterable[dict]) -> set[str]:
+    covered: set[str] = set()
+    for result in results:
+        assert result["status"] == "ok", result
+        covered.update(result["explored_blocks"])
+    return covered
+
+
+def assert_replay_adds_coverage(seed_blocks: set[str], replayed: Iterable[dict],
+                                expected_new_blocks: set[str]) -> set[str]:
+    union = replayed_coverage(replayed)
+    new_blocks = union - set(seed_blocks)
+    assert expected_new_blocks <= new_blocks
+    return union
+
+
+def valid_replayed_coverage(results: Iterable[dict]) -> set[str]:
+    covered: set[str] = set()
+    for result in results:
+        if result["status"] == "ok":
+            covered.update(result["explored_blocks"])
+            continue
+        assert result["status"] == "assume_violation", result
+    return covered
+
+
+def assert_replay_strictly_increases_coverage(
+    seed_blocks: set[str],
+    replayed: Iterable[dict],
+    expected_new_blocks: set[str] | None = None,
+) -> set[str]:
+    seed_blocks = set(seed_blocks)
+    union = seed_blocks | valid_replayed_coverage(replayed)
+    new_blocks = union - seed_blocks
+    assert new_blocks, "symbolic candidates did not add any valid new blocks"
+    if expected_new_blocks is not None:
+        assert expected_new_blocks <= new_blocks
+    assert seed_blocks < union
+    return union
 
 
 def assert_ok(result: dict, *, blocks: set[str] | None = None):
@@ -148,4 +181,3 @@ def assert_ok(result: dict, *, blocks: set[str] | None = None):
 def assert_violation(result: dict, status: str, block: str):
     assert result["status"] == status
     assert result["violation_block"] == block
-

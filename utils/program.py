@@ -69,6 +69,13 @@ CALL_RECORD_LIST = set(
     "boogie_si_record_ref",
     ])
 
+
+def find_entry_point(program):
+    for decl in program.declarations:
+        if isinstance(decl, ImplementationDeclaration) and decl.has_attribute("entrypoint"):
+            return decl
+    return None
+
 # ── Type helpers ─────────────────────────────────────────────────────────
 
 boogie_type_bitwidth = {

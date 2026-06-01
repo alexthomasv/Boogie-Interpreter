@@ -136,7 +136,11 @@ mod proofs {
                 let m = mask(BITS);
                 let (result, is_bool) = exec_binary(BuiltinFn::Urem { bits: BITS }, a, 0);
                 let expected = a as u64 & m as u64;
-                assert_eq!(result, expected as i64 & m, "bvurem(x, 0) must return dividend");
+                assert_eq!(
+                    result,
+                    expected as i64 & m,
+                    "bvurem(x, 0) must return dividend"
+                );
                 assert!(!is_bool);
             });
         };
@@ -187,7 +191,8 @@ mod proofs {
                 let result_signed = to_signed(result, BITS);
                 if result_signed != 0 {
                     assert_eq!(
-                        result_signed > 0, sx > 0,
+                        result_signed > 0,
+                        sx > 0,
                         "bvsrem sign must follow dividend"
                     );
                 }
@@ -217,7 +222,10 @@ mod proofs {
                 assert!(!is_bool);
                 let shift = (b as u32) % (BITS as u32);
                 if v & sign_bit != 0 && shift > 0 && shift < BITS as u32 {
-                    assert!(result & sign_bit != 0, "ashr of negative must preserve sign bit");
+                    assert!(
+                        result & sign_bit != 0,
+                        "ashr of negative must preserve sign bit"
+                    );
                 }
             });
         };
@@ -244,7 +252,10 @@ mod proofs {
         kani::assume(v & sign_bit == 0);
         let (ashr_result, _) = exec_binary(BuiltinFn::Ashr { bits }, a, b);
         let (lshr_result, _) = exec_binary(BuiltinFn::Lshr { bits }, a, b);
-        assert_eq!(ashr_result, lshr_result, "ashr of positive value must equal lshr");
+        assert_eq!(
+            ashr_result, lshr_result,
+            "ashr of positive value must equal lshr"
+        );
     }
 
     // =========================================================================
@@ -305,7 +316,10 @@ mod proofs {
         let v = x & src_mask;
         if v & (1i64 << 7) != 0 {
             let expected = (v | !src_mask) & dst_mask;
-            assert_eq!(result, expected, "sext of negative must sign-extend with 1s");
+            assert_eq!(
+                result, expected,
+                "sext of negative must sign-extend with 1s"
+            );
         } else {
             assert_eq!(result, v, "sext of positive must zero-extend");
         }
@@ -329,7 +343,10 @@ mod proofs {
     #[kani::proof]
     fn verify_test_vector_udiv_zero() {
         let (result, _) = exec_binary(BuiltinFn::Udiv { bits: 32 }, 0x12345678, 0);
-        assert_eq!(result, 0xFFFFFFFFi64, "udiv(0x12345678, 0) @ 32 = 0xFFFFFFFF");
+        assert_eq!(
+            result, 0xFFFFFFFFi64,
+            "udiv(0x12345678, 0) @ 32 = 0xFFFFFFFF"
+        );
     }
 
     #[kani::proof]
@@ -367,6 +384,9 @@ mod proofs {
     #[kani::proof]
     fn verify_test_vector_sext_negative() {
         let result = exec_unary(BuiltinFn::Sext { src: 8, dst: 32 }, 0x80);
-        assert_eq!(result, 0xFFFFFF80u32 as i64, "sext(0x80, 8->32) = 0xFFFFFF80");
+        assert_eq!(
+            result, 0xFFFFFF80u32 as i64,
+            "sext(0x80, 8->32) = 0xFFFFFF80"
+        );
     }
 }

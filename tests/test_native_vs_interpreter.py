@@ -2,15 +2,14 @@
 End-to-end tests: native C execution vs Boogie interpreter.
 
 Native C: compile with SMACK stubs and run directly.
-Interpreter: run via `pypy interpreter.py` subprocess, check compact trace.
+Interpreter: run the Rust CLI subprocess and check raw trace output.
 
 These tests verify that both paths produce valid results for the same inputs.
 """
 import json
-import os
 import shutil
 import subprocess
-import tempfile
+import sys
 from pathlib import Path
 
 import pytest
@@ -256,13 +255,9 @@ def _compile_and_run_native(harness_code, sources, build_dir, name):
 
 
 def _run_interpreter_subprocess(pkg_name):
-    """Run interpreter as PyPy subprocess. Returns True if compact trace exists."""
+    """Run the Rust interpreter subprocess. Returns True if a raw trace exists."""
     pkg_dir = TEST_PACKAGES_DIR / f"{pkg_name}_pkg"
     if not pkg_dir.exists():
-        return None
-
-    pypy = shutil.which("pypy") or shutil.which("pypy3")
-    if not pypy:
         return None
 
     trace_dir = Path(f"positive_examples/{pkg_name}")
@@ -272,7 +267,7 @@ def _run_interpreter_subprocess(pkg_name):
         return {"exists": True, "path": compact_files[0]}
 
     r = subprocess.run(
-        [pypy, "-m", "interpreter.python.interpreter", str(pkg_dir)],
+        [sys.executable, "-m", "interpreter.runner", str(pkg_dir), "--engine", "native"],
         capture_output=True, text=True, timeout=600,
         cwd=str(PROJECT_ROOT),
     )
@@ -320,24 +315,24 @@ class TestPkcsI15Native:
 
 
 class TestPkcsI15Interpreter:
-    """Test that the Boogie interpreter produces a valid compact trace."""
+    """Test that the Rust interpreter produces a valid raw trace."""
 
-    def test_interpreter_produces_compact_trace(self):
+    def test_interpreter_produces_raw_trace(self):
         pkg_name = "bearssl_test_pkcs1_i15"
         result = _run_interpreter_subprocess(pkg_name)
         if result is None:
-            pytest.skip("Package not compiled or PyPy not available")
+            pytest.skip("Package not compiled")
         assert result["exists"], \
-            f"Interpreter should produce a compact trace (rc={result.get('returncode')})"
+            f"Interpreter should produce a raw trace (rc={result.get('returncode')})"
 
-    def test_compact_trace_has_data(self):
+    def test_raw_trace_has_data(self):
         trace_dir = Path("positive_examples/bearssl_test_pkcs1_i15")
-        compact_files = list(trace_dir.glob("*.trace.raw.zst")) if trace_dir.exists() else []
-        if not compact_files:
-            pytest.skip("No compact trace available")
+        trace_files = list(trace_dir.glob("*.trace.raw.zst")) if trace_dir.exists() else []
+        if not trace_files:
+            pytest.skip("No raw trace available")
         # Check file is non-trivial (> 1KB)
-        assert compact_files[0].stat().st_size > 1024, \
-            "Compact trace should be larger than 1KB"
+        assert trace_files[0].stat().st_size > 1024, \
+            "Raw trace should be larger than 1KB"
 
 
 class TestPkcsI15Consistency:

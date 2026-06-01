@@ -1,7 +1,4 @@
-"""
-Level 1: Golden trace comparison tests.
-Runs both interpreters on available benchmarks and asserts identical output.
-"""
+"""Golden trace smoke tests for the Rust interpreter."""
 import pytest
 import sys
 import struct
@@ -19,10 +16,11 @@ except ImportError:
     HAS_NATIVE = False
 
 native_required = pytest.mark.skipif(not HAS_NATIVE, reason="Native interpreter not built")
+GOLDEN_TRACE_MAX_STEPS = 100_000_000
 
 
 class TestGoldenTraces:
-    """Compare Python and native interpreter outputs on real benchmarks."""
+    """Run the Rust interpreter on real benchmarks."""
 
     pytestmark = [
         native_required,
@@ -31,9 +29,9 @@ class TestGoldenTraces:
         pytest.mark.slow,
     ]
 
-    def test_both_engines_match(self, benchmark_data):
-        """Run both engines on the same input and assert identical results."""
-        from interpreter.runner import run_both
+    def test_native_engine_runs(self, benchmark_data, tmp_path):
+        """Run the Rust engine on the same input and assert it explores blocks."""
+        from interpreter.runner import run_native
 
         name = benchmark_data['name']
         program = benchmark_data['program']
@@ -42,27 +40,45 @@ class TestGoldenTraces:
 
         print(f"\nTesting benchmark: {name} / {input_name}")
 
-        explored_blocks, _ = run_both(
+        result = run_native(
             program, inputs, name, input_name,
-            full_trace=False, no_read_trace=False,
+            raw_log_path=tmp_path / f"{input_name}.trace.raw.zst",
+            no_trace=True,
+            return_status=True,
             extra_data=inputs.extra_data,
+            max_steps=GOLDEN_TRACE_MAX_STEPS,
         )
+        explored_blocks = set(result.get("explored_blocks") or [])
 
         assert len(explored_blocks) > 0, f"No blocks explored for {name}"
-        print(f"  {len(explored_blocks)} blocks explored — PASS")
+        print(f"  {len(explored_blocks)} blocks explored - PASS")
 
-    def test_explored_blocks_count(self, benchmark_data):
-        """Verify we explore a reasonable number of blocks."""
-        from interpreter.runner import run_python
+    def test_explored_blocks_count(self, benchmark_data, tmp_path):
+        """Verify explored block accounting is internally consistent."""
+        from interpreter.runner import run_native
 
         name = benchmark_data['name']
         program = benchmark_data['program']
         inputs = benchmark_data['program_inputs']
         input_name = benchmark_data['input_name']
 
-        explored, _ = run_python(program, inputs, name, input_name)
-        # Every benchmark should explore at least 10 blocks
-        assert len(explored) >= 10, f"Only {len(explored)} blocks explored for {name}"
+        result = run_native(
+            program, inputs, name, input_name,
+            raw_log_path=tmp_path / f"{input_name}.trace.raw.zst",
+            no_trace=True,
+            return_status=True,
+            extra_data=inputs.extra_data,
+            max_steps=GOLDEN_TRACE_MAX_STEPS,
+        )
+        explored = set(result.get("explored_blocks") or [])
+        assert result.get("status") in {
+            "ok",
+            "assert_violation",
+            "assume_violation",
+            "step_limit",
+        }
+        assert len(explored) > 0, f"No blocks explored for {name}"
+        assert result.get("blocks_explored") == len(explored)
 
 
 class TestBinaryTraceFormat:

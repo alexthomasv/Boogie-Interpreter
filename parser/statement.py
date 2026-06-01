@@ -1,14 +1,10 @@
 from .node import Node
 from .declaration import Declaration
-from .scope import Scope
 from .expression import LabelIdentifier, Identifier
 
 
 class Statement(Node):
     pass
-
-class Label(Declaration):
-    name = None
 
 class AssertStatement(Statement):
     expression = None
@@ -96,7 +92,7 @@ class ReturnStatement(Statement):
         return hash(self.expression)
 
     def __repr__(self):
-        return f"{str('return')} {str(self.expression) if self.expression else ''};"
+        return f"return {self.expression};" if self.expression else "return;"
 
 class CallStatement(Statement):
 
@@ -108,9 +104,6 @@ class CallStatement(Statement):
 
     def forall(self):
         return len(self.assignments) == 0
-
-    def target(self):
-        return self.procedure.declaration
 
     def set_prefix(self, prefix, indent=1):
         self.prefix = prefix
@@ -126,7 +119,31 @@ class CallStatement(Statement):
         rets = (', '.join(str(a) for a in self.assignments) + ' := ') if len(self.assignments) else ''
         proc = str(self.procedure)
         args = ', '.join(str(a) for a in self.arguments)
-        return f"{str('call')} {self.show_attrs()} {rets} {proc}({args});"
+        attrs = f"{self.show_attrs()} " if self.attributes else ""
+        return f"call {attrs}{rets}{proc}({args});"
+
+class ParallelCallStatement(Statement):
+    calls = []
+    children = ["calls"]
+
+    def __repr__(self):
+        rendered = []
+        for call in self.calls:
+            rets = (
+                ", ".join(str(a) for a in call["rets"]) + " := "
+                if call.get("rets") else ""
+            )
+            rendered.append(f"{rets}{call['name']}")
+        attrs = f"{self.show_attrs()} " if self.attributes else ""
+        return f"par {attrs}{' | '.join(rendered)};"
+
+class YieldStatement(Statement):
+    def __repr__(self):
+        return "yield;"
+
+class PopStatement(Statement):
+    def __repr__(self):
+        return "pop;"
 
 class IfStatement(Statement):
     condition = None
@@ -186,7 +203,11 @@ class WhileStatement(Statement):
 
 class BreakStatement(Statement):
     def __init__(self, identifier=None):
+        super().__init__()
         self.identifier = identifier
+
+    def __repr__(self):
+        return f"break {self.identifier};" if self.identifier else "break;"
 
     def show(self, blk):
         return f"{blk('break')}{' ' if self.identifier else ''}{blk(self.identifier)};"
@@ -201,6 +222,7 @@ class Block(Declaration):
     prefix = None
 
     def __init__(self, names, statements):
+        super().__init__()
         self.names = names
         if len(self.names) == 0:
             self.name = "Default"
@@ -221,10 +243,10 @@ class Block(Declaration):
                 s.set_prefix(prefix, indent)
 
     def id(self):
-        return LabelIdentifier(name=self.name, declaration=self)
+        return LabelIdentifier(name=self.name)
 
     def copy(self):
-        return Block(names=self.names[:], statements=[s.copy() for s in self.statements])
+        return self.clone()
 
     def __repr__(self):
         indent_prefix = (self.indent_num - 2) * "  "
@@ -259,13 +281,12 @@ class Body(Node):
             taken = []
         taken += [d.names for d in self.locals]
         name = self.fresh_from(prefix or "$var", taken)
-        self.locals.append(bpl(f"var {name}: {type_};"))
-        return bpl(name)
+        self.locals.append(bpl(f"var {name}: {type_};", kind="decl"))
+        return bpl(name, kind="expr")
 
     def fresh_label(self, prefix):
         name = self.fresh_from(prefix or "$bb", [b.names for b in self.blocks])
-        decl = Label(name=name)
-        return LabelIdentifier(name=name, declaration=decl)
+        return LabelIdentifier(name=name)
 
     def fresh_from(self, prefix, taken):
         if prefix not in taken and prefix:

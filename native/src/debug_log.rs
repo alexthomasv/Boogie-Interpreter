@@ -16,6 +16,10 @@ fn enabled(category: &str) -> Option<String> {
     }
 }
 
+pub fn is_enabled(category: &str) -> bool {
+    enabled(category).is_some()
+}
+
 fn escape_json(value: &str) -> String {
     let mut out = String::with_capacity(value.len() + 8);
     for ch in value.chars() {
@@ -61,4 +65,3 @@ pub fn event(category: &str, event: &str, fields: &[(&str, String)]) {
         let _ = fh.write_all(line.as_bytes());
     }
 }
-

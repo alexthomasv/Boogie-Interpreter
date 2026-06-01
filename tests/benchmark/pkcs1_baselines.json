@@ -1,0 +1,12 @@
+{
+  "bearssl_test_pkcs1_i15": {
+    "hash": "299e4e14f637a2e14a1c5ea793dcb64f65b2054815ce9e8e4afd2a0d826f9a61",
+    "min_reachable_blocks_covered": 100,
+    "min_candidates_evaluated": 1
+  },
+  "bearssl_test_pkcs1_i31": {
+    "hash": "81745ce9b860ebbb2797c753cb21d5c077e079a68f6f33ab40bc5214fc624481",
+    "min_reachable_blocks_covered": 1,
+    "min_candidates_evaluated": 1
+  }
+}

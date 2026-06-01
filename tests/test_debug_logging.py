@@ -1,8 +1,9 @@
 import json
 
+import pytest
+
 from interpreter.parser.boogie_parser import parse_boogie
-from interpreter.python.Environment import Environment
-from interpreter.runner import run_python_result
+from interpreter.runner import run_native
 from interpreter.utils.debug_log import DebugLogger
 from interpreter.utils.support_matrix import support_matrix_summary
 
@@ -44,22 +45,6 @@ def test_debug_logger_write_failures_are_non_disruptive(tmp_path):
     logger.event("exec", "cannot_write")
 
 
-def test_environment_logs_uninitialized_default(tmp_path, monkeypatch):
-    monkeypatch.chdir(tmp_path)
-    log_dir = tmp_path / "logs"
-    logger = DebugLogger.from_options(log_dir, "exec", run_id="env-test")
-    env = Environment("debug_test", "input_0", debug_logger=logger)
-
-    assert env.get_var("$missing") == 0
-
-    events = _read_events(log_dir / "debug.jsonl")
-    assert any(
-        event["event"] == "uninitialized_var_defaulted"
-        and event["var"] == "$missing"
-        for event in events
-    )
-
-
 def test_support_matrix_summary_exposes_known_areas():
     summary = support_matrix_summary()
 
@@ -69,7 +54,9 @@ def test_support_matrix_summary_exposes_known_areas():
     assert summary["statements"]["unsupported"] > 0
 
 
-def test_run_python_result_reports_structured_assert(tmp_path, monkeypatch):
+@pytest.mark.native
+def test_run_native_result_reports_structured_assert(tmp_path, monkeypatch):
+    pytest.importorskip("swoosh_interp")
     monkeypatch.chdir(tmp_path)
     program = parse_boogie(
         """
@@ -81,19 +68,22 @@ def test_run_python_result_reports_structured_assert(tmp_path, monkeypatch):
         }
         """
     )
-    logger = DebugLogger.from_options(tmp_path / "logs", "exec", run_id="py-result")
+    logger = DebugLogger.from_options(tmp_path / "logs", "exec", run_id="native-result")
 
-    result = run_python_result(
+    result = run_native(
         program,
         {},
         "debug_prog",
         "input_0",
+        raw_log_path=tmp_path / "assert.raw.zst",
+        no_trace=True,
+        return_status=True,
         debug_logger=logger,
     )
 
     assert result["status"] == "assert_violation"
     assert result["violation_block"] == "entry"
-    assert result["engine"] == "python"
+    assert result["engine"] == "native"
     assert result["explored_blocks"] == {"entry"}
 
     events = _read_events(tmp_path / "logs" / "debug.jsonl")

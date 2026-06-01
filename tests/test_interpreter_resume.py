@@ -441,7 +441,7 @@ class TestInterpreterSubprocess(unittest.TestCase):
     def test_force_flag_accepted(self):
         """The --force flag should be accepted by the CLI."""
         result = subprocess.run(
-            [sys.executable, "-m", "interpreter.python.interpreter", "--help"],
+            [sys.executable, "-m", "interpreter.runner", "--help"],
             capture_output=True, text=True, cwd=ROOT
         )
         assert "--force" in result.stdout
@@ -449,7 +449,7 @@ class TestInterpreterSubprocess(unittest.TestCase):
     def test_missing_pkg_fails(self):
         """Running with a nonexistent package should fail."""
         result = subprocess.run(
-            [sys.executable, "-m", "interpreter.python.interpreter", "/nonexistent/path_pkg"],
+            [sys.executable, "-m", "interpreter.runner", "/nonexistent/path_pkg"],
             capture_output=True, text=True, cwd=ROOT
         )
         assert result.returncode != 0

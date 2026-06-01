@@ -27,9 +27,15 @@ from pathlib import Path
 from hypothesis import given, settings, target, HealthCheck, Phase, Verbosity
 from hypothesis import strategies as st
 
-from interpreter.runner import compute_coverage, run_python, run_native, find_entry_point
+from interpreter.runner import prepare_native, run_native
 from interpreter.utils.inputs import Input, ProgramInputs, preprocess_external_inputs
 from interpreter.utils.input_parser import get_bpl_field_sizes
+from interpreter.utils.program import find_entry_point
+from swoosh_cli.layout import current_layout, first_existing, legacy_package_dir
+
+DEFAULT_MAX_STEPS_PER_INPUT = int(
+    os.environ.get("SWOOSH_COVERAGE_FUZZ_MAX_STEPS", "100000")
+)
 
 
 # ---------------------------------------------------------------------------
@@ -398,13 +404,23 @@ def _inputs_to_input_str(param_info, program_inputs):
 class CoverageFuzzer:
     """Coverage-guided input generator using Hypothesis target()."""
 
-    def __init__(self, name, max_examples=200, target_pct=100.0, engine='native'):
+    def __init__(self, name, max_examples=200, target_pct=100.0,
+                 engine='native', max_steps_per_input=None):
+        if engine != "native":
+            raise ValueError("coverage_fuzz is Rust-only; use engine='native'")
         self.name = name
         self.max_examples = max_examples
         self.target_pct = target_pct
         self.engine = engine
+        self.max_steps_per_input = (
+            DEFAULT_MAX_STEPS_PER_INPUT
+            if max_steps_per_input is None else int(max_steps_per_input)
+        )
 
-        self.pkg_path = Path("test_packages") / f"{name}_pkg"
+        self.pkg_path = first_existing(
+            current_layout().package_dir(name),
+            legacy_package_dir(name),
+        )
         assert self.pkg_path.is_dir(), f"Package not found: {self.pkg_path}"
 
         self.output_dir = Path("test_input") / name
@@ -439,18 +455,9 @@ class CoverageFuzzer:
         self._last_new_block_at = 0
         self.start_time = None
 
-        # Pre-compile bytecode for native engine (avoids re-lowering every run)
-        self._compiled = None
-        if self.engine == 'native':
-            try:
-                import swoosh_interp
-                self._compiled = swoosh_interp.lower(self.program)
-            except ImportError:
-                print("[coverage-fuzz] Native interpreter not available, falling back to Python")
-                self.engine = 'python'
-            except BaseException as e:
-                print(f"[coverage-fuzz] Native lowering failed ({e}), falling back to Python")
-                self.engine = 'python'
+        # Pre-compile bytecode and static input metadata once.
+        self._prepared = prepare_native(self.program)
+        self._compiled = self._prepared.compiled
 
         # Compute total block count
         entry = find_entry_point(self.program)
@@ -461,22 +468,24 @@ class CoverageFuzzer:
         """Run the interpreter and return explored blocks."""
         try:
             input_name = f"fuzz_{self.run_count}"
-            if self.engine == 'native' and self._compiled is not None:
-                explored, _ = run_native(
-                    self.program, program_inputs,
-                    self.name, input_name,
-                    log_read=False, pickled=False,
-                    compiled=self._compiled,
-                    no_trace=True,
-                )
-            else:
-                explored, _ = run_python(
-                    self.program, program_inputs,
-                    self.name, input_name,
-                    full_trace=False, no_read_trace=True,
-                )
-            return explored
-        except Exception as e:
+            result = run_native(
+                self.program, program_inputs,
+                self.name, input_name,
+                raw_log_path=self.output_dir / f"{input_name}.trace.raw.zst",
+                log_read=False,
+                compiled=self._compiled,
+                prepared=self._prepared,
+                no_trace=True,
+                return_status=True,
+                return_memory_summary=False,
+                validate_handoff=False,
+                quiet=True,
+                max_steps=self.max_steps_per_input,
+            )
+            if result.get("status") == "ok":
+                return set(result.get("explored_blocks") or [])
+            return set()
+        except Exception:
             # Some inputs may cause assertion failures — that's fine, skip
             return set()
 

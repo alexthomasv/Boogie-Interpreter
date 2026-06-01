@@ -1,0 +1,15 @@
+{
+  "cases": {
+    "scalar_concolic": {
+      "candidates_per_sec": 322.1750942704462,
+      "symbolic_state_ms": 0.006643
+    },
+    "scalar_symbolic": {
+      "candidates_per_sec": 226.4024158043376,
+      "symbolic_state_ms": 0.0068449999999999995
+    }
+  },
+  "min_ratio": 0.5,
+  "schema": 1,
+  "state_ms_max_ratio": 5.0
+}

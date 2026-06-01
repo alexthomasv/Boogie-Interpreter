@@ -122,6 +122,24 @@ pub enum BuiltinFn {
 /// A compiled statement.
 #[derive(Debug, Clone)]
 pub enum Stmt {
+    /// `if (cond) { then_body } else { else_body }` — structured
+    /// branching emitted by the diffprod corerel reify path for
+    /// `IfRel`-inside-loop and similar shapes. Body vectors must
+    /// NOT contain Goto/Return — bpl_emit honors this; lowering
+    /// asserts.
+    If {
+        cond: Expr,
+        then_body: Vec<Stmt>,
+        else_body: Vec<Stmt>,
+    },
+    /// `while (cond) { body }` — structured loop emitted by
+    /// diffprod when corerel reify encounters a nested loop inside
+    /// another structured construct. Body must NOT contain
+    /// Goto/Return; lowering debug-asserts.
+    While {
+        cond: Expr,
+        body: Vec<Stmt>,
+    },
     /// x := expr (single assignment, most common)
     Assign1 { lhs: VarId, rhs: Expr },
     /// x, y := e1, e2 (multi-assignment)
@@ -164,6 +182,8 @@ pub enum Stmt {
     },
     /// call read.cross_product
     CallRead { args: Vec<Expr> },
+    /// call llvm.memmove/llvm.memcpy intrinsic over byte-addressed memory maps
+    CallMemmove { args: Vec<Expr> },
     /// Quantified assume for memset (&&)
     QuantMemsetWrite {
         m_ret: VarId,
@@ -242,8 +262,6 @@ pub struct CompiledProgram {
     pub var_names: Vec<String>,
     /// Variable name → VarId (O(1) lookup)
     pub name_to_var: rustc_hash::FxHashMap<String, VarId>,
-    /// VarId → is_shadow
-    pub is_shadow: Vec<bool>,
     /// Entry block ID
     pub entry_block: BlockId,
     /// Preconditions that must hold before the entry block executes.

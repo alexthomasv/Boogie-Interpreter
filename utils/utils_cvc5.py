@@ -1,6 +1,6 @@
 from cvc5 import Kind, Term, Sort, Solver, SortKind
 import math
-from interpreter.parser.expression import FunctionApplication, MapSelect, StorageIdentifier, ProcedureIdentifier, BinaryExpression, UnaryExpression, BooleanLiteral, IntegerLiteral, OldExpression, LogicalNegation, ArithmeticNegation, QuantifiedExpression, IfExpression, Identifier
+from interpreter.parser.expression import FunctionApplication, MapSelect, StorageIdentifier, ProcedureIdentifier, BinaryExpression, UnaryExpression, BooleanLiteral, IntegerLiteral, BitvectorLiteral, OldExpression, LogicalNegation, ArithmeticNegation, QuantifiedExpression, IfExpression, Identifier
 from interpreter.parser.statement import AssertStatement, AssumeStatement, AssignStatement, Block, CallStatement, GotoStatement, HavocStatement
 from interpreter.parser.declaration import StorageDeclaration, ImplementationDeclaration, ProcedureDeclaration
 from interpreter.parser.type import BooleanType, IntegerType, CustomType, MapType
@@ -59,16 +59,33 @@ fn_to_cvc5_op = {
     "$not.ref": (Kind.BITVECTOR_NOT, 1, 64, 64),
     "$not.i16": (Kind.BITVECTOR_NOT, 1, 16, 16),
 
-    "$ne.ref": (Kind.DISTINCT, 2, 64, 64),
-    "$ne.i64": (Kind.DISTINCT, 2, 64, 64),
-    "$ne.i32": (Kind.DISTINCT, 2, 32, 32),
-    "$ne.i8": (Kind.DISTINCT, 2, 8, 8),
+    # SMACK comparison helpers return ``i1`` per the prelude
+    # (``smack/lib/smack/Prelude.cpp::IntPred::getIntFuncs``).  The
+    # operand width comes from the suffix; the result is always 1-bit
+    # (0 or 1).  Encoding output_type=1 lets downstream sort-coercion
+    # match assignments such as ``$i2: i1 := $slt.i32($i1, 1000);``
+    # and lets logical NOT round-trip ``!($helper(...))`` cleanly.
+    # The ``.bool`` variants are emitted by the same prelude code path
+    # and return Bool directly.
+    "$ne.ref": (Kind.DISTINCT, 2, 64, 1),
+    "$ne.ref.bool": (Kind.DISTINCT, 2, 64, bool),
+    "$ne.i64": (Kind.DISTINCT, 2, 64, 1),
+    "$ne.i64.bool": (Kind.DISTINCT, 2, 64, bool),
+    "$ne.i32": (Kind.DISTINCT, 2, 32, 1),
+    "$ne.i32.bool": (Kind.DISTINCT, 2, 32, bool),
+    "$ne.i8": (Kind.DISTINCT, 2, 8, 1),
+    "$ne.i8.bool": (Kind.DISTINCT, 2, 8, bool),
 
-    "$eq.ref": (Kind.EQUAL, 2, 64, 64),
-    "$eq.i64": (Kind.EQUAL, 2, 64, 64),
-    "$eq.i32": (Kind.EQUAL, 2, 32, 32),
-    "$eq.i8": (Kind.EQUAL, 2, 8, 8),
+    "$eq.ref": (Kind.EQUAL, 2, 64, 1),
+    "$eq.ref.bool": (Kind.EQUAL, 2, 64, bool),
+    "$eq.i64": (Kind.EQUAL, 2, 64, 1),
+    "$eq.i64.bool": (Kind.EQUAL, 2, 64, bool),
+    "$eq.i32": (Kind.EQUAL, 2, 32, 1),
+    "$eq.i32.bool": (Kind.EQUAL, 2, 32, bool),
+    "$eq.i8": (Kind.EQUAL, 2, 8, 1),
+    "$eq.i8.bool": (Kind.EQUAL, 2, 8, bool),
     "$eq.i1": (Kind.EQUAL, 2, 1, 1),
+    "$eq.i1.bool": (Kind.EQUAL, 2, 1, bool),
 
     "$udiv.ref": (Kind.BITVECTOR_UDIV, 2, 64, 64),
     "$udiv.i64": (Kind.BITVECTOR_UDIV, 2, 64, 64),
@@ -80,42 +97,70 @@ fn_to_cvc5_op = {
     "$sdiv.i32": (Kind.BITVECTOR_SDIV, 2, 32, 32),
     "$sdiv.i8": (Kind.BITVECTOR_SDIV, 2, 8, 8),
 
-    "$ult.ref": (Kind.BITVECTOR_ULT, 2, 64, 64),
-    "$ult.i64": (Kind.BITVECTOR_ULT, 2, 64, 64),
-    "$ult.i32": (Kind.BITVECTOR_ULT, 2, 32, 32),
-    "$ult.i8": (Kind.BITVECTOR_ULT, 2, 8, 8),
-    "$ugt.i64": (Kind.BITVECTOR_UGT, 2, 64, 64),
-    "$ugt.i32": (Kind.BITVECTOR_UGT, 2, 32, 32),
-    "$ugt.i8": (Kind.BITVECTOR_UGT, 2, 8, 8),
-    "$uge.i64": (Kind.BITVECTOR_UGE, 2, 64, 64),
-    "$uge.i32": (Kind.BITVECTOR_UGE, 2, 32, 32),
-    "$uge.i8": (Kind.BITVECTOR_UGE, 2, 8, 8),
+    # SMACK comparison helpers return ``i1``; the ``.bool`` variants
+    # return Bool.  See note above $ne.ref and the prelude in
+    # ``smack/lib/smack/Prelude.cpp``.
+    "$ult.ref": (Kind.BITVECTOR_ULT, 2, 64, 1),
+    "$ult.ref.bool": (Kind.BITVECTOR_ULT, 2, 64, bool),
+    "$ult.i64": (Kind.BITVECTOR_ULT, 2, 64, 1),
+    "$ult.i64.bool": (Kind.BITVECTOR_ULT, 2, 64, bool),
+    "$ult.i32": (Kind.BITVECTOR_ULT, 2, 32, 1),
+    "$ult.i32.bool": (Kind.BITVECTOR_ULT, 2, 32, bool),
+    "$ult.i8": (Kind.BITVECTOR_ULT, 2, 8, 1),
+    "$ult.i8.bool": (Kind.BITVECTOR_ULT, 2, 8, bool),
+    "$ugt.i64": (Kind.BITVECTOR_UGT, 2, 64, 1),
+    "$ugt.i64.bool": (Kind.BITVECTOR_UGT, 2, 64, bool),
+    "$ugt.i32": (Kind.BITVECTOR_UGT, 2, 32, 1),
+    "$ugt.i32.bool": (Kind.BITVECTOR_UGT, 2, 32, bool),
+    "$ugt.i8": (Kind.BITVECTOR_UGT, 2, 8, 1),
+    "$ugt.i8.bool": (Kind.BITVECTOR_UGT, 2, 8, bool),
+    "$uge.i64": (Kind.BITVECTOR_UGE, 2, 64, 1),
+    "$uge.i64.bool": (Kind.BITVECTOR_UGE, 2, 64, bool),
+    "$uge.i32": (Kind.BITVECTOR_UGE, 2, 32, 1),
+    "$uge.i32.bool": (Kind.BITVECTOR_UGE, 2, 32, bool),
+    "$uge.i8": (Kind.BITVECTOR_UGE, 2, 8, 1),
+    "$uge.i8.bool": (Kind.BITVECTOR_UGE, 2, 8, bool),
 
     # Signed greater than
     "$sgt.ref.bool": (Kind.BITVECTOR_SGT, 2, 64, bool),
-    "$sgt.i64": (Kind.BITVECTOR_SGT, 2, 64, 64),
-    "$sgt.i32": (Kind.BITVECTOR_SGT, 2, 32, 32),
-    "$sgt.i8": (Kind.BITVECTOR_SGT, 2, 8, 8),
+    "$sgt.i64": (Kind.BITVECTOR_SGT, 2, 64, 1),
+    "$sgt.i64.bool": (Kind.BITVECTOR_SGT, 2, 64, bool),
+    "$sgt.i32": (Kind.BITVECTOR_SGT, 2, 32, 1),
+    "$sgt.i32.bool": (Kind.BITVECTOR_SGT, 2, 32, bool),
+    "$sgt.i8": (Kind.BITVECTOR_SGT, 2, 8, 1),
+    "$sgt.i8.bool": (Kind.BITVECTOR_SGT, 2, 8, bool),
 
     # Signed greater than or equal to
     "$sge.ref.bool": (Kind.BITVECTOR_SGE, 2, 64, bool),
-    "$sge.i64": (Kind.BITVECTOR_SGE, 2, 64, 64),
-    "$sge.i32": (Kind.BITVECTOR_SGE, 2, 32, 32),
-    "$sge.i8": (Kind.BITVECTOR_SGE, 2, 8, 8),
+    "$sge.i64": (Kind.BITVECTOR_SGE, 2, 64, 1),
+    "$sge.i64.bool": (Kind.BITVECTOR_SGE, 2, 64, bool),
+    "$sge.i32": (Kind.BITVECTOR_SGE, 2, 32, 1),
+    "$sge.i32.bool": (Kind.BITVECTOR_SGE, 2, 32, bool),
+    "$sge.i8": (Kind.BITVECTOR_SGE, 2, 8, 1),
+    "$sge.i8.bool": (Kind.BITVECTOR_SGE, 2, 8, bool),
 
     # Signed less than or equal to
-    "$sle.i64": (Kind.BITVECTOR_SLE, 2, 64, 64),
-    "$sle.i32": (Kind.BITVECTOR_SLE, 2, 32, 32),
-    "$sle.i8": (Kind.BITVECTOR_SLE, 2, 8, 8),
+    "$sle.i64": (Kind.BITVECTOR_SLE, 2, 64, 1),
+    "$sle.i64.bool": (Kind.BITVECTOR_SLE, 2, 64, bool),
+    "$sle.i32": (Kind.BITVECTOR_SLE, 2, 32, 1),
+    "$sle.i32.bool": (Kind.BITVECTOR_SLE, 2, 32, bool),
+    "$sle.i8": (Kind.BITVECTOR_SLE, 2, 8, 1),
+    "$sle.i8.bool": (Kind.BITVECTOR_SLE, 2, 8, bool),
     "$sle.ref.bool": (Kind.BITVECTOR_SLE, 2, 64, bool),
 
     "$slt.ref.bool": (Kind.BITVECTOR_SLT, 2, 64, bool),
-    "$slt.i64": (Kind.BITVECTOR_SLT, 2, 64, 64),
-    "$slt.i32": (Kind.BITVECTOR_SLT, 2, 32, 32),
-    "$slt.i8": (Kind.BITVECTOR_SLT, 2, 8, 8),
-    "$ule.i64": (Kind.BITVECTOR_ULE, 2, 64, 64),
-    "$ule.i32": (Kind.BITVECTOR_ULE, 2, 32, 32),
-    "$ule.i8": (Kind.BITVECTOR_ULE, 2, 8, 8),
+    "$slt.i64": (Kind.BITVECTOR_SLT, 2, 64, 1),
+    "$slt.i64.bool": (Kind.BITVECTOR_SLT, 2, 64, bool),
+    "$slt.i32": (Kind.BITVECTOR_SLT, 2, 32, 1),
+    "$slt.i32.bool": (Kind.BITVECTOR_SLT, 2, 32, bool),
+    "$slt.i8": (Kind.BITVECTOR_SLT, 2, 8, 1),
+    "$slt.i8.bool": (Kind.BITVECTOR_SLT, 2, 8, bool),
+    "$ule.i64": (Kind.BITVECTOR_ULE, 2, 64, 1),
+    "$ule.i64.bool": (Kind.BITVECTOR_ULE, 2, 64, bool),
+    "$ule.i32": (Kind.BITVECTOR_ULE, 2, 32, 1),
+    "$ule.i32.bool": (Kind.BITVECTOR_ULE, 2, 32, bool),
+    "$ule.i8": (Kind.BITVECTOR_ULE, 2, 8, 1),
+    "$ule.i8.bool": (Kind.BITVECTOR_ULE, 2, 8, bool),
     "$urem.i64": (Kind.BITVECTOR_UREM, 2, 64, 64),
     "$urem.i32": (Kind.BITVECTOR_UREM, 2, 32, 32),
     "$urem.i8": (Kind.BITVECTOR_UREM, 2, 8, 8),
@@ -451,47 +496,83 @@ _INT_ENC_FN_MAP = {
     "$sub.i32": (Kind.SUB, 2, None, None),
     "$sub.i16": (Kind.SUB, 2, None, None),
     "$sub.i8":  (Kind.SUB, 2, None, None),
-    # Equality / inequality (already sort-polymorphic)
+    # Equality / inequality (already sort-polymorphic).  ``int_cmp``
+    # returns the i1-style 0/1 integer that Boogie's prelude uses for
+    # the non-``.bool`` variant; the ``.bool`` variant returns Bool.
     "$eq.ref": (Kind.EQUAL, 2, None, "int_cmp"),
+    "$eq.ref.bool": (Kind.EQUAL, 2, None, bool),
     "$eq.i64": (Kind.EQUAL, 2, None, "int_cmp"),
+    "$eq.i64.bool": (Kind.EQUAL, 2, None, bool),
     "$eq.i32": (Kind.EQUAL, 2, None, "int_cmp"),
+    "$eq.i32.bool": (Kind.EQUAL, 2, None, bool),
     "$eq.i8":  (Kind.EQUAL, 2, None, "int_cmp"),
+    "$eq.i8.bool": (Kind.EQUAL, 2, None, bool),
     "$eq.i1":  (Kind.EQUAL, 2, None, "int_cmp"),
+    "$eq.i1.bool": (Kind.EQUAL, 2, None, bool),
     "$ne.ref": (Kind.DISTINCT, 2, None, "int_cmp"),
+    "$ne.ref.bool": (Kind.DISTINCT, 2, None, bool),
     "$ne.i64": (Kind.DISTINCT, 2, None, "int_cmp"),
+    "$ne.i64.bool": (Kind.DISTINCT, 2, None, bool),
     "$ne.i32": (Kind.DISTINCT, 2, None, "int_cmp"),
+    "$ne.i32.bool": (Kind.DISTINCT, 2, None, bool),
     "$ne.i8":  (Kind.DISTINCT, 2, None, "int_cmp"),
+    "$ne.i8.bool": (Kind.DISTINCT, 2, None, bool),
     # Signed comparisons → integer comparisons
     "$slt.i32": (Kind.LT, 2, None, "int_cmp"),
+    "$slt.i32.bool": (Kind.LT, 2, None, bool),
     "$slt.i64": (Kind.LT, 2, None, "int_cmp"),
+    "$slt.i64.bool": (Kind.LT, 2, None, bool),
     "$slt.i8":  (Kind.LT, 2, None, "int_cmp"),
+    "$slt.i8.bool": (Kind.LT, 2, None, bool),
     "$slt.ref.bool": (Kind.LT, 2, None, bool),
     "$sle.i32": (Kind.LEQ, 2, None, "int_cmp"),
+    "$sle.i32.bool": (Kind.LEQ, 2, None, bool),
     "$sle.i64": (Kind.LEQ, 2, None, "int_cmp"),
+    "$sle.i64.bool": (Kind.LEQ, 2, None, bool),
     "$sle.i8":  (Kind.LEQ, 2, None, "int_cmp"),
+    "$sle.i8.bool": (Kind.LEQ, 2, None, bool),
     "$sle.ref.bool": (Kind.LEQ, 2, None, bool),
     "$sgt.i32": (Kind.GT, 2, None, "int_cmp"),
+    "$sgt.i32.bool": (Kind.GT, 2, None, bool),
     "$sgt.i64": (Kind.GT, 2, None, "int_cmp"),
+    "$sgt.i64.bool": (Kind.GT, 2, None, bool),
     "$sgt.i8":  (Kind.GT, 2, None, "int_cmp"),
+    "$sgt.i8.bool": (Kind.GT, 2, None, bool),
     "$sgt.ref.bool": (Kind.GT, 2, None, bool),
     "$sge.i32": (Kind.GEQ, 2, None, "int_cmp"),
+    "$sge.i32.bool": (Kind.GEQ, 2, None, bool),
     "$sge.i64": (Kind.GEQ, 2, None, "int_cmp"),
+    "$sge.i64.bool": (Kind.GEQ, 2, None, bool),
     "$sge.i8":  (Kind.GEQ, 2, None, "int_cmp"),
+    "$sge.i8.bool": (Kind.GEQ, 2, None, bool),
     "$sge.ref.bool": (Kind.GEQ, 2, None, bool),
     # Unsigned comparisons → same as signed in integer mode (no wraparound)
     "$ult.i32": (Kind.LT, 2, None, "int_cmp"),
+    "$ult.i32.bool": (Kind.LT, 2, None, bool),
     "$ult.i64": (Kind.LT, 2, None, "int_cmp"),
+    "$ult.i64.bool": (Kind.LT, 2, None, bool),
     "$ult.i8":  (Kind.LT, 2, None, "int_cmp"),
+    "$ult.i8.bool": (Kind.LT, 2, None, bool),
     "$ult.ref":  (Kind.LT, 2, None, "int_cmp"),
+    "$ult.ref.bool": (Kind.LT, 2, None, bool),
     "$ule.i32": (Kind.LEQ, 2, None, "int_cmp"),
+    "$ule.i32.bool": (Kind.LEQ, 2, None, bool),
     "$ule.i64": (Kind.LEQ, 2, None, "int_cmp"),
+    "$ule.i64.bool": (Kind.LEQ, 2, None, bool),
     "$ule.i8":  (Kind.LEQ, 2, None, "int_cmp"),
+    "$ule.i8.bool": (Kind.LEQ, 2, None, bool),
     "$ugt.i32": (Kind.GT, 2, None, "int_cmp"),
+    "$ugt.i32.bool": (Kind.GT, 2, None, bool),
     "$ugt.i64": (Kind.GT, 2, None, "int_cmp"),
+    "$ugt.i64.bool": (Kind.GT, 2, None, bool),
     "$ugt.i8":  (Kind.GT, 2, None, "int_cmp"),
+    "$ugt.i8.bool": (Kind.GT, 2, None, bool),
     "$uge.i32": (Kind.GEQ, 2, None, "int_cmp"),
+    "$uge.i32.bool": (Kind.GEQ, 2, None, bool),
     "$uge.i64": (Kind.GEQ, 2, None, "int_cmp"),
+    "$uge.i64.bool": (Kind.GEQ, 2, None, bool),
     "$uge.i8":  (Kind.GEQ, 2, None, "int_cmp"),
+    "$uge.i8.bool": (Kind.GEQ, 2, None, bool),
     # Division / remainder → integer ops
     "$sdiv.i32": (Kind.INTS_DIVISION, 2, None, None),
     "$sdiv.i64": (Kind.INTS_DIVISION, 2, None, None),
@@ -608,14 +689,24 @@ def detect_integer_encoding(program):
     if not has_int_alias:
         return False
 
-    # Look for SMACK's BV intrinsic function names — present in BV mode,
-    # absent in unbounded-integer mode.
+    # Look for SMACK's BV-mode integer arithmetic intrinsics — present
+    # only when SMACK was invoked with --integer-encoding bit-vector for
+    # the iN program types. Pointer/ref conversion helpers like
+    # ``$bv2int.64`` and ``$int2bv.64`` are emitted in both modes (SMACK
+    # always uses bv64 for ref) and must NOT be treated as BV-mode
+    # markers; restrict the check to the iN-arith intrinsics.
+    bv_arith_prefixes = (
+        '$add.bv', '$sub.bv', '$mul.bv', '$div.bv', '$rem.bv',
+        '$slt.bv', '$sle.bv', '$sgt.bv', '$sge.bv',
+        '$ult.bv', '$ule.bv', '$ugt.bv', '$uge.bv',
+        '$shl.bv', '$lshr.bv', '$ashr.bv',
+        '$and.bv', '$or.bv', '$xor.bv', '$not.bv',
+    )
     for d in program.declarations:
         if isinstance(d, FunctionDeclaration):
             name = getattr(d, 'name', '') or ''
-            if name.startswith('$add.bv') or name.startswith('$slt.bv') or \
-               name.startswith('$mul.bv') or name.startswith('$bv2int'):
-                return False  # BV intrinsics present → BV mode
+            if name.startswith(bv_arith_prefixes):
+                return False  # BV-mode arithmetic intrinsics present
 
     return True
 
@@ -870,7 +961,9 @@ def convert_expr_cvc5(cvc5_fn_map, state_cache, solver, expr, mono_mem: bool) ->
         if isinstance(expr, OldExpression):
             assert False
         elif isinstance(expr, LogicalNegation):
-            # If inner is BV1, convert to Bool before NOT
+            # If inner is BV1, convert to Bool before NOT. SMACK
+            # comparison helpers (e.g. ``$slt.i32``) return ``i1`` per
+            # the Boogie prelude, so the inner term lands here as BV1.
             if unary_expr.getSort().isBitVector() and unary_expr.getSort().getBitVectorSize() == 1:
                 unary_expr = solver.mkTerm(Kind.EQUAL, unary_expr, solver.mkBitVector(1, 1))
             return solver.mkTerm(Kind.NOT, unary_expr)
@@ -902,6 +995,13 @@ def convert_expr_cvc5(cvc5_fn_map, state_cache, solver, expr, mono_mem: bool) ->
             return solver.mkBoolean(True)
         else:
             return solver.mkBoolean(False)
+    elif isinstance(expr, BitvectorLiteral):
+        # ``Nbv<width>`` literal — produce a typed BV constant directly so
+        # callers (agent invariants like ``$i5 == 1bv1``) don't depend on
+        # the surrounding op to widen an Integer.
+        if _INTEGER_ENCODING:
+            return solver.mkInteger(str(expr.value))
+        return solver.mkBitVector(int(expr.base), int(expr.value))
     elif isinstance(expr, Term):
         return expr
     else:
@@ -1003,6 +1103,21 @@ def deserialize_predicate_helper(state_cache, predicate):
         predicate._cached_str = None
         predicate._cached_variable_terms = None
 
+def _constant_resolution_matches_name(term, expected_name: str) -> bool:
+    """Return whether a cached cvc5 CONSTANT still has the requested symbol.
+
+    The serialized form distinguishes a program constant named ``$0`` from a
+    BV literal value ``0``.  State caches are shared across parser, runtime, and
+    deserialization paths; if a stale or malformed cache entry under ``$0``
+    points at a literal, blindly trusting it erases the symbol during decode.
+    """
+    if term is None:
+        return False
+    try:
+        return term.getSymbol() == expected_name
+    except Exception:
+        return False
+
 def deserialize_cvc5_term(state_cache, root_term):
     # 1. FASTEST PATH: Check global cache
     if hasattr(state_cache, "cvc5_term_cache"):
@@ -1049,6 +1164,9 @@ def deserialize_cvc5_term(state_cache, root_term):
         # --- LEAVES: resolve immediately ---
         if op_kind == Kind.CONSTANT:
             res = state_cache.cvc5_var(term.var_name)
+            if res is not None and not _constant_resolution_matches_name(
+                    res, term.var_name):
+                res = None
             if not res:
                 sort_kind = NUM_TO_SORT[term.type]
                 if sort_kind == SortKind.BOOLEAN_SORT:
@@ -1063,8 +1181,11 @@ def deserialize_cvc5_term(state_cache, root_term):
                     res = mkConst(solver.mkArraySort(idx_sort, elem_sort), term.var_name)
                 else:
                     raise ValueError(f"Unknown sort: {sort_kind}")
-                from src.state.redis_keys import put_cvc5_var
-                put_cvc5_var(state_cache.redis, term.var_name, res)
+                put_runtime = getattr(state_cache, "put_runtime_cvc5_var", None)
+                if callable(put_runtime):
+                    put_runtime(term.var_name, res)
+                else:
+                    state_cache.cached_id_to_cvc5[term.var_name] = res
             memo[term] = res
             stack.pop()
             continue
@@ -1418,16 +1539,8 @@ class HollowCvc5Term:
 
 def deserialize_state_key(state_cache, state_key):
     from src.state.proof_obligation import ProofObligation
-    from src.abduction.wp_depth import restore_or_record_wp_depth, wp_depth_of
     pc, predicate = pickle.loads(state_key)
     predicate.predicate = deserialize_cvc5_term(state_cache, predicate.predicate)
-    restore_or_record_wp_depth(
-        state_cache,
-        pc,
-        predicate,
-        default=wp_depth_of(predicate),
-        source="deserialize_state_key",
-    )
     return ProofObligation(pc, predicate)
 
 
@@ -1852,20 +1965,32 @@ def parse_constraint_tuple(tuple_str):
         "array": None
     }
 
-    # --- TYPE 4: Disjunction ---
+    # --- TYPE 4: Disjunction of constants ---
     if r"\/" in body:
-        parts = body.split(r"\/")
-        first_match = re.search(r"\((.*?)\)\s*==\s*\((.*?)\)", parts[0])
-        
-        if first_match:
-            result["variable"] = first_match.group(1).strip()
+        parts = [p.strip() for p in body.split(r"\/")]
+        disjuncts = []
+        for part in parts:
+            # This fast path is only for simple finite-domain predicates
+            # such as ``($i0) == (1) \/ ($i0) == (2)``.  Mixed Boolean
+            # formulas containing a top-level disjunction must fall through
+            # to the general infix parser; otherwise a left conjunction can
+            # be misread as the "variable" and later crash EQ_CONST.
+            match_const = re.fullmatch(
+                r"\(?\s*([\$\w.]+(?:\[[^\]]+\])?)\s*\)?"
+                r"\s*==\s*"
+                r"\(?\s*(-?\d+)\s*\)?",
+                part,
+            )
+            if not match_const:
+                disjuncts = []
+                break
+            disjuncts.append((match_const.group(1).strip(),
+                              int(match_const.group(2))))
+
+        if disjuncts and len({var for var, _c in disjuncts}) == 1:
+            result["variable"] = disjuncts[0][0]
             result["type"] = "disjunction_of_constants"
-            constants = []
-            for p in parts:
-                c_match = re.search(r"==\s*\(\s*(\d+)\s*\)", p)
-                if c_match:
-                    constants.append(int(c_match.group(1)))
-            result["allowed_values"] = constants
+            result["allowed_values"] = [c for _var, c in disjuncts]
             return result
 
     # --- EQUALITIES ---
@@ -1962,7 +2087,7 @@ def parse_constraint_tuple(tuple_str):
 
         # --- TYPE 1: Constant Comparison ---
         # Generic fallback for standard variables (e.g. ($i6640) == (18))
-        if is_digit_rhs and "[" not in lhs:
+        if is_digit_rhs and "[" not in lhs and re.match(r'^[\$\w.]+$', lhs):
             result["type"] = "constant_comparison"
             result["variable"] = lhs
             result["constant"] = int(rhs)
@@ -1994,14 +2119,18 @@ def _parse_infix_expr(s, state_cache):
         '==': Kind.EQUAL, '!=': Kind.DISTINCT,
     }
 
-    # Logical (Bool-theory) operators — agent-authored invariants
-    # commonly use ``||``, ``&&``, and Boogie's ``==>`` to combine
-    # comparison predicates.  When both operands are Bool we route
-    # through the Bool-theory Kind instead of the BV one.
+    # Logical (Bool-theory) operators.  Agent-authored invariants
+    # commonly use ``||``, ``&&``, and Boogie's ``==>``; Swoosh's
+    # term renderer emits ``\/``, ``/\``, and ``=>``.  Accept both
+    # spellings so rendered proof targets round-trip through this
+    # parser instead of treating ``/`` as BV division.
     _BOOL_OPS = {
         '||': Kind.OR,
+        '\\/': Kind.OR,
         '&&': Kind.AND,
+        '/\\': Kind.AND,
         '==>': Kind.IMPLIES,
+        '=>': Kind.IMPLIES,
     }
 
     # Operator precedence (lower = binds tighter, but all >= 0 so the
@@ -2009,8 +2138,8 @@ def _parse_infix_expr(s, state_cache):
     # connectives are the loosest so ``a < b || c <= d`` parses as
     # ``(a < b) || (c <= d)``; ``==>`` is looser than ``||`` / ``&&``.
     _PREC = {
-        '==>': 0,
-        '||': 1, '&&': 1,
+        '==>': 0, '=>': 0,
+        '||': 1, '\\/': 1, '&&': 1, '/\\': 1,
         '==': 2, '!=': 2,
         '<': 3, '>': 3, '<=': 3, '>=': 3,
         '+': 4, '-': 4,
@@ -2053,13 +2182,16 @@ def _parse_infix_expr(s, state_cache):
         elif s[i:i+3] in ('==>',):
             tokens.append(('OP', s[i:i+3]))
             i += 3
-        elif s[i:i+2] in ('>>', '<<', '<=', '>=', '==', '!=', '||', '&&'):
+        elif s[i:i+2] in (
+            '>>', '<<', '<=', '>=', '==', '!=',
+            '||', '\\/', '&&', '/\\', '=>',
+        ):
             tokens.append(('OP', s[i:i+2]))
             i += 2
-        elif s[i] in '+-*/%<>&^~':
+        elif s[i] in '+-*/%<>&^~!':
             tokens.append(('OP', s[i]))
             i += 1
-        elif s[i] in '()[],':
+        elif s[i] in '()[],:?':
             tokens.append((s[i], s[i]))
             i += 1
         else:
@@ -2159,6 +2291,92 @@ def _parse_infix_expr(s, state_cache):
         except Exception:
             return False
 
+    def _parse_call_args():
+        args = []
+        expect('(')
+        if peek()[0] == ')':
+            advance()
+            return args
+        while True:
+            args.append(parse_expr(0))
+            typ, _val = peek()
+            if typ == ',':
+                advance()
+                continue
+            expect(')')
+            return args
+
+    def _mk_function_call(name, args):
+        fn_map = get_fn_map()
+        if name not in fn_map:
+            raise ValueError(f"Unknown function: {name}")
+        cvc5_op, expected_args, op_bit_width, output_type = fn_map[name][:4]
+        if expected_args is not None and len(args) != expected_args:
+            raise ValueError(
+                f"{name} expects {expected_args} args, got {len(args)}")
+
+        if _INTEGER_ENCODING and op_bit_width is None:
+            fixed_args = []
+            for arg in args:
+                if arg.getSort().isBoolean():
+                    fixed_args.append(solver.mkTerm(
+                        Kind.ITE, arg, solver.mkInteger(1),
+                        solver.mkInteger(0)))
+                else:
+                    fixed_args.append(arg)
+            if cvc5_op is None:
+                if len(fixed_args) != 1:
+                    raise ValueError(f"{name} identity cast needs one arg")
+                return fixed_args[0]
+            if output_type == "int_cmp":
+                cond = solver.mkTerm(cvc5_op, *fixed_args)
+                if not cond.getSort().isBoolean():
+                    cond = cvc5_cast_to_bool(solver, cond)
+                return solver.mkTerm(
+                    Kind.ITE, cond, solver.mkInteger(1),
+                    solver.mkInteger(0))
+            ret = solver.mkTerm(cvc5_op, *fixed_args)
+            if output_type == bool and not ret.getSort().isBoolean():
+                ret = cvc5_cast_to_bool(solver, ret)
+            return ret
+
+        fixed_args = [cvc5_cast_to_bv(solver, arg, op_bit_width)
+                      for arg in args]
+        if cvc5_op is None:
+            if len(fixed_args) != 1:
+                raise ValueError(f"{name} identity cast needs one arg")
+            return fixed_args[0]
+        ret = solver.mkTerm(cvc5_op, *fixed_args)
+        if output_type == bool:
+            return cvc5_cast_to_bool(solver, ret)
+        return cvc5_cast_to_bv(solver, ret, output_type)
+
+    def _coerce_ite_branches(then_term, else_term):
+        """Make C-style ternary branches share a cvc5 sort."""
+        try:
+            if then_term.getSort() == else_term.getSort():
+                return then_term, else_term
+            if then_term.getSort().isBoolean() and else_term.getSort().isBitVector():
+                return cvc5_cast_to_bv(
+                    solver, then_term, else_term.getSort().getBitVectorSize()), else_term
+            if else_term.getSort().isBoolean() and then_term.getSort().isBitVector():
+                return then_term, cvc5_cast_to_bv(
+                    solver, else_term, then_term.getSort().getBitVectorSize())
+            if then_term.getSort().isBitVector() and else_term.getSort().isBitVector():
+                return _match_bv_sorts(solver, then_term, else_term)
+            if _either_int(then_term, else_term):
+                return _coerce_to_int(then_term), _coerce_to_int(else_term)
+        except Exception:
+            pass
+        return then_term, else_term
+
+    def _mk_ite(cond_term, then_term, else_term):
+        cond = _unwrap_bool_or_bv1(cond_term)
+        if cond is None:
+            cond = cvc5_cast_to_bool(solver, cond_term)
+        then_term, else_term = _coerce_ite_branches(then_term, else_term)
+        return solver.mkTerm(Kind.ITE, cond, then_term, else_term)
+
     def parse_expr(min_prec=0):
         left = parse_primary()
         while True:
@@ -2214,6 +2432,12 @@ def _parse_infix_expr(s, state_cache):
                 if val in ('<', '>', '<=', '>=') and result.getSort().isBoolean():
                     result = _bool_to_bv1(result)
             left = result
+        if min_prec <= 0 and peek()[0] == '?':
+            advance()
+            then_term = parse_expr(0)
+            expect(':')
+            else_term = parse_expr(0)
+            left = _mk_ite(left, then_term, else_term)
         return left
 
     def parse_primary():
@@ -2229,6 +2453,9 @@ def _parse_infix_expr(s, state_cache):
                 expect(']')
                 return solver.mkTerm(Kind.SELECT, expr, idx)
             return expr
+        elif typ == 'ID' and val in ('true', 'false'):
+            advance()
+            return solver.mkBoolean(val == 'true')
         elif typ == 'ID' and val == 'STORE':
             advance()
             expect('(')
@@ -2241,6 +2468,8 @@ def _parse_infix_expr(s, state_cache):
             return solver.mkTerm(Kind.STORE, arr, idx, v)
         elif typ == 'ID':
             advance()
+            if peek()[0] == '(':
+                return _mk_function_call(val, _parse_call_args())
             term = state_cache.cvc5_var(val)
             if term is None:
                 raise ValueError(f"Unknown variable: {val}")
@@ -2257,8 +2486,9 @@ def _parse_infix_expr(s, state_cache):
             # scalar width.  _match_bv_sorts will resize on sort
             # mismatch when the other operand is BV64 etc.
             return solver.mkBitVector(32, int(val))
-        elif typ == 'OP' and val == '~':
-            # Boogie-style negation: ``~(expr)``.  The operand's sort
+        elif typ == 'OP' and val in ('~', '!'):
+            # Boogie-style negation: ``~(expr)`` or ``!(expr)``.
+            # The operand's sort
             # decides whether to emit a Bool NOT or a BV NOT.
             # Predicates like ``~($i1 >= 0)`` land here with a Bool
             # operand (after fix #3 unwrapped the top-level
@@ -2267,6 +2497,9 @@ def _parse_infix_expr(s, state_cache):
             advance()
             operand = parse_primary()
             try:
+                unwrapped = _unwrap_bool_or_bv1(operand)
+                if unwrapped is not None and unwrapped.getSort().isBoolean():
+                    return solver.mkTerm(Kind.NOT, unwrapped)
                 if operand.getSort().isBoolean():
                     return solver.mkTerm(Kind.NOT, operand)
             except Exception:

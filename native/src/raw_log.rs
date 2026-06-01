@@ -9,18 +9,18 @@
 //! On-disk format:
 //!   header (in frame 0):
 //!     magic = b"SWRL"                4 bytes
-//!     version = 1                    1 byte
+//!     version = 2                    1 byte
 //!     var_table_len (u32 LE)         4 bytes
 //!     var_table = [len:u16, bytes]*  variable
 //!     block_table_len (u32 LE)       4 bytes
 //!     block_table = [len:u16, bytes]*variable
 //!   records (repeated across frames 1..N):
-//!     kind (u8)    1 byte  — `b'W'` write / `b'R'` read
-//!     var_id (u32) 4 bytes
-//!     pc (u32)     4 bytes
-//!     block_id(u32)4 bytes
+//!     kind (u8)    1 byte  — `b'W'` write / `b'R'` read / `b'I'` iter context
+//!     var_id (u32) 4 bytes — variable id, or context id for `b'I'`
+//!     pc (u32)     4 bytes — pc, or parent context id for `b'I'`
+//!     block_id(u32)4 bytes — block id, or loop header block id for `b'I'`
 //!     value(i64)   8 bytes
-//!     iter_id(u32) 4 bytes
+//!     iter_id(u32) 4 bytes — context id, or depth for `b'I'`
 //!   = 25 bytes/record
 //!
 //! All fields are little-endian. The byte stream is wrapped in one or
@@ -36,7 +36,7 @@ use std::io::{BufWriter, Write};
 use std::path::Path;
 
 pub const MAGIC: &[u8; 4] = b"SWRL";
-pub const VERSION: u8 = 1;
+pub const VERSION: u8 = 2;
 pub const RECORD_SIZE: usize = 1 + 4 + 4 + 4 + 8 + 4;
 
 /// Number of zstd encoder worker threads. Multi-worker encoding within

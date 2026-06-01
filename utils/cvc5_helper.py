@@ -14,6 +14,7 @@ KIND_TRANSLATIONS = {
     Kind.ADD: "+",
     Kind.MULT: "*",
     Kind.SUB: "-",
+    Kind.NEG: "-",
     Kind.DIVISION: "/",
     Kind.ITE: "if",
     Kind.LEQ: "<=",
@@ -54,6 +55,36 @@ KIND_TRANSLATIONS = {
     Kind.BITVECTOR_SDIV: "/",
     Kind.XOR: "^",
 }
+
+_LOW_PRECEDENCE_ARITH = {
+    Kind.ADD,
+    Kind.SUB,
+    Kind.BITVECTOR_ADD,
+    Kind.BITVECTOR_SUB,
+}
+
+_MULTIPLICATIVE_KINDS = {
+    Kind.MULT,
+    Kind.DIVISION,
+    Kind.BITVECTOR_MULT,
+    Kind.BITVECTOR_UDIV,
+    Kind.BITVECTOR_SDIV,
+}
+
+
+def _term_to_string_child(term, parent_kind, id_to_cexpr=None, depth=0, indent=0):
+    rendered = term_to_string(term, id_to_cexpr, depth, indent)
+    if term is None or term.getNumChildren() == 0:
+        return rendered
+    child_kind = term.getKind()
+    if parent_kind in _MULTIPLICATIVE_KINDS and child_kind in _LOW_PRECEDENCE_ARITH:
+        return f"({rendered})"
+    if parent_kind in (Kind.SUB, Kind.BITVECTOR_SUB) and child_kind in _LOW_PRECEDENCE_ARITH:
+        return f"({rendered})"
+    if parent_kind in (Kind.NEG, Kind.BITVECTOR_NEG) and child_kind in _LOW_PRECEDENCE_ARITH:
+        return f"({rendered})"
+    return rendered
+
 
 def get_canonical_name(expr):
     # Retrieves the actual variable name (as seen in the Boogie code) from the cvc5 term
@@ -141,10 +172,18 @@ def term_to_string(term, id_to_cexpr=None, depth=0, indent=0):
 
         if current_kind == Kind.NOT:
             expr = term_to_string(term[0], id_to_cexpr, depth + 1)
-            return f"{prefix}~({expr})"
+            # ``~`` is BITWISE NOT in Boogie / SMACK; logical NOT is
+            # ``!``.  Emitting ``~`` here produced strings like
+            # ``~($i5 == 0)`` that cvc5's parser later rejected with
+            # ``unknown function application: ~(($i5 == 0))`` —
+            # ``$i5 == 0`` is Bool, ``~`` only applies to bit-vectors.
+            # The bug surfaced as a ``target_parse_error`` blocking
+            # check-llm-invariants on every transformed assertion.
+            return f"{prefix}!({expr})"
 
-        if current_kind == Kind.BITVECTOR_NEG:
-            expr = term_to_string(term[0], id_to_cexpr, depth + 1)
+        if current_kind in (Kind.NEG, Kind.BITVECTOR_NEG):
+            expr = _term_to_string_child(
+                term[0], current_kind, id_to_cexpr, depth + 1)
             return f"{prefix}(-{expr})"
 
         if current_kind == Kind.IMPLIES:
@@ -193,12 +232,22 @@ def term_to_string(term, id_to_cexpr=None, depth=0, indent=0):
                 if lo.isBitVectorValue() and int(lo.getBitVectorValue(), 2) == 0:
                     n_zeros = lo.getSort().getBitVectorSize()
                     if hi.getKind() == Kind.BITVECTOR_EXTRACT:
-                        inner = term_to_string(hi[0], id_to_cexpr, depth + 1, indent)
+                        inner = _term_to_string_child(
+                            hi[0],
+                            Kind.BITVECTOR_MULT,
+                            id_to_cexpr,
+                            depth + 1,
+                            indent,
+                        )
                         multiplier = 1 << n_zeros
                         return f"{prefix}{multiplier} * {inner}"
 
         # Binary/n-ary operators (ADD, MULT, AND, OR, etc.)
-        children = [term_to_string(term[i], id_to_cexpr, depth + 1, indent) for i in range(term.getNumChildren())]
+        children = [
+            _term_to_string_child(
+                term[i], current_kind, id_to_cexpr, depth + 1, indent)
+            for i in range(term.getNumChildren())
+        ]
         expression = f" {operator} ".join(children)
         return expression
     else:
@@ -301,4 +350,3 @@ def pretty_term(term, id_to_cexpr=None, indent=0, indent_str="    "):
 
     # Atomic — single line
     return pad + term_to_string(term, id_to_cexpr)
-
