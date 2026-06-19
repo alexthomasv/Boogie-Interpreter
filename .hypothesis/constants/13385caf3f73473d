@@ -1,0 +1,4 @@
+# file: /home/ubuntu/boogie-parser/interpreter/coverage_gen/symbolic_state.py
+# hypothesis_version: 6.151.9
+
+[255, '0', '0X', '0x', 'buffer', 'buffer_byte', 'buffer_index', 'buffers', 'byte_index', 'contents', 'extra_byte', 'extra_data', 'extra_index', 'field_index', 'havoc', 'havoc_index', 'havoc_seq', 'havoc_var', 'input_var', 'kind', 'ones', 'private', 'scalar', 'size', 'struct', 'struct_buffer_byte', 'struct_scalar_byte', 'value', 'var', 'variables']

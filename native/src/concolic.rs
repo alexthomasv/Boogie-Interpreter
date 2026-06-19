@@ -753,7 +753,7 @@ impl<'a> Engine<'a> {
         let mut event_fields = vec![
             ("reason", reason.to_string()),
             ("pc", self.vm.pc.to_string()),
-            ("block", self.vm.curr_block.clone()),
+            ("block", self.vm.block_name(self.program)),
         ];
         for (key, value) in fields {
             event_fields.push((*key, value.clone()));
@@ -777,7 +777,7 @@ impl<'a> Engine<'a> {
                         &[
                             ("depth", depth.to_string()),
                             ("max_path_depth", self.max_path_depth.to_string()),
-                            ("block", self.vm.curr_block.clone()),
+                            ("block", self.vm.block_name(self.program)),
                         ],
                     );
                 }
@@ -799,8 +799,7 @@ impl<'a> Engine<'a> {
             }
 
             let block = &self.program.blocks[block_id as usize];
-            self.vm.explored_blocks.insert(block_id);
-            self.vm.curr_block.clone_from(&block.name);
+            self.vm.mark_explored(block_id);
             self.vm.curr_block_id = block_id;
             self.vm.pc = block.start_pc;
             if !self.vm.no_trace {
@@ -835,7 +834,6 @@ impl<'a> Engine<'a> {
             return true;
         }
         let entry = &self.program.blocks[self.program.entry_block as usize];
-        self.vm.curr_block.clone_from(&entry.name);
         self.vm.curr_block_id = self.program.entry_block;
         self.vm.pc = entry.start_pc;
         for (idx, expr) in self.program.entry_preconditions.iter().enumerate() {
@@ -1410,7 +1408,7 @@ impl<'a> Engine<'a> {
                 self.candidate_score(CandidateKind::ValueProfile, &target_block);
             let inserted = self.push_candidate(Candidate {
                 updates,
-                source_block: self.vm.curr_block.clone(),
+                source_block: self.vm.block_name(self.program),
                 target_block,
                 branch_index: 0,
                 kind: CandidateKind::ValueProfile,
@@ -1478,7 +1476,7 @@ impl<'a> Engine<'a> {
             priority += distance_bonus;
             let inserted = self.push_candidate(Candidate {
                 updates,
-                source_block: self.vm.curr_block.clone(),
+                source_block: self.vm.block_name(self.program),
                 target_block,
                 branch_index: 0,
                 kind: CandidateKind::DistanceGuided,
@@ -1562,7 +1560,7 @@ impl<'a> Engine<'a> {
                         if let Some(bool_expr) = sym_bool_text(sym) {
                             self.stats.objectives += 1;
                             self.try_solve(
-                                self.vm.curr_block.clone(),
+                                self.vm.block_name(self.program),
                                 format!("assert@{}", self.vm.pc),
                                 0,
                                 bool_expr,
@@ -1883,30 +1881,25 @@ impl<'a> Engine<'a> {
             return;
         };
 
+        // Keep the per-entry structure: the symbolic mirror tracks exactly
+        // which concrete addrs were initialized, so this cannot Arc-share.
         let copied: Vec<(i64, i64, Option<Sym>)> = self.vm.memory_maps[map_idx]
-            .memory
-            .iter()
-            .filter_map(|(&addr, &value)| {
-                if addr >= src && addr < src_end {
-                    Some((
-                        dst + (addr - src),
-                        value,
-                        self.sym_maps[map_idx].get(&addr).cloned(),
-                    ))
-                } else {
-                    None
-                }
+            .iter_init_range(src, src_end)
+            .map(|(addr, value)| {
+                (
+                    dst + (addr - src),
+                    value,
+                    self.sym_maps[map_idx].get(&addr).cloned(),
+                )
             })
             .collect();
         let clear: Vec<i64> = self.vm.memory_maps[map_idx]
-            .memory
-            .keys()
-            .filter(|&&addr| addr >= dst && addr < dst_end)
-            .copied()
+            .iter_init_range(dst, dst_end)
+            .map(|(addr, _)| addr)
             .collect();
 
         for addr in clear {
-            self.vm.memory_maps[map_idx].memory.remove(&addr);
+            self.vm.memory_maps[map_idx].remove(addr);
             self.sym_maps[map_idx].remove(&addr);
         }
         for (addr, value, sym) in copied {
@@ -1925,9 +1918,8 @@ impl<'a> Engine<'a> {
     {
         if let (Some(src_idx), Some(dst_idx)) = (self.get_map_idx(m_src), self.get_map_idx(m_ret)) {
             let addrs: Vec<i64> = self.vm.memory_maps[src_idx]
-                .memory
-                .keys()
-                .copied()
+                .iter_init()
+                .map(|(addr, _)| addr)
                 .filter(|addr| pred(*addr, boundary))
                 .collect();
             for addr in addrs {

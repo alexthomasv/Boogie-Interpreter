@@ -1,0 +1,4 @@
+# file: /home/ubuntu/boogie-parser/interpreter/coverage_gen/writer.py
+# hypothesis_version: 6.151.9
+
+['$', ', ', '.', '//', '// @private', '0', '0x', '0x00', ':', '?', '_', 'buffer', 'contents', 'name', 'size', 'value', '};']

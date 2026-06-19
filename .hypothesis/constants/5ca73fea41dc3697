@@ -1,0 +1,4 @@
+# file: /home/ubuntu/boogie-parser/interpreter/parser/node.py
+# hypothesis_version: 6.151.9
+
+['attributes', 'bind', 'children', 'declaration', 'key', 'values']

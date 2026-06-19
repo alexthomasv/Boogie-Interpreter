@@ -1,0 +1,4 @@
+# file: /home/ubuntu/boogie-parser/interpreter/utils/indent_log.py
+# hypothesis_version: 6.151.9
+
+[0.1, '  - %r', '  ... and %d more', '%', 'level', 'max_items', 'swoosh.abduction', '✓', '✗']

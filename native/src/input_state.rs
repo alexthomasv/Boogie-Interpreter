@@ -140,12 +140,12 @@ fn export_var_store<'py>(
 fn export_memory_maps<'py>(py: Python<'py>, vm: &VM) -> PyResult<Bound<'py, PyDict>> {
     let out = PyDict::new_bound(py);
     for map in &vm.memory_maps {
-        if map.memory.is_empty() {
+        if map.is_init_empty() {
             continue;
         }
         let contents = PyDict::new_bound(py);
-        for (addr, value) in &map.memory {
-            contents.set_item(*addr, *value)?;
+        for (addr, value) in map.iter_init() {
+            contents.set_item(addr, value)?;
         }
         out.set_item(map.name.as_str(), contents)?;
     }

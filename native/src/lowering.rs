@@ -3,6 +3,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyTuple};
 use rustc_hash::FxHashMap;
 
+pub(crate) mod fold;
 pub(crate) mod inline;
 
 /// An active inlining frame. While lowering an inlined callee's body, its
@@ -511,6 +512,19 @@ pub fn lower_program_full(
         }
     }
 
+    // Post-inline ConstantFoldPass equivalent for the direct lowering path
+    // (the inline path folds interleaved in flush_block). Fold semantics
+    // match vm::eval exactly, so results and traces are unchanged.
+    for block in blocks.iter_mut() {
+        for stmt in block.body.iter_mut() {
+            fold::fold_stmt(stmt);
+        }
+        if let Some(cond) = block.assume_cond.as_mut() {
+            fold::fold_in_place(cond);
+        }
+    }
+    normalize_is_external_assumes(&mut blocks);
+
     Ok(CompiledProgram {
         blocks,
         label_to_block,
@@ -530,6 +544,68 @@ pub fn lower_program_full(
         loop_parent_header,
         static_scalars: Vec::new(),
     })
+}
+
+/// True if `expr` mentions `$isExternal` anywhere in its tree.
+pub(crate) fn expr_contains_is_external(expr: &Expr) -> bool {
+    match expr {
+        Expr::IsExternal => true,
+        Expr::Var(_) | Expr::Const(_) | Expr::Bool(_) => false,
+        Expr::BinOp { lhs, rhs, .. } => {
+            expr_contains_is_external(lhs) || expr_contains_is_external(rhs)
+        }
+        Expr::Builtin { args, .. } => args.iter().any(expr_contains_is_external),
+        Expr::Store {
+            map, index, value, ..
+        } => {
+            expr_contains_is_external(map)
+                || expr_contains_is_external(index)
+                || expr_contains_is_external(value)
+        }
+        Expr::Load { map, index, .. } => {
+            expr_contains_is_external(map) || expr_contains_is_external(index)
+        }
+        Expr::IfThenElse { cond, then_, else_ } => {
+            expr_contains_is_external(cond)
+                || expr_contains_is_external(then_)
+                || expr_contains_is_external(else_)
+        }
+        Expr::Not(inner) => expr_contains_is_external(inner),
+    }
+}
+
+/// Rewrite `assume e` to `AssumeTrue` when `e` mentions `$isExternal`.
+///
+/// `$isExternal` is a verifier-only hint; concrete execution always skips
+/// such assumes (the VM used to detect them with a per-execution tree walk).
+/// Normalizing once here keeps the exact skip semantics while removing the
+/// walk from the hot path. Also applied in `load_compiled` so `.swcp`
+/// packages serialized before this pass stay correct.
+pub(crate) fn normalize_is_external_assumes(blocks: &mut [Block]) {
+    fn normalize_stmts(stmts: &mut [Stmt]) {
+        for stmt in stmts.iter_mut() {
+            match stmt {
+                Stmt::Assume { expr } => {
+                    if expr_contains_is_external(expr) {
+                        *stmt = Stmt::AssumeTrue;
+                    }
+                }
+                Stmt::If {
+                    then_body,
+                    else_body,
+                    ..
+                } => {
+                    normalize_stmts(then_body);
+                    normalize_stmts(else_body);
+                }
+                Stmt::While { body, .. } => normalize_stmts(body),
+                _ => {}
+            }
+        }
+    }
+    for block in blocks.iter_mut() {
+        normalize_stmts(&mut block.body);
+    }
 }
 
 /// Lower a Python statement to a Rust Stmt.

@@ -1,0 +1,4 @@
+# file: /home/ubuntu/boogie-parser/interpreter/coverage_gen/mutator.py
+# hypothesis_version: 6.151.9
+
+[100, 127, 128, 254, 255, 256, 65535, 65536, 18446744073709551615, '0', '0x', 'buffer', 'contents', 'size', 'value']

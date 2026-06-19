@@ -1,0 +1,4 @@
+# file: /home/ubuntu/boogie-parser/interpreter/parser/declaration.py
+# hypothesis_version: 6.151.9
+
+[' <: ', ' complete', '$label', ', ', ': ', ';', 'arguments', 'body', 'expression', 'finite', 'name', 'names', 'order_spec', 'parameters', 'return_type', 'returns', 'specifications', 'type', 'type_arguments', 'unique', 'where']

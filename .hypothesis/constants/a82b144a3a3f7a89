@@ -1,0 +1,4 @@
+# file: /home/ubuntu/boogie-parser/interpreter/parser/boogie_parser.py
+# hypothesis_version: 6.151.9
+
+[', ', '[^<:]:[^:]', '\\A\\s*[\\w$\\\\.]+:.*;', 'auto', 'block', 'blocks', 'boogie.lark', 'decl', 'declaration', 'expr', 'expression', 'lalr', 'param', 'param_decl', 'program', 'spec', 'start', 'statement', 'stmt', 'type']

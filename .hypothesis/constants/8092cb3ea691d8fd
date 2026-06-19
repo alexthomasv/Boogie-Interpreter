@@ -1,0 +1,4 @@
+# file: /home/ubuntu/boogie-parser/interpreter/utils/raw_log.py
+# hypothesis_version: 6.151.9
+
+[b'SWRL', 255, 1024, 65535, '<BIIIqI', '<H', '<I', 'utf-8', 'wb']

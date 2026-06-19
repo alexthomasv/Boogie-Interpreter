@@ -2,9 +2,27 @@ use crate::builtins;
 use crate::memory_map::MemoryMap;
 use crate::opcodes::*;
 use crate::trace::{TraceAccumulator, OP_READ, OP_WRITE};
-use rustc_hash::FxHashSet;
 
 const MASK_64: i64 = -1i64; // all bits set = u64::MAX as i64
+
+/// Surface symbol for a Boogie binary operator (for failing-assume messages).
+fn binop_symbol(op: &BinOp) -> &'static str {
+    match op {
+        BinOp::Eq => "==",
+        BinOp::Ne => "!=",
+        BinOp::Lt => "<",
+        BinOp::Gt => ">",
+        BinOp::Le => "<=",
+        BinOp::Ge => ">=",
+        BinOp::And => "&&",
+        BinOp::Or => "||",
+        BinOp::Implies => "==>",
+        BinOp::Iff => "<==>",
+        BinOp::Sub => "-",
+        BinOp::Mul => "*",
+        BinOp::Add => "+",
+    }
+}
 
 /// Runtime value — either a scalar or a memory map index.
 #[derive(Debug, Clone)]
@@ -27,6 +45,13 @@ pub enum ExecutionStatus {
         pc: u32,
         block: String,
         reason: &'static str,
+        /// Human-readable description of WHICH assume failed and why — the
+        /// rendered condition plus the concrete values of the scalar variables
+        /// it references (e.g. `($i3 >= 0)  [where $i3=-1]`). Empty when no
+        /// expression is available (e.g. an infeasible goto with no candidate
+        /// guard). Surfaced to Python as `invalid_detail` so an agent fixing a
+        /// stale input knows exactly which precondition the input violates.
+        detail: String,
     },
     StepLimit {
         pc: u32,
@@ -47,14 +72,23 @@ pub struct VM {
     pub var_to_map: Vec<Option<usize>>,
     /// Current PC
     pub pc: u32,
-    /// Current block name
-    pub curr_block: String,
-    /// Current block ID (for trace — avoids string allocation)
+    /// Current block ID (names are materialized only on error paths and at
+    /// the Python boundary — see `block_name`)
     pub curr_block_id: u32,
-    /// Explored block IDs. Names are materialized only at the Python boundary.
-    pub explored_blocks: FxHashSet<BlockId>,
-    /// Ordered block entries for lightweight path/edge coverage.
+    /// Explored-block bitset, indexed by BlockId (parallel to program.blocks).
+    pub explored_blocks: Vec<bool>,
+    /// Number of distinct blocks explored (popcount of `explored_blocks`).
+    pub explored_count: usize,
+    /// Ordered block entries for lightweight path/edge coverage. Only
+    /// recorded when `record_block_trace` is set; `block_entries` keeps the
+    /// total count either way.
     pub block_trace: Vec<BlockId>,
+    /// Whether to record the ordered `block_trace` (returned to Python as
+    /// `block_sequence`). Long runs enter millions of blocks — callers that
+    /// don't need the sequence turn this off.
+    pub record_block_trace: bool,
+    /// Total number of block entries (what `block_trace.len()` would be).
+    pub block_entries: u64,
     /// Compact trace accumulator
     pub trace: TraceAccumulator,
     /// Whether to log reads
@@ -79,6 +113,8 @@ pub struct VM {
     /// Per-variable nondet schedules loaded from .input int_seq entries.
     pub havoc_sequences: Vec<Option<Vec<i64>>>,
     pub havoc_counts: Vec<usize>,
+    /// Reusable RHS-evaluation buffer for AssignN (avoids a per-statement Vec).
+    scratch_evals: Vec<EvalResult>,
 }
 
 impl VM {
@@ -112,10 +148,12 @@ impl VM {
             memory_maps: Vec::new(),
             var_to_map,
             pc: 0,
-            curr_block: String::new(),
             curr_block_id: 0,
-            explored_blocks: FxHashSet::default(),
+            explored_blocks: vec![false; program.blocks.len()],
+            explored_count: 0,
             block_trace: Vec::new(),
+            record_block_trace: true,
+            block_entries: 0,
             trace,
             log_read: true,
             alloc_addr: 0,
@@ -131,6 +169,31 @@ impl VM {
             no_trace: !trace_enabled,
             havoc_sequences: vec![None; n],
             havoc_counts: vec![0; n],
+            scratch_evals: Vec::new(),
+        }
+    }
+
+    /// Materialize the current block's name. Only used on error paths and at
+    /// the Python boundary — the hot loop tracks `curr_block_id` only.
+    #[inline]
+    pub fn block_name(&self, program: &CompiledProgram) -> String {
+        program
+            .blocks
+            .get(self.curr_block_id as usize)
+            .map(|b| b.name.clone())
+            .unwrap_or_default()
+    }
+
+    /// Mark a block as explored (bitset + distinct count).
+    #[inline]
+    pub fn mark_explored(&mut self, block_id: BlockId) {
+        let idx = block_id as usize;
+        if idx >= self.explored_blocks.len() {
+            self.explored_blocks.resize(idx + 1, false);
+        }
+        if !self.explored_blocks[idx] {
+            self.explored_blocks[idx] = true;
+            self.explored_count += 1;
         }
     }
 
@@ -273,48 +336,12 @@ impl VM {
             if self.memory_maps[map_idx].element_bit_width != 8 {
                 continue;
             }
-            let is_shadow = self.memory_maps[map_idx].name.ends_with(".shadow");
-            let (dst_base, src_base) = if is_shadow {
+            let (dst_base, src_base) = if self.memory_maps[map_idx].is_shadow {
                 (dst_shadow, src_shadow)
             } else {
                 (dst, src)
             };
-            self.memmove_sparse_map(map_idx, dst_base, src_base, len);
-        }
-    }
-
-    fn memmove_sparse_map(&mut self, map_idx: usize, dst: i64, src: i64, len: i64) {
-        let Some(src_end) = src.checked_add(len) else {
-            return;
-        };
-        let Some(dst_end) = dst.checked_add(len) else {
-            return;
-        };
-
-        let copied: Vec<(i64, i64)> = self.memory_maps[map_idx]
-            .memory
-            .iter()
-            .filter_map(|(&addr, &value)| {
-                if addr >= src && addr < src_end {
-                    Some((dst + (addr - src), value))
-                } else {
-                    None
-                }
-            })
-            .collect();
-        let clear: Vec<i64> = self.memory_maps[map_idx]
-            .memory
-            .keys()
-            .filter(|&&addr| addr >= dst && addr < dst_end)
-            .copied()
-            .collect();
-
-        let map = &mut self.memory_maps[map_idx];
-        for addr in clear {
-            map.memory.remove(&addr);
-        }
-        for (addr, value) in copied {
-            map.set(addr, value);
+            self.memory_maps[map_idx].move_range(src_base, dst_base, len);
         }
     }
 
@@ -341,9 +368,11 @@ impl VM {
 
         loop {
             let block = &program.blocks[block_id as usize];
-            self.explored_blocks.insert(block_id);
-            self.block_trace.push(block_id);
-            self.curr_block.clone_from(&block.name);
+            self.mark_explored(block_id);
+            self.block_entries += 1;
+            if self.record_block_trace {
+                self.block_trace.push(block_id);
+            }
             self.curr_block_id = block_id;
             self.pc = block.start_pc;
             // Let the trace accumulator update its loop stack for this
@@ -351,13 +380,13 @@ impl VM {
             if !self.no_trace {
                 self.trace.on_block_enter(block_id);
             }
-            if let Some(status) = self.consume_step(&mut steps, max_steps) {
+            if let Some(status) = self.consume_step(&mut steps, max_steps, program) {
                 return status;
             }
 
             // Execute body statements
             for stmt in &block.body {
-                if let Some(status) = self.consume_step(&mut steps, max_steps) {
+                if let Some(status) = self.consume_step(&mut steps, max_steps, program) {
                     return status;
                 }
                 if let Err(status) = self.execute_stmt(stmt, program) {
@@ -385,14 +414,19 @@ impl VM {
     }
 
     #[inline(always)]
-    fn consume_step(&self, steps: &mut usize, max_steps: usize) -> Option<ExecutionStatus> {
+    fn consume_step(
+        &self,
+        steps: &mut usize,
+        max_steps: usize,
+        program: &CompiledProgram,
+    ) -> Option<ExecutionStatus> {
         if max_steps == 0 {
             return None;
         }
         if *steps >= max_steps {
             return Some(ExecutionStatus::StepLimit {
                 pc: self.pc,
-                block: self.curr_block.clone(),
+                block: self.block_name(program),
             });
         }
         *steps += 1;
@@ -404,15 +438,16 @@ impl VM {
             return None;
         }
         let entry = &program.blocks[program.entry_block as usize];
-        self.curr_block.clone_from(&entry.name);
         self.curr_block_id = program.entry_block;
         self.pc = entry.start_pc;
         for expr in &program.entry_preconditions {
             if !self.eval_bool(expr, program) {
+                let detail = self.describe_assume_expr(expr, program);
                 return Some(ExecutionStatus::AssumeViolation {
                     pc: self.pc,
-                    block: self.curr_block.clone(),
+                    block: self.block_name(program),
                     reason: "requires",
+                    detail,
                 });
             }
         }
@@ -442,10 +477,31 @@ impl VM {
                 }
             }
         }
-        taken.ok_or_else(|| ExecutionStatus::AssumeViolation {
-            pc: self.pc,
-            block: self.curr_block.clone(),
-            reason: "infeasible_goto",
+        taken.ok_or_else(|| {
+            // No branch guard held for the current state: render each candidate
+            // target's guard (and the live values) so the caller sees which
+            // partition the input fell outside of.
+            let mut detail = String::from("no goto target feasible; guards: ");
+            for (i, &target_id) in targets.iter().enumerate() {
+                if i > 0 {
+                    detail.push_str(" | ");
+                }
+                let block = &program.blocks[target_id as usize];
+                match &block.assume_cond {
+                    Some(cond) => detail.push_str(&self.describe_assume_expr(cond, program)),
+                    None => detail.push_str(&format!("{}=<unconditional>", block.name)),
+                }
+                if detail.len() > 400 {
+                    detail.push('…');
+                    break;
+                }
+            }
+            ExecutionStatus::AssumeViolation {
+                pc: self.pc,
+                block: self.block_name(program),
+                reason: "infeasible_goto",
+                detail,
+            }
         })
     }
 
@@ -461,33 +517,36 @@ impl VM {
                 self.set_eval_result(*lhs, val);
             }
             Stmt::AssignN { lhs, rhs } => {
-                let vals: Vec<EvalResult> = rhs.iter().map(|r| self.eval(r, program)).collect();
-                for (var_id, val) in lhs.iter().zip(vals) {
+                let mut vals = std::mem::take(&mut self.scratch_evals);
+                vals.clear();
+                vals.extend(rhs.iter().map(|r| self.eval(r, program)));
+                for (var_id, val) in lhs.iter().zip(vals.drain(..)) {
                     self.set_eval_result(*var_id, val);
                 }
+                self.scratch_evals = vals;
             }
             Stmt::Assert { expr } => {
                 if !self.eval_bool(expr, program) {
                     return Err(ExecutionStatus::AssertViolation {
                         pc: self.pc,
-                        block: self.curr_block.clone(),
+                        block: self.block_name(program),
                     });
                 }
             }
             Stmt::Assume { expr } => {
-                // `$isExternal` is a verifier-only hint that always reads 0 on
-                // heap pointers during concrete execution; skip asserting it.
-                if !expr_contains_is_external(expr) {
-                    // Concrete execution: assume is treated as assert — if the
-                    // expression is false, the inputs violate a precondition
-                    // the verifier is allowed to rely on, so fail loudly.
-                    if !self.eval_bool(expr, program) {
-                        return Err(ExecutionStatus::AssumeViolation {
-                            pc: self.pc,
-                            block: self.curr_block.clone(),
-                            reason: "assume",
-                        });
-                    }
+                // Concrete execution: assume is treated as assert — if the
+                // expression is false, the inputs violate a precondition
+                // the verifier is allowed to rely on, so fail loudly.
+                // (`$isExternal` assumes are rewritten to AssumeTrue at
+                // lowering — see lowering::normalize_is_external_assumes.)
+                if !self.eval_bool(expr, program) {
+                    let detail = self.describe_assume_expr(expr, program);
+                    return Err(ExecutionStatus::AssumeViolation {
+                        pc: self.pc,
+                        block: self.block_name(program),
+                        reason: "assume",
+                        detail,
+                    });
                 }
             }
             Stmt::AssumeTrue => {}
@@ -615,8 +674,13 @@ impl VM {
                     if len != len_shadow || len < 0 {
                         return Err(ExecutionStatus::AssumeViolation {
                             pc: self.pc,
-                            block: self.curr_block.clone(),
+                            block: self.block_name(program),
                             reason: "invalid_memmove",
+                            detail: format!(
+                                "memmove length check failed: len={} len_shadow={} \
+                                 (requires len == len_shadow && len >= 0)",
+                                len, len_shadow
+                            ),
                         });
                     }
                     self.memmove_i8_maps(vals[0], vals[1], vals[2], vals[3], len);
@@ -633,23 +697,15 @@ impl VM {
                 let len_val = self.get_scalar(*len);
                 let val_val = self.get_scalar(*val);
                 let map_idx = self.get_map_idx(*m_ret);
-                for addr in dst_val..dst_val + len_val {
-                    self.memory_maps[map_idx].set(addr, val_val);
-                }
+                self.memory_maps[map_idx].fill_range(dst_val, len_val, val_val);
             }
             Stmt::QuantMemsetPreserveLt { m_ret, m_src, dst } => {
                 let dst_val = self.get_scalar(*dst);
                 let src_idx = self.get_map_idx(*m_src);
                 let dst_idx = self.get_map_idx(*m_ret);
-                // Collect addresses first to avoid borrow issues
-                let addrs: Vec<(i64, i64)> = self.memory_maps[src_idx]
-                    .memory
-                    .iter()
-                    .filter(|(&addr, _)| addr < dst_val)
-                    .map(|(&addr, &val)| (addr, val))
-                    .collect();
-                for (addr, val) in addrs {
-                    self.memory_maps[dst_idx].set(addr, val);
+                if src_idx != dst_idx {
+                    let (dst_map, src_map) = two_maps(&mut self.memory_maps, dst_idx, src_idx);
+                    dst_map.merge_below(src_map, dst_val);
                 }
             }
             Stmt::QuantMemsetPreserveGe {
@@ -663,14 +719,9 @@ impl VM {
                 let boundary = dst_val + len_val;
                 let src_idx = self.get_map_idx(*m_src);
                 let dst_idx = self.get_map_idx(*m_ret);
-                let addrs: Vec<(i64, i64)> = self.memory_maps[src_idx]
-                    .memory
-                    .iter()
-                    .filter(|(&addr, _)| addr >= boundary)
-                    .map(|(&addr, &val)| (addr, val))
-                    .collect();
-                for (addr, val) in addrs {
-                    self.memory_maps[dst_idx].set(addr, val);
+                if src_idx != dst_idx {
+                    let (dst_map, src_map) = two_maps(&mut self.memory_maps, dst_idx, src_idx);
+                    dst_map.merge_from(src_map, boundary);
                 }
             }
             Stmt::QuantMemcpyWrite {
@@ -685,26 +736,20 @@ impl VM {
                 let len_val = self.get_scalar(*len);
                 let src_idx = self.get_map_idx(*m_src);
                 let dst_idx = self.get_map_idx(*m_ret);
-                // Read all source values first
-                let vals: Vec<i64> = (0..len_val)
-                    .map(|offset| self.memory_maps[src_idx].get(src_val + offset))
-                    .collect();
-                for (offset, val) in vals.into_iter().enumerate() {
-                    self.memory_maps[dst_idx].set(dst_val + offset as i64, val);
+                if src_idx == dst_idx {
+                    self.memory_maps[dst_idx].move_range_all_init(src_val, dst_val, len_val);
+                } else {
+                    let (dst_map, src_map) = two_maps(&mut self.memory_maps, dst_idx, src_idx);
+                    dst_map.copy_range_values(src_map, src_val, dst_val, len_val);
                 }
             }
             Stmt::QuantMemcpyPreserveLt { m_ret, m_src, dst } => {
                 let dst_val = self.get_scalar(*dst);
                 let src_idx = self.get_map_idx(*m_src);
                 let dst_idx = self.get_map_idx(*m_ret);
-                let addrs: Vec<(i64, i64)> = self.memory_maps[src_idx]
-                    .memory
-                    .iter()
-                    .filter(|(&addr, _)| addr < dst_val)
-                    .map(|(&addr, &val)| (addr, val))
-                    .collect();
-                for (addr, val) in addrs {
-                    self.memory_maps[dst_idx].set(addr, val);
+                if src_idx != dst_idx {
+                    let (dst_map, src_map) = two_maps(&mut self.memory_maps, dst_idx, src_idx);
+                    dst_map.merge_below(src_map, dst_val);
                 }
             }
             Stmt::QuantMemcpyPreserveGe {
@@ -718,14 +763,9 @@ impl VM {
                 let boundary = dst_val + len_val;
                 let src_idx = self.get_map_idx(*m_src);
                 let dst_idx = self.get_map_idx(*m_ret);
-                let addrs: Vec<(i64, i64)> = self.memory_maps[src_idx]
-                    .memory
-                    .iter()
-                    .filter(|(&addr, _)| addr >= boundary)
-                    .map(|(&addr, &val)| (addr, val))
-                    .collect();
-                for (addr, val) in addrs {
-                    self.memory_maps[dst_idx].set(addr, val);
+                if src_idx != dst_idx {
+                    let (dst_map, src_map) = two_maps(&mut self.memory_maps, dst_idx, src_idx);
+                    dst_map.merge_from(src_map, boundary);
                 }
             }
             Stmt::If { cond, then_body, else_body } => {
@@ -787,6 +827,130 @@ impl VM {
                     self.vars[vid] = Value::Map(new_idx);
                 }
             }
+        }
+    }
+
+    /// Describe a failing assume for a human/agent: render the condition and
+    /// append the concrete values of the scalar variables it references, so the
+    /// caller knows EXACTLY which precondition the input violated and with what
+    /// values. Read-only; safe to call on the error path after `eval_bool`.
+    fn describe_assume_expr(&self, expr: &Expr, program: &CompiledProgram) -> String {
+        let mut cond = String::new();
+        let mut vars: Vec<VarId> = Vec::new();
+        self.render_expr(expr, program, &mut cond, &mut vars);
+        let mut vals = String::new();
+        for vid in vars.iter().take(12) {
+            if !vals.is_empty() {
+                vals.push_str(", ");
+            }
+            let name = program
+                .var_names
+                .get(*vid as usize)
+                .map(|s| s.as_str())
+                .unwrap_or("?");
+            match self.vars.get(*vid as usize) {
+                Some(Value::Scalar(v)) => vals.push_str(&format!("{}={}", name, v)),
+                Some(Value::Map(_)) => vals.push_str(&format!("{}=<map>", name)),
+                None => vals.push_str(&format!("{}=?", name)),
+            }
+        }
+        if vals.is_empty() {
+            cond
+        } else {
+            format!("{}  [where {}]", cond, vals)
+        }
+    }
+
+    /// Compact recursive render of an `Expr` into Boogie-ish surface syntax,
+    /// collecting referenced variable ids (deduped) into `vars`. Bounded length
+    /// so a pathological expression cannot produce an unbounded message.
+    fn render_expr(
+        &self,
+        expr: &Expr,
+        program: &CompiledProgram,
+        out: &mut String,
+        vars: &mut Vec<VarId>,
+    ) {
+        if out.len() > 300 {
+            if !out.ends_with('…') {
+                out.push('…');
+            }
+            return;
+        }
+        match expr {
+            Expr::Var(id) => {
+                let name = program
+                    .var_names
+                    .get(*id as usize)
+                    .map(|s| s.as_str())
+                    .unwrap_or("?");
+                out.push_str(name);
+                if !vars.contains(id) {
+                    vars.push(*id);
+                }
+            }
+            Expr::Const(v) => out.push_str(&v.to_string()),
+            Expr::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+            Expr::BinOp { op, lhs, rhs } => {
+                out.push('(');
+                self.render_expr(lhs, program, out, vars);
+                out.push(' ');
+                out.push_str(binop_symbol(op));
+                out.push(' ');
+                self.render_expr(rhs, program, out, vars);
+                out.push(')');
+            }
+            Expr::Not(inner) => {
+                out.push_str("!(");
+                self.render_expr(inner, program, out, vars);
+                out.push(')');
+            }
+            Expr::Builtin { fn_id, args } => {
+                out.push_str(&format!("{:?}", fn_id));
+                out.push('(');
+                for (i, a) in args.iter().enumerate() {
+                    if i > 0 {
+                        out.push_str(", ");
+                    }
+                    self.render_expr(a, program, out, vars);
+                }
+                out.push(')');
+            }
+            Expr::Load {
+                bit_width,
+                map,
+                index,
+            } => {
+                out.push_str(&format!("load.i{}(", bit_width));
+                self.render_expr(map, program, out, vars);
+                out.push_str(", ");
+                self.render_expr(index, program, out, vars);
+                out.push(')');
+            }
+            Expr::Store {
+                bit_width,
+                map,
+                index,
+                value,
+            } => {
+                out.push_str(&format!("store.i{}(", bit_width));
+                self.render_expr(map, program, out, vars);
+                out.push_str(", ");
+                self.render_expr(index, program, out, vars);
+                out.push_str(", ");
+                self.render_expr(value, program, out, vars);
+                out.push(')');
+            }
+            Expr::IfThenElse { cond, then_, else_ } => {
+                out.push('(');
+                self.render_expr(cond, program, out, vars);
+                out.push_str(" ? ");
+                self.render_expr(then_, program, out, vars);
+                out.push_str(" : ");
+                self.render_expr(else_, program, out, vars);
+                out.push(')');
+            }
+            Expr::IsExternal => out.push_str("$isExternal"),
         }
     }
 
@@ -875,12 +1039,8 @@ impl VM {
                     let v = if bw < ew { val & ((1i64 << bw) - 1) } else { val };
                     self.memory_maps[map_idx].set(idx_val, v);
                 } else {
-                    let ew_mask = self.memory_maps[map_idx].element_mask();
-                    let count = bw / ew;
-                    for i in 0..count as i64 {
-                        self.memory_maps[map_idx]
-                            .set(idx_val + i, (val >> (i * ew as i64)) & ew_mask);
-                    }
+                    let count = (bw / ew) as u32;
+                    self.memory_maps[map_idx].store_wide(idx_val, count, ew as u32, val);
                 }
                 EvalResult::MapRef(map_idx)
             }
@@ -902,12 +1062,12 @@ impl VM {
                     let v = if bw < ew { raw & ((1i64 << bw) - 1) } else { raw };
                     EvalResult::Scalar(v)
                 } else {
-                    let mut result: i64 = 0;
-                    let count = bw / ew;
-                    for i in 0..count as i64 {
-                        result |= self.memory_maps[map_idx].get(idx_val + i) << (i * ew as i64);
-                    }
-                    EvalResult::Scalar(result)
+                    let count = (bw / ew) as u32;
+                    EvalResult::Scalar(self.memory_maps[map_idx].load_wide(
+                        idx_val,
+                        count,
+                        ew as u32,
+                    ))
                 }
             }
             Expr::IfThenElse { cond, then_, else_ } => {
@@ -1190,6 +1350,19 @@ fn format_printf(fmt: &str, args: &[i64], m0: &crate::memory_map::MemoryMap) -> 
     result
 }
 
+/// Disjoint `(&mut dst, &src)` borrows of two distinct memory maps.
+#[inline]
+fn two_maps(maps: &mut [MemoryMap], dst: usize, src: usize) -> (&mut MemoryMap, &MemoryMap) {
+    debug_assert_ne!(dst, src);
+    if dst < src {
+        let (lo, hi) = maps.split_at_mut(src);
+        (&mut lo[dst], &hi[0])
+    } else {
+        let (lo, hi) = maps.split_at_mut(dst);
+        (&mut hi[0], &lo[src])
+    }
+}
+
 /// Result of evaluating an expression.
 #[derive(Debug, Clone)]
 pub enum EvalResult {
@@ -1198,31 +1371,3 @@ pub enum EvalResult {
     MapRef(usize),
 }
 
-/// True if `expr` mentions `$isExternal` anywhere in its tree. Used to skip
-/// concrete assume-as-assert for verifier-only hints.
-fn expr_contains_is_external(expr: &Expr) -> bool {
-    match expr {
-        Expr::IsExternal => true,
-        Expr::Var(_) | Expr::Const(_) | Expr::Bool(_) => false,
-        Expr::BinOp { lhs, rhs, .. } => {
-            expr_contains_is_external(lhs) || expr_contains_is_external(rhs)
-        }
-        Expr::Builtin { args, .. } => args.iter().any(expr_contains_is_external),
-        Expr::Store {
-            map, index, value, ..
-        } => {
-            expr_contains_is_external(map)
-                || expr_contains_is_external(index)
-                || expr_contains_is_external(value)
-        }
-        Expr::Load { map, index, .. } => {
-            expr_contains_is_external(map) || expr_contains_is_external(index)
-        }
-        Expr::IfThenElse { cond, then_, else_ } => {
-            expr_contains_is_external(cond)
-                || expr_contains_is_external(then_)
-                || expr_contains_is_external(else_)
-        }
-        Expr::Not(inner) => expr_contains_is_external(inner),
-    }
-}

@@ -1,0 +1,2 @@
+2026-04-14 06:32:41,432	INFO packaging.py:726 -- Downloading package from gcs://_ray_pkg_b7fd76b6ab220ef1.zip to /tmp/_sr_2529067/session_2026-04-14_06-32-38_095688_2529067/runtime_resources/working_dir_files/_ray_pkg_b7fd76b6ab220ef1.zip with protocol Protocol.GCS
+2026-04-14 06:32:41,439	INFO uri_cache.py:86 -- Added URI gcs://_ray_pkg_b7fd76b6ab220ef1.zip with size 456059

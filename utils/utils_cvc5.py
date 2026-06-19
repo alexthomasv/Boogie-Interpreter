@@ -754,6 +754,39 @@ def convert_type_to_cvc5(solver, type_, mono_mem = True) -> Sort:
             assert False
     assert False, f"unknown type {type_} {type(type_)}"
 
+def _coerce_bool_int_literal_equality(solver, lhs, rhs):
+    """Boolean-vs-int-literal (dis)equality from printed wp text.
+
+    The canonical printer flattens ``ite(c, 1, 0) == 1`` to ``(c) == (1)``,
+    so re-parsing freeze-payload/agent-boundary text meets a Boolean term
+    compared to an integer literal — ill-sorted for cvc5 EQUAL (observed:
+    every synth candidate for c2i_126 pc 2906 died with target_parse_error
+    'not a bit-vector sort' and the obligation was abandoned every
+    iteration). Coerce by the elided-ite semantics: ``b == 1 -> b``,
+    ``b == 0 -> not b``, any other literal -> false. Returns None when the
+    shape doesn't apply (including plain bool==bool).
+    """
+    for a, b in ((lhs, rhs), (rhs, lhs)):
+        try:
+            if not a.getSort().isBoolean() or b.getSort().isBoolean():
+                continue
+            value = None
+            if b.isBitVectorValue():
+                value = int(b.getBitVectorValue(10))
+            elif b.isIntegerValue():
+                value = int(b.getIntegerValue())
+        except Exception:
+            return None
+        if value is None:
+            return None
+        if value == 1:
+            return a
+        if value == 0:
+            return solver.mkTerm(Kind.NOT, a)
+        return solver.mkBoolean(False)
+    return None
+
+
 def convert_expr_cvc5(cvc5_fn_map, state_cache, solver, expr, mono_mem: bool) -> Term:
     if isinstance(expr, StorageIdentifier) or isinstance(expr, ProcedureIdentifier):
         result = state_cache.cvc5_var(expr.name)
@@ -764,10 +797,18 @@ def convert_expr_cvc5(cvc5_fn_map, state_cache, solver, expr, mono_mem: bool) ->
         if expr.op in cvc5_fn_map:
             lhs = convert_expr_cvc5(cvc5_fn_map, state_cache, solver, expr.lhs, mono_mem)
             rhs = convert_expr_cvc5(cvc5_fn_map, state_cache, solver, expr.rhs, mono_mem)
-            if not _INTEGER_ENCODING and rhs.isBitVectorValue():
-                rhs = sign_extend(solver, rhs, lhs.getSort().getBitVectorSize())
             fn_entry = cvc5_fn_map[expr.op]
             cvc5_op = fn_entry[0]
+            if cvc5_op in (Kind.EQUAL, Kind.DISTINCT):
+                # Printed-wp round-trip: ``ite(c,1,0) == 1`` is rendered as
+                # ``(c) == (1)`` — coerce bool-vs-int-literal before the
+                # bv sign-extend below chokes on the Boolean side.
+                coerced = _coerce_bool_int_literal_equality(solver, lhs, rhs)
+                if coerced is not None:
+                    return (coerced if cvc5_op == Kind.EQUAL
+                            else solver.mkTerm(Kind.NOT, coerced))
+            if not _INTEGER_ENCODING and rhs.isBitVectorValue():
+                rhs = sign_extend(solver, rhs, lhs.getSort().getBitVectorSize())
 
             _, _, op_type, out_type = fn_entry[:4]
             if op_type == bool:
@@ -790,11 +831,17 @@ def convert_expr_cvc5(cvc5_fn_map, state_cache, solver, expr, mono_mem: bool) ->
         elif expr.op == "==":
             lhs = convert_expr_cvc5(cvc5_fn_map, state_cache, solver, expr.lhs, mono_mem)
             rhs = convert_expr_cvc5(cvc5_fn_map, state_cache, solver, expr.rhs, mono_mem)
+            coerced = _coerce_bool_int_literal_equality(solver, lhs, rhs)
+            if coerced is not None:
+                return coerced
             lhs, rhs = assign_fix_type(solver, lhs, rhs)
             return solver.mkTerm(Kind.EQUAL, lhs, rhs)
         elif expr.op == "!=":
             lhs = convert_expr_cvc5(cvc5_fn_map, state_cache, solver, expr.lhs, mono_mem)
             rhs = convert_expr_cvc5(cvc5_fn_map, state_cache, solver, expr.rhs, mono_mem)
+            coerced = _coerce_bool_int_literal_equality(solver, lhs, rhs)
+            if coerced is not None:
+                return solver.mkTerm(Kind.NOT, coerced)
             lhs, rhs = assign_fix_type(solver, lhs, rhs)
             return solver.mkTerm(Kind.DISTINCT, lhs, rhs)
         else:
@@ -1542,6 +1589,21 @@ def deserialize_state_key(state_cache, state_key):
     pc, predicate = pickle.loads(state_key)
     predicate.predicate = deserialize_cvc5_term(state_cache, predicate.predicate)
     return ProofObligation(pc, predicate)
+
+
+def deserialize_predicate_pickle(state_cache, raw: bytes):
+    """Rehydrate a pickled ``Predicate`` (serde form) against ``state_cache``.
+
+    The native-term counterpart of parsing a printed predicate: the anvil gate
+    replay loads the freeze payload's live obligation/transformed terms with
+    this instead of reparsing text — text round-trips build different ASTs
+    (left-nested binaries, flattened bool==int) and every divergence splits
+    the gate from the live engine.
+    """
+    predicate = pickle.loads(raw)
+    predicate.predicate = deserialize_cvc5_term(
+        state_cache, predicate.predicate)
+    return predicate
 
 
 _HOLLOW_INFIX = {
@@ -2538,6 +2600,13 @@ def _parse_infix_expr(s, state_cache):
             return term
         elif typ == 'NUM':
             advance()
+            # In SMACK integer encoding (type iN = int) a numeric literal is an
+            # Int — emit it directly so it composes with arithmetic helpers in
+            # any position (e.g. as a function arg `$sge.i32($i0, 1)`, where no
+            # surrounding infix operator is present to coerce a BV literal). The
+            # infix-binary coercion only fixes operand-position BV literals.
+            if _INTEGER_ENCODING:
+                return solver.mkInteger(int(val))
             # Default 32-bit bitvector — matches the SMACK-emitted
             # scalar width.  _match_bv_sorts will resize on sort
             # mismatch when the other operand is BV64 etc.

@@ -1,0 +1,316 @@
+# SMT-LIB 2.6 FixedSizeBitVectors Theory — Shared Specification
+# Reference: https://smtlib.cs.uiowa.edu/theories-FixedSizeBitVectors.shtml
+#
+# This file is the single source of truth for both Rust (Kani) and Python (Crosshair)
+# verification of bitvector operations.
+
+bit_widths: [8, 16, 32, 64]
+
+helpers:
+  mask:
+    description: "Bit mask for a given width"
+    formula: "(1 << bits) - 1 if bits < 64 else 0xFFFFFFFFFFFFFFFF"
+  to_signed:
+    description: "Interpret unsigned value as two's complement signed"
+    formula: "val - (1 << bits) if val & (1 << (bits-1)) else val"
+    precondition: "0 <= val <= mask(bits)"
+
+operations:
+  # ── Arithmetic ──────────────────────────────────────────────
+  bvadd:
+    rust_fn: "BuiltinFn::Add"
+    python_fn: "add_fn"
+    arity: 2
+    semantics: "((a & mask) + (b & mask)) & mask"
+    properties:
+      - commutative: "bvadd(a, b) == bvadd(b, a)"
+      - identity: "bvadd(a, 0) == a & mask"
+
+  bvsub:
+    rust_fn: "BuiltinFn::Sub"
+    python_fn: "sub_fn"
+    arity: 2
+    semantics: "((a & mask) - (b & mask)) & mask"
+
+  bvmul:
+    rust_fn: "BuiltinFn::Mul"
+    python_fn: "mul_fn"
+    arity: 2
+    semantics: "((a & mask) * (b & mask)) & mask"
+    properties:
+      - commutative: "bvmul(a, b) == bvmul(b, a)"
+
+  # ── Division ────────────────────────────────────────────────
+  bvudiv:
+    rust_fn: "BuiltinFn::Udiv"
+    python_fn: "udiv_fn"
+    arity: 2
+    semantics: "(a & mask) // (b & mask) if (b & mask) != 0 else mask"
+    edge_cases:
+      zero_divisor:
+        condition: "(b & mask) == 0"
+        result: "mask  # all-ones"
+        rationale: "SMT-LIB defines bvudiv(x, 0) = all-ones"
+
+  bvsdiv:
+    rust_fn: "BuiltinFn::Sdiv"
+    python_fn: "sdiv_fn"
+    arity: 2
+    semantics: "truncated_division(to_signed(a), to_signed(b))"
+    edge_cases:
+      zero_divisor:
+        condition: "to_signed(b, bits) == 0"
+        result: "mask  # all-ones"
+      truncation:
+        description: "Division truncates toward zero, NOT toward negative infinity"
+        example: "bvsdiv(-8, 3) == -2, not -3"
+    never:
+      - "floor_division: NEVER use Python's // or Rust's div_floor for signed division"
+      - "panic: NEVER panic on division by zero"
+
+  bvurem:
+    rust_fn: "BuiltinFn::Urem"
+    python_fn: "urem_fn"
+    arity: 2
+    semantics: "(a & mask) % (b & mask) if (b & mask) != 0 else (a & mask)"
+    edge_cases:
+      zero_divisor:
+        condition: "(b & mask) == 0"
+        result: "a & mask  # return dividend"
+
+  bvsrem:
+    rust_fn: "BuiltinFn::Srem"
+    python_fn: "srem_fn"
+    arity: 2
+    semantics: "sx - truncate(sx / sy) * sy if sy != 0 else sx"
+    edge_cases:
+      zero_divisor:
+        condition: "to_signed(b, bits) == 0"
+        result: "to_signed(a, bits) & mask  # return dividend"
+    properties:
+      - sign_follows_dividend: "sign(result) == sign(a) when b != 0"
+    never:
+      - "return_zero: NEVER return 0 when divisor is zero"
+
+  # ── Bitwise ─────────────────────────────────────────────────
+  bvand:
+    rust_fn: "BuiltinFn::And"
+    python_fn: "and_fn"
+    arity: 2
+    semantics: "(a & mask) & (b & mask)"
+
+  bvor:
+    rust_fn: "BuiltinFn::Or"
+    python_fn: "or_fn"
+    arity: 2
+    semantics: "((a & mask) | (b & mask)) & mask"
+
+  bvxor:
+    rust_fn: "BuiltinFn::Xor"
+    python_fn: "xor_fn"
+    arity: 2
+    semantics: "((a & mask) ^ (b & mask)) & mask"
+
+  bvnot:
+    rust_fn: "BuiltinFn::Not"
+    python_fn: "not_fn"
+    arity: 1
+    semantics: "(~x) & mask"
+
+  # ── Shifts ──────────────────────────────────────────────────
+  bvshl:
+    rust_fn: "BuiltinFn::Shl"
+    python_fn: "shl_fn"
+    arity: 2
+    semantics: "((a & mask) << (b % bits)) & mask if b < bits else 0"
+    note: "SMT-LIB: bvshl returns 0 when shift >= bit width"
+
+  bvlshr:
+    rust_fn: "BuiltinFn::Lshr"
+    python_fn: "lshr_fn"
+    arity: 2
+    semantics: "((a & mask) as unsigned) >> (b % bits) if b < bits else 0"
+    note: "Logical shift right — zero-fill from MSB"
+
+  bvashr:
+    rust_fn: "BuiltinFn::Ashr"
+    python_fn: "ashr_fn"
+    arity: 2
+    semantics: |
+      v = a & mask
+      shift = b % bits
+      if sign_bit_set(v, bits):
+        (v >> shift) | (sign_fill_mask(shift, bits))
+      else:
+        (v >> shift) & mask
+    properties:
+      - generic_width: "Must work for ALL bit widths, not just 32/64"
+    never:
+      - "hardcoded_widths: NEVER have separate code paths only for 32 and 64"
+
+  # ── Signed comparisons ─────────────────────────────────────
+  bvslt:
+    rust_fn: "BuiltinFn::Slt"
+    python_fn: "slt_fn"
+    arity: 2
+    semantics: "to_signed(a, bits) < to_signed(b, bits)"
+    output: "bool_or_bv1"
+
+  bvsle:
+    rust_fn: "BuiltinFn::Sle"
+    python_fn: "sle_fn"
+    arity: 2
+    semantics: "to_signed(a, bits) <= to_signed(b, bits)"
+    output: "bool_or_bv1"
+
+  bvsgt:
+    rust_fn: "BuiltinFn::Sgt"
+    python_fn: "sgt_fn"
+    arity: 2
+    semantics: "to_signed(a, bits) > to_signed(b, bits)"
+    output: "bool_or_bv1"
+
+  bvsge:
+    rust_fn: "BuiltinFn::Sge"
+    python_fn: "sge_fn"
+    arity: 2
+    semantics: "to_signed(a, bits) >= to_signed(b, bits)"
+    output: "bool_or_bv1"
+
+  # ── Unsigned comparisons ───────────────────────────────────
+  bvult:
+    rust_fn: "BuiltinFn::Ult"
+    python_fn: "ult_fn"
+    arity: 2
+    semantics: "(a & mask) < (b & mask)"
+    output: "bool_or_bv1"
+
+  bvule:
+    rust_fn: "BuiltinFn::Ule"
+    python_fn: "ule_fn"
+    arity: 2
+    semantics: "(a & mask) <= (b & mask)"
+    output: "bool_or_bv1"
+
+  bvugt:
+    rust_fn: "BuiltinFn::Ugt"
+    python_fn: "ugt_fn"
+    arity: 2
+    semantics: "(a & mask) > (b & mask)"
+    output: "bool_or_bv1"
+
+  bvuge:
+    rust_fn: "BuiltinFn::Uge"
+    python_fn: "uge_fn"
+    arity: 2
+    semantics: "(a & mask) >= (b & mask)"
+    output: "bool_or_bv1"
+
+  # ── Equality ────────────────────────────────────────────────
+  bveq:
+    rust_fn: "BuiltinFn::BvEq"
+    python_fn: "eq_fn"
+    arity: 2
+    semantics: "(a & mask) == (b & mask)"
+    output: "bool_or_bv1"
+
+  bvne:
+    rust_fn: "BuiltinFn::BvNe"
+    python_fn: "ne_fn"
+    arity: 2
+    semantics: "(a & mask) != (b & mask)"
+    output: "bool_or_bv1"
+
+  # ── Casts ───────────────────────────────────────────────────
+  sign_extend:
+    rust_fn: "BuiltinFn::Sext"
+    python_fn: "sext_fn"
+    arity: 1
+    semantics: |
+      v = x & src_mask
+      if v & (1 << (src-1)):
+        v |= ~src_mask
+      v & dst_mask
+
+  zero_extend:
+    rust_fn: "BuiltinFn::Zext"
+    python_fn: "lambda x: x"
+    arity: 1
+    semantics: "x  # identity (high bits already zero in unsigned repr)"
+
+  extract:
+    rust_fn: "BuiltinFn::Trunc"
+    python_fn: "trunc_fn"
+    arity: 1
+    semantics: "x & mask(dst)"
+
+test_vectors:
+  - op: bvudiv
+    bits: 32
+    a: 0x12345678
+    b: 0
+    expected: 0xFFFFFFFF
+    note: "division by zero returns all-ones"
+
+  - op: bvsdiv
+    bits: 32
+    a: -8  # 0xFFFFFFF8 as signed
+    b: 3
+    expected: -2  # truncated toward zero
+    note: "truncated division, not floor"
+
+  - op: bvsdiv
+    bits: 32
+    a: 0
+    b: 0
+    expected: 0xFFFFFFFF
+    note: "signed division by zero"
+
+  - op: bvashr
+    bits: 8
+    a: 0x80
+    b: 1
+    expected: 0xC0
+    note: "8-bit arithmetic shift right with sign extension"
+
+  - op: bvashr
+    bits: 16
+    a: 0x8000
+    b: 1
+    expected: 0xC000
+    note: "16-bit arithmetic shift right"
+
+  - op: bvashr
+    bits: 64
+    a: 0x8000000000000000
+    b: 1
+    expected: 0xC000000000000000
+    note: "64-bit arithmetic shift right"
+
+  - op: bvsrem
+    bits: 32
+    a: 5
+    b: 0
+    expected: 5
+    note: "srem by zero returns dividend"
+
+  - op: bvurem
+    bits: 32
+    a: 7
+    b: 0
+    expected: 7
+    note: "urem by zero returns dividend"
+
+  - op: bvshl
+    bits: 32
+    a: 1
+    b: 32
+    expected: 0
+    note: "shift by bit width per SMT-LIB"
+
+  - op: sign_extend
+    src: 8
+    dst: 32
+    a: 0x80
+    expected: 0xFFFFFF80
+    note: "sign extension of negative 8-bit value"

@@ -344,13 +344,101 @@ def prepare_native(program, *, test_path=None, compiled=None):
     return PreparedNativeProgram(program, test_path=test_path, compiled=compiled)
 
 
+# ---------------------------------------------------------------------------
+# Injected asserts (falsification probes)
+# ---------------------------------------------------------------------------
+#
+# `--inject-assert PC:EXPR` inserts `assert EXPR;` immediately BEFORE the
+# statement currently at flat index PC, so the injected assert evaluates in
+# the state on entry to PC — the exact semantics of a verifier obligation
+# (pc, P) — and takes over that pc in the renumbered program. A concrete
+# input that fires it is a witness that the obligation is NOT an invariant;
+# a surviving run proves nothing (one input), it is only recorded evidence.
+#
+# `--probe-block LABEL` injects `assert false;` as block LABEL's first
+# statement: the first concrete visit fires it, answering "does this input
+# reach the block?" with early-return semantics — for falsifying
+# reachability-flavored predicates, where the witness IS the visit.
+
+_INJECT_ASSERT_SPECS = []   # [(pc:int, expr_text:str)] set by main()
+_PROBE_BLOCK_SPECS = []     # [block_label:str] set by main()
+_INJECTED_ASSERTS = {}      # final_pc -> {kind, expr, block, requested_pc}
+
+
+def inject_asserts(program, assert_specs, block_probes):
+    """Mutate ``program`` in place, inserting probe asserts; return the
+    final-pc map (the program is renumbered by the insertions)."""
+    from interpreter.parser.boogie_parser import parse_expr
+    from interpreter.parser.statement import AssertStatement
+    from interpreter.parser.declaration import ImplementationDeclaration
+    from interpreter.parser.desugar import desugar_while_statements
+    from interpreter.utils.program import initialize_code_metadata
+
+    # Pin the numbering the specs refer to (no-op for SMACK input).
+    desugar_while_statements(program)
+    impl = next(d for d in program.declarations
+                if isinstance(d, ImplementationDeclaration) and d.body)
+    pc_to_stmt, label_to_pc, pc_to_block, _ = initialize_code_metadata(impl)
+    blocks_by_name = {b.name: b for b in impl.body.blocks}
+
+    work = []  # (pc_for_ordering, expr_text, kind, block_label)
+    for pc, text in assert_specs:
+        pc = int(pc)
+        if pc not in pc_to_stmt:
+            raise ValueError(f"inject-assert: pc {pc} is not a statement pc")
+        work.append((pc, str(text), "predicate", pc_to_block[pc]))
+    for label in block_probes:
+        if label not in blocks_by_name:
+            raise ValueError(f"probe-block: no block labeled {label!r}")
+        work.append((label_to_pc.get(label, 0), "false",
+                     "block_probe", label))
+
+    inserted = []  # (stmt_obj, kind, expr_text, block_label, requested_pc)
+    # Insert bottom-up so earlier insertions don't shift later targets.
+    for pc, text, kind, label in sorted(work, key=lambda w: -int(w[0])):
+        stmt = AssertStatement()
+        stmt.expression = parse_expr(text)
+        blk = blocks_by_name[label]
+        if kind == "block_probe":
+            blk.statements.insert(0, stmt)
+        else:
+            blk.statements.insert(
+                blk.statements.index(pc_to_stmt[int(pc)]), stmt)
+        inserted.append((stmt, kind, text, label, int(pc)))
+
+    new_pc_to_stmt, _, _, _ = initialize_code_metadata(impl)
+    by_id = {id(s): (k, t, l, rp) for s, k, t, l, rp in inserted}
+    final = {}
+    for fpc, stmt in new_pc_to_stmt.items():
+        meta = by_id.get(id(stmt))
+        if meta is not None:
+            final[int(fpc)] = {"kind": meta[0], "expr": meta[1],
+                               "block": meta[2], "requested_pc": meta[3]}
+    return final
+
+
 def _load_shared(test_path, engine):
     """Load program + compile bytecode once in the parent process."""
     global _SHARED_PROGRAM, _SHARED_COMPILED, _SHARED_PREPARED, _SHARED_FIELD_SIZES
+    global _INJECTED_ASSERTS
     _reject_legacy_engine(engine)
 
     with open(test_path, 'rb') as f:
         _SHARED_PROGRAM = pickle.load(f)
+
+    if _INJECT_ASSERT_SPECS or _PROBE_BLOCK_SPECS:
+        import json as _json
+        try:
+            _INJECTED_ASSERTS = inject_asserts(
+                _SHARED_PROGRAM, _INJECT_ASSERT_SPECS, _PROBE_BLOCK_SPECS)
+        except Exception as ex:
+            print(f"[INJECT_ASSERT_ERROR] error={_json.dumps(str(ex))}")
+            raise
+        for fpc, meta in sorted(_INJECTED_ASSERTS.items()):
+            print(f"[INJECTED_ASSERT] pc={fpc} "
+                  f"requested_pc={meta['requested_pc']} "
+                  f"kind={meta['kind']} block={meta['block']!r} "
+                  f"expr={_json.dumps(meta['expr'])}")
 
     from interpreter.utils.input_parser import get_bpl_field_sizes
     _SHARED_FIELD_SIZES = get_bpl_field_sizes(test_path.parent, program=_SHARED_PROGRAM)
@@ -540,13 +628,22 @@ def _finish_native_result(result, *, return_status):
             expr_str='<native assertion>',
         )
     if status == 'assume_violation':
+        # `invalid_detail` (from the native VM) names exactly which assume failed
+        # and the concrete values that violated it, e.g.
+        #   ($i3 >= 0)  [where $i3=-1]
+        # so an agent fixing a stale input knows precisely which precondition to
+        # satisfy rather than just "an assume failed somewhere".
+        _detail = (result.get("invalid_detail") or "").strip()
+        _reason = result.get("invalid_reason") or "assume"
+        if _detail:
+            _expr_str = f"the {_reason} condition is false: {_detail}"
+        else:
+            _expr_str = f"concrete {_reason} failed (no condition detail available)"
         raise AssumeViolation(
             result.get('violation_pc'),
             result.get('violation_block'),
-            "concrete assume failed at "
-            f"pc={result.get('violation_pc')} "
-            f"block={result.get('violation_block')!r}",
-            reason=result.get("invalid_reason") or "assume",
+            _expr_str,
+            reason=_reason,
         )
     if status == 'step_limit':
         raise TimeoutError(
@@ -631,10 +728,15 @@ def run_native(program, program_inputs, test_name, input_name, raw_log_path,
                 max_steps=max_steps,
                 return_scalar_summary=return_scalar_summary,
                 return_raw_memory=return_raw_memory,
+                # The runner never reads the per-entry block sequence and on
+                # long runs it is tens of millions of PyStrings — skip it.
+                return_block_sequence=False,
             )
         except TypeError as exc:
             msg = str(exc)
-            if "return_scalar_summary" not in msg and "return_raw_memory" not in msg:
+            if ("return_scalar_summary" not in msg
+                    and "return_raw_memory" not in msg
+                    and "return_block_sequence" not in msg):
                 raise
             if return_scalar_summary or return_raw_memory:
                 raise RuntimeError(
@@ -770,13 +872,47 @@ def process_single_input(input_file, test_name, test_path, engine='native',
             # parent process reads child stdout to collect per-input
             # violations; expression is JSON-quoted so embedded quotes
             # / newlines in the Boogie expr don't break the line.
+            # Injected probes own their pc (the insertion renumbered the
+            # program), so a violation there is the probe's answer, not a
+            # program-assert failure.
             import json as _json
+            inj = _INJECTED_ASSERTS.get(int(v.pc)) if _INJECTED_ASSERTS \
+                else None
+            if inj is not None and inj["kind"] == "block_probe":
+                print(f"[BLOCK_REACHED] input={input_name} "
+                      f"block={inj['block']!r} pc={v.pc}")
+                debug.event("exec", "input_block_probe_reached",
+                            pc=v.pc, block=inj["block"])
+                return (input_name, None, set())
+            if inj is not None:
+                print(f"[INJECTED_ASSERT_VIOLATION] "
+                      f"input={input_name} pc={inj['requested_pc']} "
+                      f"block={v.block!r} expr={_json.dumps(inj['expr'])}")
+                debug.event("exec", "input_injected_assert_violation",
+                            pc=v.pc, requested_pc=inj["requested_pc"],
+                            block=v.block, expression=v.expr_str)
+                return (input_name, None, set())
             print(f"[ASSERT_VIOLATION] "
                   f"input={input_name} pc={v.pc} block={v.block!r} "
                   f"expr={_json.dumps(v.expr_str)}")
             debug.event("exec", "input_assert_violation",
                         pc=v.pc, block=v.block, expression=v.expr_str)
             return (input_name, None, set())
+
+        if _INJECTED_ASSERTS:
+            # Run completed: every injected assert that executed HELD.
+            # Block-visitation from the explored set tells executed-and-held
+            # apart from never-reached.
+            for fpc, meta in sorted(_INJECTED_ASSERTS.items()):
+                if meta["kind"] == "block_probe":
+                    print(f"[BLOCK_NOT_REACHED] input={input_name} "
+                          f"block={meta['block']!r}")
+                else:
+                    visited = meta["block"] in explored
+                    print(f"[INJECTED_ASSERT_SURVIVED] input={input_name} "
+                          f"pc={meta['requested_pc']} "
+                          f"block={meta['block']!r} "
+                          f"block_visited={'true' if visited else 'false'}")
 
         with open(explored_path, "w") as f:
             for block in explored:
@@ -885,11 +1021,34 @@ def main():
     parser.add_argument('--debug-categories', default='all',
                         help='Comma-separated debug categories '
                              '(default: all; e.g. exec,branch,solver)')
+    parser.add_argument('--inject-assert', action='append', default=[],
+                        metavar='PC:EXPR',
+                        help='Inject `assert EXPR;` evaluating on entry to '
+                             'flat pc PC (obligation falsification probe; '
+                             'repeatable)')
+    parser.add_argument('--probe-block', action='append', default=[],
+                        metavar='LABEL',
+                        help='Inject `assert false;` at block LABEL entry — '
+                             'reports BLOCK_REACHED on first concrete visit '
+                             '(reachability probe; repeatable)')
     args = parser.parse_args()
     try:
         _reject_legacy_engine(args.engine)
     except RuntimeError as exc:
         parser.error(str(exc))
+
+    global _INJECT_ASSERT_SPECS, _PROBE_BLOCK_SPECS
+    for spec in args.inject_assert:
+        pc_s, sep, expr = str(spec).partition(':')
+        if not sep or not pc_s.strip().isdigit() or not expr.strip():
+            parser.error(f"--inject-assert expects PC:EXPR, got {spec!r}")
+        _INJECT_ASSERT_SPECS.append((int(pc_s), expr.strip()))
+    _PROBE_BLOCK_SPECS.extend(str(b).strip() for b in args.probe_block
+                              if str(b).strip())
+    if _INJECT_ASSERT_SPECS or _PROBE_BLOCK_SPECS:
+        # Probe runs must actually execute (and never reuse stale results):
+        # the program text is mutated, so skip-if-unchanged is meaningless.
+        args.force = True
 
     test_pkg_dir = Path(args.test_pkg_path)
     test_name = test_pkg_dir.name.removesuffix("_pkg")

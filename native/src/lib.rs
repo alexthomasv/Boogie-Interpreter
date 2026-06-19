@@ -91,6 +91,9 @@ fn load_compiled(py: Python<'_>, path: &str) -> PyResult<PyObject> {
         pyo3::exceptions::PyValueError::new_err(format!("bincode deserialize: {}", e))
     })?;
     compiled.rebuild_lookup_maps();
+    // Packages serialized before the lowering-time assume normalization may
+    // still carry `$isExternal` assumes — normalize on load.
+    lowering::normalize_is_external_assumes(&mut compiled.blocks);
     let wrapper = CompiledProgramWrapper { inner: compiled };
     Ok(Py::new(py, wrapper)?.into_py(py))
 }
@@ -109,11 +112,7 @@ fn fnv64_update(mut hash: u64, bytes: &[u8]) -> u64 {
 fn memory_summary<'py>(py: Python<'py>, vm: &vm::VM) -> PyResult<Bound<'py, PyDict>> {
     let out = PyDict::new_bound(py);
     for map in &vm.memory_maps {
-        let mut items: Vec<(i64, i64)> = map
-            .memory
-            .iter()
-            .map(|(addr, value)| (*addr, *value))
-            .collect();
+        let mut items: Vec<(i64, i64)> = map.iter_init().collect();
         items.sort_by_key(|(addr, _)| *addr);
         let mut hash = FNV64_OFFSET;
         for (addr, value) in &items {
@@ -140,8 +139,8 @@ fn raw_memory<'py>(py: Python<'py>, vm: &vm::VM) -> PyResult<Bound<'py, PyDict>>
     let out = PyDict::new_bound(py);
     for map in &vm.memory_maps {
         let m = PyDict::new_bound(py);
-        for (addr, value) in &map.memory {
-            m.set_item(*addr, *value)?;
+        for (addr, value) in map.iter_init() {
+            m.set_item(addr, value)?;
         }
         out.set_item(map.name.as_str(), m)?;
     }
@@ -203,23 +202,32 @@ fn finish_vm_result(
     return_memory_summary: bool,
     return_scalar_summary: bool,
     return_raw_memory: bool,
+    return_block_sequence: bool,
     quiet: bool,
 ) -> PyResult<PyObject> {
     let result = PyDict::new_bound(py);
 
     let blocks_set = PySet::empty_bound(py)?;
-    for block_id in &vm.explored_blocks {
-        let block = &program.blocks[*block_id as usize];
-        blocks_set.add(block.name.as_str())?;
+    for (idx, explored) in vm.explored_blocks.iter().enumerate() {
+        if *explored {
+            if let Some(block) = program.blocks.get(idx) {
+                blocks_set.add(block.name.as_str())?;
+            }
+        }
     }
     result.set_item("explored_blocks", blocks_set)?;
 
-    let block_sequence = PyList::empty_bound(py);
-    for block_id in &vm.block_trace {
-        let block = &program.blocks[*block_id as usize];
-        block_sequence.append(block.name.as_str())?;
+    // The per-entry sequence is one PyString per block *entry* — tens of
+    // millions on long runs — so it's only materialized when the caller
+    // asked for it (coverage_gen does; the trace runner doesn't).
+    if return_block_sequence {
+        let block_sequence = PyList::empty_bound(py);
+        for block_id in &vm.block_trace {
+            let block = &program.blocks[*block_id as usize];
+            block_sequence.append(block.name.as_str())?;
+        }
+        result.set_item("block_sequence", block_sequence)?;
     }
-    result.set_item("block_sequence", block_sequence)?;
 
     match status {
         ExecutionStatus::Completed => {
@@ -230,12 +238,18 @@ fn finish_vm_result(
             result.set_item("violation_pc", *pc)?;
             result.set_item("violation_block", block)?;
         }
-        ExecutionStatus::AssumeViolation { pc, block, reason } => {
+        ExecutionStatus::AssumeViolation {
+            pc,
+            block,
+            reason,
+            detail,
+        } => {
             result.set_item("status", "assume_violation")?;
             result.set_item("violation_pc", *pc)?;
             result.set_item("violation_block", block)?;
             result.set_item("invalid_input", true)?;
             result.set_item("invalid_reason", *reason)?;
+            result.set_item("invalid_detail", detail.as_str())?;
         }
         ExecutionStatus::StepLimit { pc, block } => {
             result.set_item("status", "step_limit")?;
@@ -284,8 +298,8 @@ fn finish_vm_result(
     result.set_item("external_consumed", vm.external_buffer_pos)?;
     result.set_item("exec_ns", exec_elapsed.as_nanos() as u64)?;
     result.set_item("exec_ms", exec_elapsed.as_secs_f64() * 1000.0)?;
-    result.set_item("blocks_explored", vm.explored_blocks.len())?;
-    result.set_item("block_sequence_len", vm.block_trace.len())?;
+    result.set_item("blocks_explored", vm.explored_count)?;
+    result.set_item("block_sequence_len", vm.block_entries)?;
     result.set_item("no_trace", vm.no_trace)?;
     result.set_item("vars", program.var_names.len())?;
     result.set_item("memory_map_count", vm.memory_maps.len())?;
@@ -331,7 +345,7 @@ fn finish_vm_result(
 ///
 /// Returns dict with 'explored_blocks' and 'trace_records' (count).
 #[pyfunction]
-#[pyo3(signature = (compiled, var_store, memory_maps, mem_map_info, raw_log_path, extra_data=None, log_read=true, no_trace=false, havoc_sequences=None, return_memory_summary=true, quiet=true, max_steps=0, return_scalar_summary=false, return_raw_memory=false))]
+#[pyo3(signature = (compiled, var_store, memory_maps, mem_map_info, raw_log_path, extra_data=None, log_read=true, no_trace=false, havoc_sequences=None, return_memory_summary=true, quiet=true, max_steps=0, return_scalar_summary=false, return_raw_memory=false, return_block_sequence=true))]
 fn execute(
     py: Python<'_>,
     compiled: &Bound<'_, PyAny>,
@@ -348,6 +362,7 @@ fn execute(
     max_steps: usize,
     return_scalar_summary: bool,
     return_raw_memory: bool,
+    return_block_sequence: bool,
 ) -> PyResult<PyObject> {
     let wrapper: PyRef<'_, CompiledProgramWrapper> = compiled.extract()?;
     let program = &wrapper.inner;
@@ -359,6 +374,7 @@ fn execute(
     };
     vm.log_read = log_read;
     vm.no_trace = no_trace;
+    vm.record_block_trace = return_block_sequence;
     if let Some(data) = extra_data {
         vm.external_buffer = data;
     }
@@ -421,7 +437,7 @@ fn execute(
         eprintln!(
             "[native] Execution: {:.1?}, {} blocks, {} trace entries",
             exec_elapsed,
-            vm.explored_blocks.len(),
+            vm.explored_count,
             vm.trace.total
         );
     }
@@ -430,7 +446,7 @@ fn execute(
         "native_execution_end",
         &[
             ("elapsed_ms", exec_elapsed.as_millis().to_string()),
-            ("blocks", vm.explored_blocks.len().to_string()),
+            ("blocks", vm.explored_count.to_string()),
             ("trace_entries", vm.trace.total.to_string()),
         ],
     );
@@ -444,6 +460,7 @@ fn execute(
         return_memory_summary,
         return_scalar_summary,
         return_raw_memory,
+        return_block_sequence,
         quiet,
     )
 }
@@ -454,7 +471,7 @@ fn execute(
 /// PyO3 AST lowering and removes per-input Environment construction and dict
 /// handoff.
 #[pyfunction]
-#[pyo3(signature = (compiled, native_meta, program_inputs, raw_log_path, extra_data=None, log_read=true, no_trace=false, return_memory_summary=true, quiet=true, max_steps=0, return_scalar_summary=false, return_raw_memory=false))]
+#[pyo3(signature = (compiled, native_meta, program_inputs, raw_log_path, extra_data=None, log_read=true, no_trace=false, return_memory_summary=true, quiet=true, max_steps=0, return_scalar_summary=false, return_raw_memory=false, return_block_sequence=true))]
 fn execute_inputs(
     py: Python<'_>,
     compiled: &Bound<'_, PyAny>,
@@ -469,6 +486,7 @@ fn execute_inputs(
     max_steps: usize,
     return_scalar_summary: bool,
     return_raw_memory: bool,
+    return_block_sequence: bool,
 ) -> PyResult<PyObject> {
     let wrapper: PyRef<'_, CompiledProgramWrapper> = compiled.extract()?;
     let program = &wrapper.inner;
@@ -480,6 +498,7 @@ fn execute_inputs(
     };
     vm.log_read = log_read;
     vm.no_trace = no_trace;
+    vm.record_block_trace = return_block_sequence;
 
     if !no_trace {
         attach_raw_log(program, &mut vm, &raw_log_path)?;
@@ -503,7 +522,7 @@ fn execute_inputs(
             "[native] State: {:.1?}, execution: {:.1?}, {} blocks, {} trace entries",
             state_elapsed,
             exec_elapsed,
-            vm.explored_blocks.len(),
+            vm.explored_count,
             vm.trace.total
         );
     }
@@ -513,7 +532,7 @@ fn execute_inputs(
         &[
             ("state_ms", state_elapsed.as_millis().to_string()),
             ("elapsed_ms", exec_elapsed.as_millis().to_string()),
-            ("blocks", vm.explored_blocks.len().to_string()),
+            ("blocks", vm.explored_count.to_string()),
             ("trace_entries", vm.trace.total.to_string()),
         ],
     );
@@ -527,6 +546,7 @@ fn execute_inputs(
         return_memory_summary,
         return_scalar_summary,
         return_raw_memory,
+        return_block_sequence,
         quiet,
     )?;
     let result_dict = result.bind(py).downcast::<PyDict>()?;
@@ -554,6 +574,40 @@ fn prepare_symbolic_inputs(
         extra_data,
         havoc_bound,
     )
+}
+
+/// Debug introspection: pretty-print one lowered block (or all blocks when
+/// `block_name` is None) with per-statement PCs.
+#[pyfunction]
+#[pyo3(signature = (compiled, block_name=None))]
+fn dump_block(
+    py: Python<'_>,
+    compiled: &Bound<'_, PyAny>,
+    block_name: Option<&str>,
+) -> PyResult<PyObject> {
+    let wrapper: PyRef<'_, CompiledProgramWrapper> = compiled.extract()?;
+    let mut out = String::new();
+    for block in &wrapper.inner.blocks {
+        if let Some(name) = block_name {
+            if block.name != name {
+                continue;
+            }
+        }
+        out.push_str(&format!(
+            "block {} (id={}, start_pc={}):\n",
+            block.name, block.id, block.start_pc
+        ));
+        let mut pc = block.start_pc;
+        for stmt in &block.body {
+            out.push_str(&format!("  pc={} {:?}\n", pc, stmt));
+            pc += 1;
+        }
+        out.push_str(&format!("  term {:?}\n", block.terminator));
+        if let Some(cond) = &block.assume_cond {
+            out.push_str(&format!("  assume_cond {:?}\n", cond));
+        }
+    }
+    Ok(out.into_py(py))
 }
 
 #[pyfunction]
@@ -670,6 +724,7 @@ fn swoosh_interp(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(concolic_suggest, m)?)?;
     m.add_function(wrap_pyfunction!(explore, m)?)?;
     m.add_function(wrap_pyfunction!(get_var_names, m)?)?;
+    m.add_function(wrap_pyfunction!(dump_block, m)?)?;
     m.add_function(wrap_pyfunction!(load_raw_log_to_redis, m)?)?;
     m.add_function(wrap_pyfunction!(build_trace_index_sqlite, m)?)?;
     m.add_class::<CompiledProgramWrapper>()?;

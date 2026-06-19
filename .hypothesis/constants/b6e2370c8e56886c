@@ -1,0 +1,4 @@
+# file: /home/ubuntu/boogie-parser/interpreter/python/Environment.py
+# hypothesis_version: 6.151.9
+
+[255, 50000, '$CurrAddr', '$CurrAddr.shadow', '$n', '$n.shadow', '.shadow', 'GLOBAL', 'R', 'W', '_late_blocks', '_late_vars', 'a', 'alloc_addr_write', 'bv', 'exec', 'mem', 'positive_examples', 'raw_log_close', 'raw_log_late_block', 'raw_log_late_var', 'raw_log_open', 'raw_log_stale_header', 'string_value_coerced', 'text_trace_flush', 'trace']
