@@ -35,31 +35,6 @@ from interpreter.utils.static_eval import (
 )
 
 
-_FNV64_OFFSET = 0xCBF29CE484222325
-_FNV64_PRIME = 0x100000001B3
-
-
-def _fnv64_update(value: int, data: bytes) -> int:
-    for byte in data:
-        value ^= byte
-        value = (value * _FNV64_PRIME) & ((1 << 64) - 1)
-    return value
-
-
-def _memory_contents_summary(memory: dict) -> dict:
-    items = sorted((int(k), int(v)) for k, v in memory.items())
-    h = _FNV64_OFFSET
-    for addr, value in items:
-        h = _fnv64_update(h, (addr & ((1 << 64) - 1)).to_bytes(8, "little"))
-        h = _fnv64_update(h, (value & ((1 << 64) - 1)).to_bytes(8, "little"))
-    return {
-        "entries": len(items),
-        "min_addr": items[0][0] if items else None,
-        "max_addr": items[-1][0] if items else None,
-        "hash": f"{h:016x}",
-    }
-
-
 def _normalize_engine_result(result: dict, *, engine: str, input_name: str) -> dict:
     out = dict(result)
     out["engine"] = engine
@@ -597,21 +572,6 @@ def write_trace_binary(path, compact_trace):
 
 
 # ---------------------------------------------------------------------------
-# Archived Python engine compatibility stubs
-# ---------------------------------------------------------------------------
-
-def run_python_result(program, program_inputs, test_name, input_name,
-                      full_trace=False, no_read_trace=False,
-                      debug_logger=None):
-    _legacy_python_runtime_disabled("run_python_result")
-
-
-def run_python(program, program_inputs, test_name, input_name, full_trace=False,
-               no_read_trace=False, debug_logger=None):
-    _legacy_python_runtime_disabled("run_python")
-
-
-# ---------------------------------------------------------------------------
 # Native engine
 # ---------------------------------------------------------------------------
 
@@ -790,17 +750,6 @@ def run_native(program, program_inputs, test_name, input_name, raw_log_path,
     )
 
     return _finish_native_result(result, return_status=return_status)
-
-
-# ---------------------------------------------------------------------------
-# Comparison mode
-# ---------------------------------------------------------------------------
-
-def run_both(program, program_inputs, test_name, input_name, full_trace=False,
-             no_read_trace=False, extra_data=None, raw_log_path=None,
-             init_raw_log_path=None, compiled=None, debug_logger=None,
-             prepared=None):
-    _legacy_python_runtime_disabled("run_both")
 
 
 # ---------------------------------------------------------------------------
