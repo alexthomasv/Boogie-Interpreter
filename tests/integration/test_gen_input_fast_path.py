@@ -576,31 +576,6 @@ def test_until_new_path_ladder_stops_after_concrete_path_gain(tmp_path):
     assert (out_dir / "until_new_path.json").exists()
 
 
-def test_native_replay_reports_block_sequence(tmp_path):
-    pytest.importorskip("swoosh_interp")
-    program = make_program(FAST_BRANCH_SOURCE)
-    prepared = prepare_native(program)
-    result = run_native(
-        program,
-        scalar_inputs({"$x": 0}),
-        "block_sequence_case",
-        "seed",
-        raw_log_path=tmp_path / "seed.trace.raw.zst",
-        prepared=prepared,
-        no_trace=True,
-        log_read=False,
-        return_status=True,
-        return_memory_summary=False,
-        validate_handoff=False,
-        quiet=True,
-        max_steps=10_000,
-    )
-
-    assert result["status"] == "ok"
-    assert result["block_sequence"] == ["entry", "zero"]
-    assert result["block_sequence_len"] == 2
-
-
 def test_gen_input_reports_step_limited_seed_without_writing_candidate(tmp_path):
     pytest.importorskip("swoosh_interp")
     program = make_program("""

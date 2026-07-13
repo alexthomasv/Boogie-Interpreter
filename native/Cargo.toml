@@ -8,7 +8,9 @@ name = "swoosh_interp"
 crate-type = ["cdylib"]
 
 [dependencies]
-pyo3 = { version = "0.22", features = ["extension-module"] }
+pyo3 = { version = "0.22", features = ["extension-module", "num-bigint"] }
+num-bigint = { version = "0.4", features = ["serde"] }
+num-traits = "0.2"
 rustc-hash = "2.0"
 zstd = { version = "0.13", features = ["zstdmt"] }
 redis = "0.25"

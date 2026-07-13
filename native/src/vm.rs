@@ -1,7 +1,9 @@
 use crate::builtins;
+use crate::builtins::int::{Z, ZResult};
 use crate::memory_map::MemoryMap;
 use crate::opcodes::*;
 use crate::trace::{TraceAccumulator, OP_READ, OP_WRITE};
+use num_bigint::BigInt;
 
 const MASK_64: i64 = -1i64; // all bits set = u64::MAX as i64
 
@@ -24,10 +26,14 @@ fn binop_symbol(op: &BinOp) -> &'static str {
     }
 }
 
-/// Runtime value — either a scalar or a memory map index.
+/// Runtime value — a scalar, an out-of-i64 exact integer (Int mode only),
+/// or a memory map index.
 #[derive(Debug, Clone)]
 pub enum Value {
     Scalar(i64),
+    /// Exact-ℤ value strictly outside i64 range. Only `SemanticsMode::Int`
+    /// evaluation produces these (BV mode is a closed i64 algebra).
+    Big(Box<BigInt>),
     Map(usize), // index into VM.memory_maps
 }
 
@@ -115,6 +121,31 @@ pub struct VM {
     pub havoc_counts: Vec<usize>,
     /// Reusable RHS-evaluation buffer for AssignN (avoids a per-statement Vec).
     scratch_evals: Vec<EvalResult>,
+    /// Trace records SKIPPED because the value was an out-of-i64 exact
+    /// integer (Int mode). The raw-log value field is i64; recording a
+    /// wrapped/clamped stand-in could manufacture false trace-refutations
+    /// downstream, so the escape is to drop the record and count it.
+    pub big_trace_skips: u64,
+    /// Out-of-i64 exact values folded mod 2^64 at the MEMORY interface
+    /// (Int mode). SMACK emits negative pointer offsets as u64
+    /// two's-complement literals (`p + 18446744073709551615` ≡ `p - 1`),
+    /// so exact-ℤ address chains can leave i64; the memory map is a
+    /// 64-bit-address store, and folding once at the boundary is
+    /// congruent (mod 2^64) with the historical per-op wrap for +,-,*.
+    pub mem_big_folds: u64,
+}
+
+/// Two's-complement fold of an exact integer into the 64-bit address/value
+/// space of the memory map: `v mod 2^64`, read back as i64.
+#[inline]
+fn fold_big_to_i64(b: &BigInt) -> i64 {
+    // Allocation-free: v mod 2^64 == low 64 bits of the magnitude, negated
+    // (wrapping) for negative values.
+    let low = b.iter_u64_digits().next().unwrap_or(0) as i64;
+    match b.sign() {
+        num_bigint::Sign::Minus => low.wrapping_neg(),
+        _ => low,
+    }
 }
 
 impl VM {
@@ -170,6 +201,8 @@ impl VM {
             havoc_sequences: vec![None; n],
             havoc_counts: vec![0; n],
             scratch_evals: Vec::new(),
+            big_trace_skips: 0,
+            mem_big_folds: 0,
         }
     }
 
@@ -266,6 +299,36 @@ impl VM {
         self.vars[vid] = Value::Scalar(value);
     }
 
+    /// Store an out-of-i64 exact integer (Int mode). No trace record is
+    /// emitted — see `big_trace_skips` for why the escape is a counted skip.
+    #[inline]
+    pub fn set_big(&mut self, var_id: VarId, value: Box<BigInt>) {
+        if Some(var_id) == self.curr_addr_id || Some(var_id) == self.curr_addr_shadow_id {
+            panic!(
+                "exact-int overflow escape: allocation cursor {} left i64 range ({})",
+                self.var_names[var_id as usize], value
+            );
+        }
+        if !self.no_trace {
+            self.big_trace_skips += 1;
+        }
+        self.vars[var_id as usize] = Value::Big(value);
+    }
+
+    /// Memory-interface read of a variable: like `get_scalar`, but an
+    /// out-of-i64 exact value folds mod 2^64 (counted) instead of panicking
+    /// — used by the memcpy/memset/read handlers whose operands are
+    /// 64-bit addresses/lengths by construction.
+    #[inline]
+    fn get_scalar_mem(&mut self, var_id: VarId) -> i64 {
+        if let Value::Big(b) = &self.vars[var_id as usize] {
+            let folded = fold_big_to_i64(b);
+            self.mem_big_folds += 1;
+            return folded;
+        }
+        self.get_scalar(var_id)
+    }
+
     /// Get a scalar variable value, with optional read tracing.
     #[inline]
     pub fn get_scalar(&mut self, var_id: VarId) -> i64 {
@@ -279,6 +342,11 @@ impl VM {
                 }
                 v
             }
+            Value::Big(b) => panic!(
+                "exact-int overflow escape: {} = {} is outside i64 in an \
+                 i64-only context (memory/handoff)",
+                self.var_names[vid], b
+            ),
             Value::Map(_) => panic!(
                 "get_scalar called on memory map variable: {}",
                 self.var_names[vid]
@@ -291,6 +359,11 @@ impl VM {
     pub fn get_scalar_silent(&self, var_id: VarId) -> i64 {
         match &self.vars[var_id as usize] {
             Value::Scalar(v) => *v,
+            Value::Big(b) => panic!(
+                "exact-int overflow escape: {} = {} is outside i64 in an \
+                 i64-only context (memory/handoff)",
+                self.var_names[var_id as usize], b
+            ),
             Value::Map(_) => panic!(
                 "get_scalar_silent called on memory map variable: {}",
                 self.var_names[var_id as usize]
@@ -553,9 +626,15 @@ impl VM {
             Stmt::LoopHeaderSnap { live_vars } => {
                 if !self.no_trace {
                     for &vid in live_vars {
-                        if let Value::Scalar(val) = self.vars[vid as usize] {
-                            self.trace
-                                .record(vid, val, self.pc, self.curr_block_id, OP_WRITE);
+                        match &self.vars[vid as usize] {
+                            Value::Scalar(val) => {
+                                let val = *val;
+                                self.trace
+                                    .record(vid, val, self.pc, self.curr_block_id, OP_WRITE);
+                            }
+                            // Out-of-i64 exact value: counted trace skip.
+                            Value::Big(_) => self.big_trace_skips += 1,
+                            Value::Map(_) => {}
                         }
                     }
                 }
@@ -667,7 +746,7 @@ impl VM {
                 }
             }
             Stmt::CallMemmove { args } => {
-                let vals: Vec<i64> = args.iter().map(|a| self.eval_i64(a, program)).collect();
+                let vals: Vec<i64> = args.iter().map(|a| self.eval_mem_i64(a, program)).collect();
                 if vals.len() >= 6 {
                     let len = vals[4];
                     let len_shadow = vals[5];
@@ -693,14 +772,14 @@ impl VM {
                 len,
                 val,
             } => {
-                let dst_val = self.get_scalar(*dst);
-                let len_val = self.get_scalar(*len);
-                let val_val = self.get_scalar(*val);
+                let dst_val = self.get_scalar_mem(*dst);
+                let len_val = self.get_scalar_mem(*len);
+                let val_val = self.get_scalar_mem(*val);
                 let map_idx = self.get_map_idx(*m_ret);
                 self.memory_maps[map_idx].fill_range(dst_val, len_val, val_val);
             }
             Stmt::QuantMemsetPreserveLt { m_ret, m_src, dst } => {
-                let dst_val = self.get_scalar(*dst);
+                let dst_val = self.get_scalar_mem(*dst);
                 let src_idx = self.get_map_idx(*m_src);
                 let dst_idx = self.get_map_idx(*m_ret);
                 if src_idx != dst_idx {
@@ -714,8 +793,8 @@ impl VM {
                 dst,
                 len,
             } => {
-                let dst_val = self.get_scalar(*dst);
-                let len_val = self.get_scalar(*len);
+                let dst_val = self.get_scalar_mem(*dst);
+                let len_val = self.get_scalar_mem(*len);
                 let boundary = dst_val + len_val;
                 let src_idx = self.get_map_idx(*m_src);
                 let dst_idx = self.get_map_idx(*m_ret);
@@ -731,9 +810,9 @@ impl VM {
                 src,
                 len,
             } => {
-                let dst_val = self.get_scalar(*dst);
-                let src_val = self.get_scalar(*src);
-                let len_val = self.get_scalar(*len);
+                let dst_val = self.get_scalar_mem(*dst);
+                let src_val = self.get_scalar_mem(*src);
+                let len_val = self.get_scalar_mem(*len);
                 let src_idx = self.get_map_idx(*m_src);
                 let dst_idx = self.get_map_idx(*m_ret);
                 if src_idx == dst_idx {
@@ -744,7 +823,7 @@ impl VM {
                 }
             }
             Stmt::QuantMemcpyPreserveLt { m_ret, m_src, dst } => {
-                let dst_val = self.get_scalar(*dst);
+                let dst_val = self.get_scalar_mem(*dst);
                 let src_idx = self.get_map_idx(*m_src);
                 let dst_idx = self.get_map_idx(*m_ret);
                 if src_idx != dst_idx {
@@ -758,8 +837,8 @@ impl VM {
                 dst,
                 len,
             } => {
-                let dst_val = self.get_scalar(*dst);
-                let len_val = self.get_scalar(*len);
+                let dst_val = self.get_scalar_mem(*dst);
+                let len_val = self.get_scalar_mem(*len);
                 let boundary = dst_val + len_val;
                 let src_idx = self.get_map_idx(*m_src);
                 let dst_idx = self.get_map_idx(*m_ret);
@@ -802,6 +881,7 @@ impl VM {
     fn set_eval_result(&mut self, var_id: VarId, result: EvalResult) {
         match result {
             EvalResult::Scalar(v) => self.set_scalar(var_id, v, false),
+            EvalResult::Big(b) => self.set_big(var_id, b),
             EvalResult::Bool(b) => self.set_scalar(var_id, b as i64, false),
             EvalResult::MapRef(map_idx) => {
                 // Assignment of a map — the store.iN returns the modified map
@@ -850,6 +930,7 @@ impl VM {
                 .unwrap_or("?");
             match self.vars.get(*vid as usize) {
                 Some(Value::Scalar(v)) => vals.push_str(&format!("{}={}", name, v)),
+                Some(Value::Big(b)) => vals.push_str(&format!("{}={}", name, b)),
                 Some(Value::Map(_)) => vals.push_str(&format!("{}=<map>", name)),
                 None => vals.push_str(&format!("{}=?", name)),
             }
@@ -890,6 +971,7 @@ impl VM {
                 }
             }
             Expr::Const(v) => out.push_str(&v.to_string()),
+            Expr::ConstBig(b) => out.push_str(&b.to_string()),
             Expr::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
             Expr::BinOp { op, lhs, rhs } => {
                 out.push('(');
@@ -959,6 +1041,8 @@ impl VM {
     fn eval_bool(&mut self, expr: &Expr, program: &CompiledProgram) -> bool {
         match self.eval(expr, program) {
             EvalResult::Scalar(v) => v != 0,
+            // Big is strictly outside i64, hence never zero.
+            EvalResult::Big(_) => true,
             EvalResult::Bool(b) => b,
             EvalResult::MapRef(_) => panic!("Expected bool, got map"),
         }
@@ -979,42 +1063,173 @@ impl VM {
                         }
                         EvalResult::Scalar(v)
                     }
+                    Value::Big(b) => {
+                        // Out-of-i64 exact value: the read is NOT trace-
+                        // recorded (i64 value field) — counted skip.
+                        let b = b.clone();
+                        if !self.no_trace && self.log_read {
+                            self.big_trace_skips += 1;
+                        }
+                        EvalResult::Big(b)
+                    }
                     Value::Map(idx) => EvalResult::MapRef(*idx),
                 }
             }
             Expr::Const(v) => EvalResult::Scalar(*v),
+            Expr::ConstBig(b) => EvalResult::Big(b.clone()),
             Expr::Bool(b) => EvalResult::Bool(*b),
             Expr::BinOp { op, lhs, rhs } => {
-                let l = self.eval_i64(lhs, program);
-                let r = self.eval_i64(rhs, program);
-                match op {
-                    BinOp::Eq => EvalResult::Bool(l == r),
-                    BinOp::Ne => EvalResult::Bool(l != r),
-                    BinOp::Lt => EvalResult::Bool(l < r),
-                    BinOp::Gt => EvalResult::Bool(l > r),
-                    BinOp::Le => EvalResult::Bool(l <= r),
-                    BinOp::Ge => EvalResult::Bool(l >= r),
-                    BinOp::And => EvalResult::Bool(l != 0 && r != 0),
-                    BinOp::Or => EvalResult::Bool(l != 0 || r != 0),
-                    BinOp::Implies => EvalResult::Bool(l == 0 || r != 0),
-                    BinOp::Iff => EvalResult::Bool((l != 0) == (r != 0)),
-                    BinOp::Sub => EvalResult::Scalar((l.wrapping_sub(r)) & MASK_64),
-                    BinOp::Mul => EvalResult::Scalar((l.wrapping_mul(r)) & MASK_64),
-                    BinOp::Add => EvalResult::Scalar((l.wrapping_add(r)) & MASK_64),
+                if program.mode == SemanticsMode::Bv {
+                    // BV mode: the historical wrapping i64 algebra, unchanged.
+                    let l = self.eval_i64(lhs, program);
+                    let r = self.eval_i64(rhs, program);
+                    match op {
+                        BinOp::Eq => EvalResult::Bool(l == r),
+                        BinOp::Ne => EvalResult::Bool(l != r),
+                        BinOp::Lt => EvalResult::Bool(l < r),
+                        BinOp::Gt => EvalResult::Bool(l > r),
+                        BinOp::Le => EvalResult::Bool(l <= r),
+                        BinOp::Ge => EvalResult::Bool(l >= r),
+                        BinOp::And => EvalResult::Bool(l != 0 && r != 0),
+                        BinOp::Or => EvalResult::Bool(l != 0 || r != 0),
+                        BinOp::Implies => EvalResult::Bool(l == 0 || r != 0),
+                        BinOp::Iff => EvalResult::Bool((l != 0) == (r != 0)),
+                        BinOp::Sub => EvalResult::Scalar((l.wrapping_sub(r)) & MASK_64),
+                        BinOp::Mul => EvalResult::Scalar((l.wrapping_mul(r)) & MASK_64),
+                        BinOp::Add => EvalResult::Scalar((l.wrapping_add(r)) & MASK_64),
+                    }
+                } else {
+                    // Int mode: exact-ℤ core. Arithmetic uses checked ops with
+                    // BigInt promotion; comparisons compare exact values.
+                    let le = self.eval(lhs, program);
+                    let re = self.eval(rhs, program);
+                    // Hot path: both operands are in-i64 (the overwhelmingly
+                    // common case) — direct i64 comparisons, checked arith.
+                    if let (Some(l), Some(r)) = (as_small(&le), as_small(&re)) {
+                        return match op {
+                            BinOp::Eq => EvalResult::Bool(l == r),
+                            BinOp::Ne => EvalResult::Bool(l != r),
+                            BinOp::Lt => EvalResult::Bool(l < r),
+                            BinOp::Gt => EvalResult::Bool(l > r),
+                            BinOp::Le => EvalResult::Bool(l <= r),
+                            BinOp::Ge => EvalResult::Bool(l >= r),
+                            BinOp::And => EvalResult::Bool(l != 0 && r != 0),
+                            BinOp::Or => EvalResult::Bool(l != 0 || r != 0),
+                            BinOp::Implies => EvalResult::Bool(l == 0 || r != 0),
+                            BinOp::Iff => EvalResult::Bool((l != 0) == (r != 0)),
+                            BinOp::Sub => match l.checked_sub(r) {
+                                Some(v) => EvalResult::Scalar(v),
+                                None => z_to_eval(crate::builtins::int::sub(&Z::S(l), &Z::S(r))),
+                            },
+                            BinOp::Mul => match l.checked_mul(r) {
+                                Some(v) => EvalResult::Scalar(v),
+                                None => z_to_eval(crate::builtins::int::mul(&Z::S(l), &Z::S(r))),
+                            },
+                            BinOp::Add => match l.checked_add(r) {
+                                Some(v) => EvalResult::Scalar(v),
+                                None => z_to_eval(crate::builtins::int::add(&Z::S(l), &Z::S(r))),
+                            },
+                        };
+                    }
+                    let l = eval_result_to_z(le);
+                    let r = eval_result_to_z(re);
+                    use std::cmp::Ordering::*;
+                    let ord = || crate::builtins::int::cmp(&l, &r);
+                    match op {
+                        BinOp::Eq => EvalResult::Bool(ord() == Equal),
+                        BinOp::Ne => EvalResult::Bool(ord() != Equal),
+                        BinOp::Lt => EvalResult::Bool(ord() == Less),
+                        BinOp::Gt => EvalResult::Bool(ord() == Greater),
+                        BinOp::Le => EvalResult::Bool(ord() != Greater),
+                        BinOp::Ge => EvalResult::Bool(ord() != Less),
+                        BinOp::And => EvalResult::Bool(!l.is_zero() && !r.is_zero()),
+                        BinOp::Or => EvalResult::Bool(!l.is_zero() || !r.is_zero()),
+                        BinOp::Implies => EvalResult::Bool(l.is_zero() || !r.is_zero()),
+                        BinOp::Iff => EvalResult::Bool(l.is_zero() == r.is_zero()),
+                        BinOp::Sub => z_to_eval(crate::builtins::int::sub(&l, &r)),
+                        BinOp::Mul => z_to_eval(crate::builtins::int::mul(&l, &r)),
+                        BinOp::Add => z_to_eval(crate::builtins::int::add(&l, &r)),
+                    }
                 }
             }
             Expr::Builtin { fn_id, args } => {
-                if builtins::num_args(*fn_id) == 1 {
-                    let x = self.eval_i64(&args[0], program);
-                    EvalResult::Scalar(builtins::exec_unary(*fn_id, x))
-                } else {
-                    let a = self.eval_i64(&args[0], program);
-                    let b = self.eval_i64(&args[1], program);
-                    let (result, is_bool) = builtins::exec_binary(*fn_id, a, b);
-                    if is_bool {
-                        EvalResult::Bool(result != 0)
+                if program.mode == SemanticsMode::Bv {
+                    if builtins::num_args(*fn_id) == 1 {
+                        let x = self.eval_i64(&args[0], program);
+                        EvalResult::Scalar(builtins::exec_unary(*fn_id, x))
                     } else {
-                        EvalResult::Scalar(result & MASK_64)
+                        let a = self.eval_i64(&args[0], program);
+                        let b = self.eval_i64(&args[1], program);
+                        let (result, is_bool) = builtins::exec_binary(*fn_id, a, b);
+                        if is_bool {
+                            EvalResult::Bool(result != 0)
+                        } else {
+                            EvalResult::Scalar(result & MASK_64)
+                        }
+                    }
+                } else if builtins::num_args(*fn_id) == 1 {
+                    // Identity casts dominate: pass in-i64 values straight through.
+                    let xe = self.eval(&args[0], program);
+                    if !matches!(*fn_id, BuiltinFn::Not { .. }) {
+                        if let EvalResult::Scalar(_) | EvalResult::Big(_) = xe {
+                            return xe;
+                        }
+                    }
+                    let x = eval_result_to_z(xe);
+                    z_to_eval(builtins::int::exec_unary(*fn_id, &x))
+                } else {
+                    let ae = self.eval(&args[0], program);
+                    let be = self.eval(&args[1], program);
+                    // Hot path: both operands in-i64 — direct machine ops for
+                    // the arithmetic/comparison family (semantically identical
+                    // to the exec_binary Z path; see builtins::int).
+                    if let (Some(a), Some(b)) = (as_small(&ae), as_small(&be)) {
+                        match *fn_id {
+                            BuiltinFn::Add { .. } => {
+                                if let Some(v) = a.checked_add(b) {
+                                    return EvalResult::Scalar(v);
+                                }
+                            }
+                            BuiltinFn::Sub { .. } => {
+                                if let Some(v) = a.checked_sub(b) {
+                                    return EvalResult::Scalar(v);
+                                }
+                            }
+                            BuiltinFn::Mul { .. } => {
+                                if let Some(v) = a.checked_mul(b) {
+                                    return EvalResult::Scalar(v);
+                                }
+                            }
+                            BuiltinFn::Slt { .. } | BuiltinFn::Ult { .. } => {
+                                return EvalResult::Scalar((a < b) as i64)
+                            }
+                            BuiltinFn::Sle { .. } | BuiltinFn::Ule { .. } => {
+                                return EvalResult::Scalar((a <= b) as i64)
+                            }
+                            BuiltinFn::Sgt { .. } | BuiltinFn::Ugt { .. } => {
+                                return EvalResult::Scalar((a > b) as i64)
+                            }
+                            BuiltinFn::Sge { .. } | BuiltinFn::Uge { .. } => {
+                                return EvalResult::Scalar((a >= b) as i64)
+                            }
+                            BuiltinFn::BvEq { .. } => {
+                                return EvalResult::Scalar((a == b) as i64)
+                            }
+                            BuiltinFn::BvNe { .. } => {
+                                return EvalResult::Scalar((a != b) as i64)
+                            }
+                            BuiltinFn::SltBool { .. } => return EvalResult::Bool(a < b),
+                            BuiltinFn::SleBool { .. } => return EvalResult::Bool(a <= b),
+                            BuiltinFn::SgtBool { .. } => return EvalResult::Bool(a > b),
+                            BuiltinFn::SgeBool { .. } => return EvalResult::Bool(a >= b),
+                            _ => {}
+                        }
+                    }
+                    let a = eval_result_to_z(ae);
+                    let b = eval_result_to_z(be);
+                    match builtins::int::exec_binary(*fn_id, &a, &b) {
+                        ZResult::Num(z) => z_to_eval(z),
+                        ZResult::Bool(b) => EvalResult::Bool(b),
                     }
                 }
             }
@@ -1028,8 +1243,8 @@ impl VM {
                     EvalResult::MapRef(idx) => idx,
                     _ => panic!("store: expected map"),
                 };
-                let idx_val = self.eval_i64(index, program);
-                let val = self.eval_i64(value, program);
+                let idx_val = self.eval_mem_i64(index, program);
+                let val = self.eval_mem_i64(value, program);
                 let bw = *bit_width as u8;
                 let ew = self.memory_maps[map_idx].element_bit_width;
                 if bw <= ew {
@@ -1053,7 +1268,7 @@ impl VM {
                     EvalResult::MapRef(idx) => idx,
                     _ => panic!("load: expected map"),
                 };
-                let idx_val = self.eval_i64(index, program);
+                let idx_val = self.eval_mem_i64(index, program);
                 let bw = *bit_width as u8;
                 let ew = self.memory_maps[map_idx].element_bit_width;
                 if bw <= ew {
@@ -1091,8 +1306,36 @@ impl VM {
         match self.eval(expr, program) {
             EvalResult::Scalar(v) => v,
             EvalResult::Bool(b) => b as i64,
+            EvalResult::Big(b) => panic!(
+                "exact-int overflow escape: value {} is outside i64 in an \
+                 i64-only context (memory index/value or call argument)",
+                b
+            ),
             EvalResult::MapRef(_) => panic!("Expected scalar, got map"),
         }
+    }
+
+    /// Memory-interface evaluation: like `eval_i64`, but an out-of-i64
+    /// exact value folds mod 2^64 (counted). Used for load/store
+    /// indices/values and external-call arguments — 64-bit address-space
+    /// quantities by construction.
+    #[inline]
+    fn eval_mem_i64(&mut self, expr: &Expr, program: &CompiledProgram) -> i64 {
+        match self.eval(expr, program) {
+            EvalResult::Scalar(v) => v,
+            EvalResult::Bool(b) => b as i64,
+            EvalResult::Big(b) => {
+                self.mem_big_folds += 1;
+                fold_big_to_i64(&b)
+            }
+            EvalResult::MapRef(_) => panic!("Expected scalar, got map"),
+        }
+    }
+
+    /// Evaluate an expression as an exact integer (Int mode).
+    #[inline]
+    fn eval_z(&mut self, expr: &Expr, program: &CompiledProgram) -> Z {
+        eval_result_to_z(self.eval(expr, program))
     }
 
     /// Read a null-terminated C string from a memory map.
@@ -1124,7 +1367,7 @@ impl VM {
         if args.is_empty() {
             return; // malformed printf without format string — skip silently
         }
-        let vals: Vec<i64> = args.iter().map(|a| self.eval_i64(a, program)).collect();
+        let vals: Vec<i64> = args.iter().map(|a| self.eval_mem_i64(a, program)).collect();
 
         let m0_id = match self.m0_id {
             Some(id) => id,
@@ -1367,7 +1610,40 @@ fn two_maps(maps: &mut [MemoryMap], dst: usize, src: usize) -> (&mut MemoryMap, 
 #[derive(Debug, Clone)]
 pub enum EvalResult {
     Scalar(i64),
+    /// Exact-ℤ value strictly outside i64 range (Int mode only).
+    Big(Box<BigInt>),
     Bool(bool),
     MapRef(usize),
+}
+
+/// Fold an exact integer back into an `EvalResult`, preserving the
+/// "Big only when outside i64" invariant maintained by `builtins::int`.
+#[inline]
+fn z_to_eval(z: Z) -> EvalResult {
+    match z {
+        Z::S(v) => EvalResult::Scalar(v),
+        Z::B(b) => EvalResult::Big(b),
+    }
+}
+
+/// In-i64 numeric view of an eval result (Bool → 0/1); None for Big/Map.
+#[inline]
+fn as_small(e: &EvalResult) -> Option<i64> {
+    match e {
+        EvalResult::Scalar(v) => Some(*v),
+        EvalResult::Bool(b) => Some(*b as i64),
+        _ => None,
+    }
+}
+
+/// Exact-integer view of an eval result (Int mode).
+#[inline]
+fn eval_result_to_z(e: EvalResult) -> Z {
+    match e {
+        EvalResult::Scalar(v) => Z::S(v),
+        EvalResult::Bool(b) => Z::S(b as i64),
+        EvalResult::Big(b) => Z::B(b),
+        EvalResult::MapRef(_) => panic!("Expected scalar, got map"),
+    }
 }
 

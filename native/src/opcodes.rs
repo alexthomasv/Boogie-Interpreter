@@ -45,6 +45,11 @@ pub enum Expr {
     Not(Box<Expr>),
     /// $isExternal — always returns 0
     IsExternal,
+    /// Integer constant beyond i64 — Int (exact-ℤ) mode only. BV mode never
+    /// constructs this (an out-of-u64 literal is a loud lowering error there).
+    /// Kept as the LAST variant: bincode `.swcp` encoding is positional, so
+    /// appending preserves deserialization of every pre-existing package.
+    ConstBig(Box<num_bigint::BigInt>),
 }
 
 /// Binary operators at the Boogie level.
@@ -119,6 +124,13 @@ pub enum BuiltinFn {
     SleBool { bits: u8 },
     SgtBool { bits: u8 },
     SgeBool { bits: u8 },
+
+    // SMT-LIB integer division / modulus — the RESIDUAL div/rem intrinsics of
+    // the SMACK integer encoding ({:builtin "div"} $idiv.iN / {:builtin "mod"}
+    // $smod.iN). Int mode only; BV-mode programs never name them. Appended
+    // last: bincode `.swcp` variant indices are positional.
+    Idiv { bits: u8 },
+    Smod { bits: u8 },
 }
 
 /// A compiled statement.
@@ -253,6 +265,54 @@ pub struct MemMapInfo {
     pub element_bit_width: u8,
 }
 
+/// Arithmetic semantics the program was compiled under.
+///
+/// SMACK emits the same `type i32 = int` alias in both encodings; the
+/// truthful signal is the prelude body shape (see Python
+/// `interpreter.utils.integer_encoding.detect_integer_encoding`):
+///
+/// * `Int` — SMACK unbounded-integer encoding: prelude bodies are plain
+///   `(i1 + i2)` over mathematical integers. Wrapping/masking is WRONG here
+///   (the c2i_094 `j=(n+1)(n+2)/2` false refutation at n=65535 was 32-bit
+///   wrap applied to a math-int program).
+/// * `Bv` — SMACK bit-vector encoding (`$add.bv32` intrinsics): the wrapping
+///   algebra implemented by `builtins.rs` / `vm.rs` is the correct model.
+///
+/// Step 1 (mode plumbing) only CARRIES this tag; the VM still evaluates with
+/// wrapping semantics in both modes. Step 3 switches evaluation on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum SemanticsMode {
+    /// SMACK unbounded-integer encoding (`type i32 = int`, plain `(i1+i2)` prelude).
+    Int,
+    /// SMACK bit-vector encoding — wrapping algebra is the correct model.
+    /// Default: every pre-mode artifact was built under BV assumptions.
+    #[default]
+    Bv,
+}
+
+impl SemanticsMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SemanticsMode::Int => "int",
+            SemanticsMode::Bv => "bv",
+        }
+    }
+
+    pub fn from_str_opt(s: Option<&str>) -> Result<Self, String> {
+        match s {
+            None => Ok(SemanticsMode::Bv),
+            Some(v) => match v {
+                "int" => Ok(SemanticsMode::Int),
+                "bv" => Ok(SemanticsMode::Bv),
+                other => Err(format!(
+                    "unknown semantics mode {:?} (expected \"int\" or \"bv\")",
+                    other
+                )),
+            },
+        }
+    }
+}
+
 /// A compiled program ready for VM execution.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CompiledProgram {
@@ -300,6 +360,12 @@ pub struct CompiledProgram {
     /// in-memory `lower()` path, which still takes static scalars via native_meta.
     #[serde(default)]
     pub static_scalars: Vec<(VarId, i64)>,
+    /// Integer semantics the program was compiled under (see `SemanticsMode`).
+    /// `#[serde(default)]` documents intent (Bv) for self-describing formats;
+    /// note the bincode `.swcp` format is positional, so a pre-mode `.swcp`
+    /// fails to deserialize LOUDLY rather than silently defaulting.
+    #[serde(default)]
+    pub mode: SemanticsMode,
 }
 
 impl CompiledProgram {

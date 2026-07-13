@@ -28,16 +28,26 @@ use vm::ExecutionStatus;
 /// When provided, the interpreter snapshots those variables on each
 /// loop header visit, enabling iteration-aware trace data.
 #[pyfunction]
-#[pyo3(signature = (program, loop_header_live=None, loop_metadata=None))]
+#[pyo3(signature = (program, loop_header_live=None, loop_metadata=None, mode=None))]
 fn lower(
     py: Python<'_>,
     program: &Bound<'_, PyAny>,
     loop_header_live: Option<&Bound<'_, PyDict>>,
     loop_metadata: Option<&Bound<'_, PyDict>>,
+    mode: Option<&str>,
 ) -> PyResult<PyObject> {
-    let compiled = lowering::lower_program_full(py, program, loop_header_live, loop_metadata)?;
+    let mode = parse_semantics_mode(mode)?;
+    let compiled =
+        lowering::lower_program_full(py, program, loop_header_live, loop_metadata, mode)?;
     let wrapper = CompiledProgramWrapper { inner: compiled };
     Ok(Py::new(py, wrapper)?.into_py(py))
+}
+
+/// Parse the Python-side semantics-mode tag ("int"/"bv"; None → Bv, the
+/// pre-mode default so legacy callers keep today's semantics).
+fn parse_semantics_mode(mode: Option<&str>) -> PyResult<opcodes::SemanticsMode> {
+    opcodes::SemanticsMode::from_str_opt(mode)
+        .map_err(pyo3::exceptions::PyValueError::new_err)
 }
 
 #[pyclass]
@@ -45,13 +55,28 @@ pub(crate) struct CompiledProgramWrapper {
     pub(crate) inner: opcodes::CompiledProgram,
 }
 
+#[pymethods]
+impl CompiledProgramWrapper {
+    /// Semantics mode the program was lowered under: "int" or "bv".
+    #[getter]
+    fn mode(&self) -> &'static str {
+        self.inner.mode.as_str()
+    }
+}
+
 /// Inline `{:inline}` procedures and lower straight to bytecode, returning the
 /// opaque CompiledProgram handle. Like `lower`, but the input is the *un-inlined*
 /// shadowed AST — inlining happens natively in Rust (no Boogie, no reparse).
 /// Used by the differential test harness and the in-memory interpret path.
 #[pyfunction]
-fn inline_lower(py: Python<'_>, program: &Bound<'_, PyAny>) -> PyResult<PyObject> {
-    let compiled = lowering::inline::inline_lower_program(py, program, None)?;
+#[pyo3(signature = (program, mode=None))]
+fn inline_lower(
+    py: Python<'_>,
+    program: &Bound<'_, PyAny>,
+    mode: Option<&str>,
+) -> PyResult<PyObject> {
+    let mode = parse_semantics_mode(mode)?;
+    let compiled = lowering::inline::inline_lower_program(py, program, None, mode)?;
     let wrapper = CompiledProgramWrapper { inner: compiled };
     Ok(Py::new(py, wrapper)?.into_py(py))
 }
@@ -62,14 +87,16 @@ fn inline_lower(py: Python<'_>, program: &Bound<'_, PyAny>) -> PyResult<PyObject
 /// Python from the un-inlined program) is baked in so a concrete run needs no
 /// Python-AST-derived native_meta.
 #[pyfunction]
-#[pyo3(signature = (program, path, static_scalars=None))]
+#[pyo3(signature = (program, path, static_scalars=None, mode=None))]
 fn inline_lower_to_file(
     py: Python<'_>,
     program: &Bound<'_, PyAny>,
     path: &str,
     static_scalars: Option<&Bound<'_, PyDict>>,
+    mode: Option<&str>,
 ) -> PyResult<()> {
-    let compiled = lowering::inline::inline_lower_program(py, program, static_scalars)?;
+    let mode = parse_semantics_mode(mode)?;
+    let compiled = lowering::inline::inline_lower_program(py, program, static_scalars, mode)?;
     let bytes = bincode::serialize(&compiled)
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("bincode serialize: {}", e)))?;
     let compressed = zstd::encode_all(&bytes[..], 3)
@@ -154,10 +181,20 @@ fn scalar_summary<'py>(
 ) -> PyResult<Bound<'py, PyDict>> {
     let out = PyDict::new_bound(py);
     for (idx, value) in vm.vars.iter().enumerate() {
-        if let vm::Value::Scalar(scalar) = value {
-            if let Some(name) = program.var_names.get(idx) {
-                out.set_item(name.as_str(), *scalar)?;
+        match value {
+            vm::Value::Scalar(scalar) => {
+                if let Some(name) = program.var_names.get(idx) {
+                    out.set_item(name.as_str(), *scalar)?;
+                }
             }
+            // Out-of-i64 exact integer (Int mode): surface the exact value
+            // as an arbitrary-precision Python int.
+            vm::Value::Big(big) => {
+                if let Some(name) = program.var_names.get(idx) {
+                    out.set_item(name.as_str(), (**big).clone())?;
+                }
+            }
+            vm::Value::Map(_) => {}
         }
     }
     Ok(out)
@@ -301,6 +338,12 @@ fn finish_vm_result(
     result.set_item("blocks_explored", vm.explored_count)?;
     result.set_item("block_sequence_len", vm.block_entries)?;
     result.set_item("no_trace", vm.no_trace)?;
+    // Out-of-i64 exact values whose trace records were skipped (Int mode
+    // escape — see vm::VM::big_trace_skips).
+    result.set_item("trace_big_skips", vm.big_trace_skips)?;
+    // Out-of-i64 exact values folded mod 2^64 at the memory interface
+    // (Int mode escape — see vm::VM::mem_big_folds).
+    result.set_item("mem_big_folds", vm.mem_big_folds)?;
     result.set_item("vars", program.var_names.len())?;
     result.set_item("memory_map_count", vm.memory_maps.len())?;
     debug_log::event(

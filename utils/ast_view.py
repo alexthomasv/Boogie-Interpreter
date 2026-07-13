@@ -14,8 +14,12 @@ every agent then reads off the freeze payload (no re-parse, no sort/width drift)
 
 - :func:`term_to_pattern` — cvc5 ``Term`` → structural ``pattern`` dict using the
   cvc5 ``Kind`` name directly (``EQUAL``/``ITE``/``GEQ``/``BITVECTOR_SGE``); the
-  DSL matcher accepts uppercase Kind names, so no alias table is needed. Variable
-  leaves → ``{capture: name}``; integer/bv literals → ``{const: N}``.
+  DSL matcher accepts uppercase Kind names, so no alias table is needed. Free
+  program-symbol leaves → ``{capture: name, sort: var}``; other symbolic leaves
+  explicitly retain the old open-subterm domain as ``sort: subterm``; integer/bv
+  literals → ``{const: N}``.  The explicit domain is executable AST, not prose:
+  it prevents a capture observed on a scalar leaf from silently binding a
+  compound expression in a learned rule.
 - :func:`term_to_emit` — same walk in *emit* form (one-key op mappings,
   ``{gte: [...]}``); raises :class:`UnsupportedShape` for a Kind with no emit op.
 - :func:`derive_structural_template` — full ``structural_template`` (pattern +
@@ -29,9 +33,16 @@ every agent then reads off the freeze payload (no re-parse, no sort/width drift)
 
 from __future__ import annotations
 
+import base64
+import copy
+import hashlib
+import json
+import pickle
 from typing import Any
 
 from cvc5 import Kind
+
+from interpreter.utils.cvc5_serde import term_op_indices
 
 
 class UnsupportedShape(Exception):
@@ -63,7 +74,9 @@ KIND_TO_EMIT_OP: dict[str, str] = {
 
 
 def _const_value(term) -> int | None:
-    """Integer value of a literal leaf (int or bit-vector), else ``None``."""
+    """Integer value of a literal leaf (int or bit-vector), else ``None``.
+    INT-ONLY on purpose — `term_to_emit` / `_materialized_guard` do integer
+    arithmetic on it. Pattern building uses :func:`_const_literal`."""
     try:
         if term.isIntegerValue():
             return int(term.getIntegerValue())
@@ -77,7 +90,39 @@ def _const_value(term) -> int | None:
     return None
 
 
-def _capture_name(term, captures: dict[str, str]) -> str:
+def _const_literal(term):
+    """JSON-able literal value for ANY constant leaf — int/bv (raw int),
+    bool/real/string (tagged string spellings: ``bool:``/``real:``/``str:`` —
+    tagged so a real/string/bool literal can never collide with an int const
+    or with each other under the pattern matcher's ``==``; Python would
+    otherwise equate ``True == 1``). ``None`` for a non-literal.
+
+    Before this, real/string/bool literals fell through to the CAPTURE branch
+    of :func:`term_to_pattern` — a constant silently became a variable, so
+    e.g. two predicates differing only in a real constant were one
+    over-general family."""
+    c = _const_value(term)
+    if c is not None:
+        return c
+    try:
+        if term.isBooleanValue():
+            return "bool:true" if term.getBooleanValue() else "bool:false"
+    except Exception:
+        pass
+    try:
+        if term.isRealValue():
+            return "real:" + str(term.getRealValue())
+    except Exception:
+        pass
+    try:
+        if term.isStringValue():
+            return "str:" + term.getStringValue()
+    except Exception:
+        pass
+    return None
+
+
+def _capture_name(term, captures: dict) -> str:
     """Positional capture name (``c0, c1, …`` by first-visit order) for a leaf
     symbol — one per distinct term.
 
@@ -87,13 +132,64 @@ def _capture_name(term, captures: dict[str, str]) -> str:
     the committer's duplicate-signature dedup collapse same-shape obligations to a
     single rule instead of one narrow rule per operand set. The same ``captures``
     dict is shared by the obligation-pattern and candidate-emit walks, so the
-    candidate's operands bind to the obligation pattern's captures by position."""
-    key = str(term)
+    candidate's operands bind to the obligation pattern's captures by position.
+
+    Keyed on ``(spelling, Kind)``, not the spelling alone: a QUANTIFIER bound
+    variable and a free symbol can share one spelling (``i``), and a bare
+    string key merged them into ONE capture — a false variable-sharing claim
+    (the pattern then demanded the free and the bound occurrence be the same
+    term). The Kind splits bound (VARIABLE) from free (CONSTANT) while still
+    letting the obligation and candidate walks bind the same SYMBOL by name
+    (they may come from separately deserialized terms). Positional
+    α-invariance is unaffected (keys are walk-local; emitted names stay
+    ``c<n>`` by first visit)."""
+    try:
+        key = (str(term), term.getKind().name)
+    except Exception:
+        key = (str(term), "")
     if key in captures:
         return captures[key]
     name = f"c{len(captures)}"
     captures[key] = name
     return name
+
+
+def _symbol_capture_pattern(term, captures: dict) -> dict[str, Any]:
+    """Canonical executable pattern for one non-literal symbolic leaf.
+
+    cvc5 represents free program symbols with ``Kind.CONSTANT``.  Preserve that
+    fact in the matcher AST with ``sort: var``.  Quantifier-bound symbols use
+    ``Kind.VARIABLE``; the current DSL has no bound-variable leaf class, so make
+    their historically open domain explicit as ``sort: subterm`` rather than
+    smuggling it through an omitted field.
+    """
+    try:
+        domain = "var" if term.getKind() == Kind.CONSTANT else "subterm"
+    except Exception:
+        domain = "subterm"
+    return {
+        "capture": _capture_name(term, captures),
+        "sort": domain,
+    }
+
+
+def exact_nullary_literal_pattern(term) -> dict[str, Any]:
+    """Lossless executable pattern for a non-symbolic nullary cvc5 term.
+
+    Floating-point special values, rounding modes, finite-field elements, and
+    future theory literals must not fall through to a capture (which would turn
+    one exact constant into a wildcard).  Kind + sort + cvc5's canonical text
+    distinguish the value; indexed parameters are retained defensively.
+    """
+    literal: dict[str, Any] = {
+        "kind": term.getKind().name,
+        "sort": str(term.getSort()),
+        "text": str(term),
+    }
+    indices = term_op_indices(term)
+    if indices:
+        literal["indices"] = list(indices)
+    return {"literal": literal}
 
 
 def term_to_pattern(term, captures: dict[str, str], *,
@@ -104,18 +200,246 @@ def term_to_pattern(term, captures: dict[str, str], *,
     accepts directly. ``max_depth`` elides deep subtrees for the bounded prompt
     view; pass a large value for the exact deterministic template.
     """
-    c = _const_value(term)
+    c = _const_literal(term)
     if c is not None:
         return {"const": c}
     if term.getNumChildren() == 0:
-        return {"capture": _capture_name(term, captures)}
+        if term.getKind() in (Kind.CONSTANT, Kind.VARIABLE):
+            return _symbol_capture_pattern(term, captures)
+        return exact_nullary_literal_pattern(term)
     if _depth >= max_depth:
         return {"elided": term.getKind().name,
                 "nchildren": term.getNumChildren()}
-    return {"kind": term.getKind().name,
-            "args": [term_to_pattern(term[i], captures,
-                                     max_depth=max_depth, _depth=_depth + 1)
-                     for i in range(term.getNumChildren())]}
+    pattern = {
+        "kind": term.getKind().name,
+        "args": [term_to_pattern(term[i], captures,
+                                 max_depth=max_depth, _depth=_depth + 1)
+                 for i in range(term.getNumChildren())],
+    }
+    indices = term_op_indices(term)
+    if indices:
+        pattern["indices"] = list(indices)
+    return pattern
+
+
+def _pattern_contains_elision(value: Any) -> bool:
+    """Whether a target pattern contains any non-executable placeholder."""
+    if isinstance(value, dict):
+        if "elided" in value or value.get("wildcard") is True:
+            return True
+        return any(_pattern_contains_elision(item) for item in value.values())
+    if isinstance(value, list):
+        return any(_pattern_contains_elision(item) for item in value)
+    return False
+
+
+def canonical_target_pattern(term) -> dict[str, Any]:
+    """Return the executable structural pattern for one native target.
+
+    This deliberately uses the same ``term_to_pattern`` vocabulary consumed by
+    the DSL matcher, but unlike :func:`_bounded_tree` it is NOT a prompt-budget
+    view.  The generous depth guard is only a fail-closed safety bound: an
+    ``elided`` node is rejected instead of being fingerprinted as if it were an
+    executable pattern.  Every proposer consumer must use this helper rather
+    than independently re-deriving a pattern from surface text.
+    """
+    pattern = term_to_pattern(term, {}, max_depth=64)
+    if _pattern_contains_elision(pattern):
+        raise UnsupportedShape("canonical_target_pattern_exceeds_depth_limit")
+    return pattern
+
+
+def target_pattern_fingerprint(pattern: dict[str, Any]) -> str:
+    """SHA-256 of canonical compact JSON for an executable target pattern."""
+    if not isinstance(pattern, dict) or not pattern:
+        raise ValueError("canonical target pattern must be a non-empty object")
+    if _pattern_contains_elision(pattern):
+        raise ValueError(
+            "canonical target pattern must not contain wildcard/elision")
+    encoded = json.dumps(
+        pattern, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _serialized_target_pattern(root: Any) -> dict[str, Any]:
+    """Derive the executable pattern directly from a serialized cvc5 term.
+
+    ``Predicate.__getstate__`` replaces its live ``Term`` with a
+    ``HollowCvc5Term``.  Walking that representation lets every publication and
+    intake boundary bind the advertised pattern fingerprint to the native bytes
+    without needing a program-specific solver/state cache.  Keep this traversal
+    deliberately isomorphic to :func:`term_to_pattern`.
+    """
+    from interpreter.utils.utils_cvc5 import HollowCvc5Term, NUM_TO_KIND
+
+    if not isinstance(root, HollowCvc5Term):
+        raise ValueError("native predicate pickle has no serialized cvc5 term")
+    captures: dict[tuple[Any, str], str] = {}
+
+    def capture_name(node: Any, kind_name: str) -> str:
+        symbol = str(getattr(node, "var_name", "") or "")
+        key: tuple[Any, str] = (
+            symbol if symbol else node,
+            kind_name,
+        )
+        if key not in captures:
+            captures[key] = f"c{len(captures)}"
+        return captures[key]
+
+    def walk(node: Any, depth: int) -> dict[str, Any]:
+        if not isinstance(node, HollowCvc5Term):
+            raise ValueError("native predicate pickle has a malformed cvc5 term")
+        try:
+            kind = NUM_TO_KIND[node.op]
+        except Exception as exc:
+            raise ValueError(
+                f"native predicate pickle has unsupported cvc5 op {node.op!r}"
+            ) from exc
+        if kind in (Kind.CONST_INTEGER, Kind.CONST_BITVECTOR):
+            return {"const": int(node.value)}
+        if kind == Kind.CONST_BOOLEAN:
+            return {"const": "bool:true" if node.value else "bool:false"}
+        if kind == Kind.CONST_RATIONAL:
+            return {"const": "real:" + str(node.value)}
+        if kind == Kind.CONST_STRING:
+            return {"const": "str:" + str(node.value)}
+        children = list(node.children or ())
+        if not children and kind in (Kind.CONSTANT, Kind.VARIABLE):
+            return {
+                "capture": capture_name(node, kind.name),
+                "sort": (
+                    "var" if kind == Kind.CONSTANT else "subterm"
+                ),
+            }
+        if not children:
+            if node.value is None:
+                raise ValueError(
+                    "serialized cvc5 term omitted an exact nullary literal")
+            literal = {
+                "kind": kind.name,
+                "sort": repr(node.node.sort.to_obj()),
+                "text": str(node.value),
+            }
+            indices = tuple(int(value) for value in node.node.op_indices)
+            if indices:
+                literal["indices"] = list(indices)
+            return {"literal": literal}
+        if depth >= 64:
+            raise ValueError(
+                "native predicate pattern exceeds canonical depth limit")
+        pattern = {
+            "kind": kind.name,
+            "args": [walk(child, depth + 1) for child in children],
+        }
+        indices = tuple(int(value) for value in node.node.op_indices)
+        if indices:
+            pattern["indices"] = list(indices)
+        return pattern
+
+    return walk(root, 0)
+
+
+def validate_proposer_native_target_b64(
+        value: Any, *, expected_pattern_sha256: str = "") -> str:
+    """Return a native payload whose bytes agree with its advertised pattern."""
+    serialized = str(value or "").strip()
+    if not serialized:
+        raise ValueError(
+            "proposer target frame needs serialized_transformed_b64")
+    try:
+        decoded = base64.b64decode(serialized, validate=True)
+    except Exception as exc:
+        raise ValueError(
+            "proposer target frame serialized_transformed_b64 is malformed") \
+            from exc
+    if not decoded:
+        raise ValueError(
+            "proposer target frame serialized_transformed_b64 is empty")
+    try:
+        predicate = pickle.loads(decoded)
+    except Exception as exc:
+        raise ValueError(
+            "proposer target frame serialized_transformed_b64 is not a "
+            "native predicate pickle") from exc
+    native_term = getattr(predicate, "predicate", None)
+    if native_term is None:
+        raise ValueError(
+            "proposer target frame serialized_transformed_b64 is not a "
+            "native predicate pickle")
+    try:
+        native_pattern = _serialized_target_pattern(native_term)
+        native_fingerprint = target_pattern_fingerprint(native_pattern)
+    except Exception as exc:
+        raise ValueError(
+            "proposer target frame serialized_transformed_b64 is not a "
+            "native predicate pickle") from exc
+    expected = str(expected_pattern_sha256 or "").strip().lower()
+    if expected and native_fingerprint != expected:
+        raise ValueError(
+            "proposer target frame native predicate pattern fingerprint "
+            f"mismatch ({native_fingerprint} != {expected})")
+    return serialized
+
+
+def build_proposer_target_frame_from_pattern(
+        pattern: dict[str, Any], *, proof_obligation_id: str, run_id: str,
+        pc: int | str, surface: str, serialized_transformed_b64: str,
+        source: str = "native") -> dict[str, Any]:
+    """Build a target frame from a pattern already derived at the native edge."""
+    poid = str(proof_obligation_id or "").strip()
+    rid = str(run_id or "").strip()
+    if not poid:
+        raise ValueError("proposer target frame needs proof_obligation_id")
+    if not rid:
+        raise ValueError("proposer target frame needs run_id")
+    surface_text = str(surface or "").strip()
+    if not surface_text:
+        raise ValueError("proposer target frame needs surface")
+    source_text = str(source or "native").strip()
+    if not source_text:
+        raise ValueError("proposer target frame needs source")
+    try:
+        pc_value = int(pc)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("proposer target frame needs an integer pc") from exc
+    fingerprint = target_pattern_fingerprint(pattern)
+    serialized = validate_proposer_native_target_b64(
+        serialized_transformed_b64,
+        expected_pattern_sha256=fingerprint,
+    )
+    return {
+        "schema": "anvil.proposer-target-frame/v1",
+        "proof_obligation_id": poid,
+        "run_id": rid,
+        "pc": pc_value,
+        "surface": surface_text,
+        "pattern": copy.deepcopy(pattern),
+        "pattern_sha256": fingerprint,
+        "serialized_transformed_b64": serialized,
+        "source": source_text,
+    }
+
+
+def build_proposer_target_frame(
+        term, *, proof_obligation_id: str, run_id: str, pc: int | str,
+        surface: str, serialized_transformed_b64: str,
+        source: str = "native") -> dict[str, Any]:
+    """Build the one proposer target contract from a live native term.
+
+    ``surface`` is display-only.  ``pattern`` and its fingerprint come from the
+    native cvc5 term, while ``serialized_transformed_b64`` lets downstream
+    verification rehydrate that exact target without parsing the display.
+    """
+    return build_proposer_target_frame_from_pattern(
+        canonical_target_pattern(term),
+        proof_obligation_id=proof_obligation_id,
+        run_id=run_id,
+        pc=pc,
+        surface=surface,
+        serialized_transformed_b64=serialized_transformed_b64,
+        source=source,
+    )
 
 
 def term_to_emit(term, captures: dict[str, str]) -> dict[str, Any]:
@@ -159,7 +483,7 @@ def _materialized_guard(term):
     return None
 
 
-def derive_structural_template(term, *, rule_id: str, scope: str = "root",
+def derive_structural_template(term, *, rule_id: str,
                                candidate_term=None) -> dict[str, Any]:
     """Build a ``structural_template`` rule dict — ``pattern`` from the obligation
     ``term`` (so it matches real obligations), ``emit`` the **proved candidate**
@@ -195,7 +519,6 @@ def derive_structural_template(term, *, rule_id: str, scope: str = "root",
         "id": rule_id,
         "kind": "structural_template",
         "source": "p_target_transformed",
-        "scope": scope,
         "pattern": pattern,
         "emit": [emit],
         "rationale": f"auto-derived from obligation AST ({note})",
@@ -211,7 +534,7 @@ def _bounded_tree(term, *, max_depth: int = 6,
 
     def walk(t, depth):
         count[0] += 1
-        c = _const_value(t)
+        c = _const_literal(t)
         if c is not None:
             return {"const": c}
         if t.getNumChildren() == 0:
@@ -236,6 +559,7 @@ def build_obligation_ast_view(term, *, surface: str | None = None,
     view: dict[str, Any] = {
         "surface": str(surface) if surface is not None else None,
         "sexpr": None, "ast_tree": None,
+        "canonical_pattern": None, "canonical_pattern_sha256": None,
         "materialized_guard": None, "structural_template": None,
     }
     try:
@@ -244,6 +568,15 @@ def build_obligation_ast_view(term, *, surface: str | None = None,
         pass
     try:
         view["ast_tree"] = _bounded_tree(term)
+    except Exception:
+        pass
+    try:
+        # Authoritative executable pattern.  ``ast_tree`` above remains the
+        # bounded diagnostic rendering; consumers must never mistake it for the
+        # pattern/fingerprint used by lookahead and verification.
+        pattern = canonical_target_pattern(term)
+        view["canonical_pattern"] = pattern
+        view["canonical_pattern_sha256"] = target_pattern_fingerprint(pattern)
     except Exception:
         pass
     try:

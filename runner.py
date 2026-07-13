@@ -197,6 +197,58 @@ def _build_trace_name_tables(program, entry):
     return var_names, block_names
 
 
+def _package_manifest_mode(test_path):
+    """Semantics mode recorded in the package build manifest, or None.
+
+    Reads ``<pkg_dir>/<name>.manifest.json`` written by ``tools/compile.py``.
+    Returns "int"/"bv" from the ``integer_encoding`` key, or None when the
+    manifest (or the key — legacy pre-mode packages) is absent.
+    """
+    import json
+
+    from interpreter.utils.integer_encoding import mode_from_integer_encoding
+
+    if test_path is None:
+        return None
+    manifest_path = Path(test_path).parent / f"{Path(test_path).stem}.manifest.json"
+    if not manifest_path.exists():
+        return None
+    try:
+        with open(manifest_path) as fp:
+            manifest = json.load(fp)
+    except (json.JSONDecodeError, OSError):
+        return None
+    flag = manifest.get("integer_encoding")
+    if flag is None:
+        return None
+    return mode_from_integer_encoding(flag)
+
+
+def _check_semantics_mode(ast_mode, manifest_mode, compiled_mode, *, context):
+    """FAIL LOUDLY if any two PRESENT semantics-mode tags disagree.
+
+    The three tags are: content-derived from the loaded AST
+    (``detect_integer_encoding``), the package manifest's
+    ``integer_encoding`` key, and the mode baked into an already-compiled
+    program (``swoosh_interp`` wrapper / ``.swcp``). Absent tags (legacy
+    packages / manifests) are skipped — absence cannot disagree.
+    """
+    tags = {
+        "ast": ast_mode,
+        "manifest": manifest_mode,
+        "compiled": compiled_mode,
+    }
+    present = {k: v for k, v in tags.items() if v is not None}
+    if len(set(present.values())) > 1:
+        raise RuntimeError(
+            f"semantics-mode mismatch for {context}: {present} — the package "
+            "on disk, the loaded AST and/or the pre-lowered bytecode were "
+            "produced under different integer encodings. Rebuild the package "
+            "('./swoosh build <name>') and any .swcp so all tags agree; "
+            "running would evaluate the program under the wrong arithmetic."
+        )
+
+
 class PreparedNativeProgram:
     """Static native-run state reused across many ProgramInputs.
 
@@ -262,17 +314,42 @@ class PreparedNativeProgram:
         self.ptr_aliases = gather_ptr_aliases(self.impl_decl)
         self.trace_var_names, self.trace_block_names = _build_trace_name_tables(
             program, self.entry)
+
+        # Semantics mode is content-derived from the loaded AST (never from
+        # flags), cross-checked against the package manifest and against any
+        # pre-lowered bytecode handed in (which carries the mode it was
+        # lowered/serialized with). Any disagreement is a hard error.
+        from interpreter.utils.integer_encoding import detect_semantics_mode
+        self.semantics_mode = detect_semantics_mode(self.program)
+        _check_semantics_mode(
+            self.semantics_mode,
+            _package_manifest_mode(self.test_path),
+            getattr(compiled, "mode", None) if compiled is not None else None,
+            context=(f"package {self.test_path}" if self.test_path is not None
+                     else f"program entry {self.impl_decl_name!r}"),
+        )
+
         self.compiled = compiled if compiled is not None else self._lower_program()
         self.native_meta = self._build_native_meta()
 
     def _lower_program(self):
         import swoosh_interp
 
-        if self.test_path is not None:
-            lh_live = _build_loop_header_live(self.test_path)
-            loop_meta = _build_loop_metadata(self.test_path)
-            return swoosh_interp.lower(self.program, lh_live, loop_meta)
-        return swoosh_interp.lower(self.program)
+        try:
+            if self.test_path is not None:
+                lh_live = _build_loop_header_live(self.test_path)
+                loop_meta = _build_loop_metadata(self.test_path)
+                return swoosh_interp.lower(self.program, lh_live, loop_meta,
+                                           mode=self.semantics_mode)
+            return swoosh_interp.lower(self.program, mode=self.semantics_mode)
+        except TypeError as exc:
+            if "mode" not in str(exc):
+                raise
+            raise RuntimeError(
+                "Installed Rust native module is too old: lower() has no "
+                "semantics-mode parameter. Rebuild with: "
+                "cd interpreter/native && maturin develop --release"
+            ) from exc
 
     def _build_native_meta(self):
         """Build static metadata for Rust-side per-input concretization."""
@@ -323,28 +400,82 @@ def prepare_native(program, *, test_path=None, compiled=None):
 # Injected asserts (falsification probes)
 # ---------------------------------------------------------------------------
 #
-# `--inject-assert PC:EXPR` inserts `assert EXPR;` immediately BEFORE the
-# statement currently at flat index PC, so the injected assert evaluates in
-# the state on entry to PC — the exact semantics of a verifier obligation
-# (pc, P) — and takes over that pc in the renumbered program. A concrete
-# input that fires it is a witness that the obligation is NOT an invariant;
-# a surviving run proves nothing (one input), it is only recorded evidence.
+# `--inject-assert PC:EXPR` inserts `assert EXPR;` at PC and evaluates it
+# in-state; `--inject-at {before,after}` (default `before`) picks WHICH state:
+#   before — insert immediately BEFORE stmt(PC): evaluates in the state on
+#            ENTRY to PC (pre-state). This is the CANDIDATE / precondition role:
+#            an abduced sufficient condition C must hold BEFORE stmt(PC) runs.
+#   after  — insert immediately AFTER stmt(PC), before the block terminator:
+#            evaluates in the state on EXIT from PC (post-state). This is the
+#            OBLIGATION / postcondition role: an obligation (pc, P) means P
+#            holds AFTER stmt(pc), so a value DEFINED at PC reads its freshly-
+#            assigned value, not a stale entry value. Refused when stmt(PC) is
+#            itself a goto/return (no reachable slot after a block terminator).
+# The predicate is injected RAW either way — placement is the only axis; there
+# is no weakest-precondition transform. A concrete input that fires the assert
+# is a witness the obligation/candidate is NOT invariant; a surviving run
+# proves nothing (one input), it is only recorded evidence.
 #
-# `--probe-block LABEL` injects `assert false;` as block LABEL's first
-# statement: the first concrete visit fires it, answering "does this input
-# reach the block?" with early-return semantics — for falsifying
-# reachability-flavored predicates, where the witness IS the visit.
+# `--probe-block LABEL` is observation-only. Labels are validated before
+# execution, then each successfully completed run reports whether LABEL is in
+# its explored-block set. A probe never mutates control flow or terminates the
+# run, and an early-terminated run emits no block-probe verdict.
 
-_INJECT_ASSERT_SPECS = []   # [(pc:int, expr_text:str)] set by main()
-_PROBE_BLOCK_SPECS = []     # [block_label:str] set by main()
-_INJECTED_ASSERTS = {}      # final_pc -> {kind, expr, block, requested_pc}
+_INJECT_ASSERT_SPECS = []     # [(pc:int, expr_text:str)] set by main()
+_INJECT_ASSERT_AST_SPECS = []  # [(pc, expr_ast, kind)] set by main() (no parse)
+_INJECT_WHERE = "before"      # "before" | "after"; injected asserts only
+_PROBE_BLOCK_SPECS = []       # [block_label:str] set by main()
+_INJECTED_ASSERTS = {}        # final_pc -> {kind, expr, block, requested_pc}
+_INJECT_ASSERT_KINDS = frozenset({"predicate", "carrier_guard"})
 
 
-def inject_asserts(program, assert_specs, block_probes):
-    """Mutate ``program`` in place, inserting probe asserts; return the
-    final-pc map (the program is renumbered by the insertions)."""
+def _normalize_inject_assert_ast_specs(rows):
+    """Normalize pickle rows to ``(pc, expr_ast, kind)`` triples.
+
+    Two-element rows are the legacy predicate form. Three-element rows may
+    explicitly identify a normal predicate or the reachability carrier guard.
+    """
+    normalized = []
+    for index, row in enumerate(rows or ()):
+        if not isinstance(row, (tuple, list)) or len(row) not in (2, 3):
+            raise ValueError(
+                "inject-assert-ast: row "
+                f"{index} must be (pc, expr_ast) or (pc, expr_ast, kind)")
+        pc, expr_ast = row[:2]
+        kind = "predicate" if len(row) == 2 else str(row[2]).strip()
+        if kind not in _INJECT_ASSERT_KINDS:
+            allowed = "|".join(sorted(_INJECT_ASSERT_KINDS))
+            raise ValueError(
+                f"inject-assert-ast: row {index} kind must be {allowed}, "
+                f"got {kind!r}")
+        normalized.append((int(pc), expr_ast, kind))
+    return normalized
+
+
+def inject_asserts(program, assert_specs, block_probes, ast_specs=(),
+                   where="before"):
+    """Mutate ``program`` in place, inserting requested asserts; return the
+    final-pc map (the program is renumbered by the insertions).
+
+    ``assert_specs`` are ``(pc, expr_text)`` pairs whose text is parsed.
+    ``ast_specs`` are ``(pc, expr_ast)`` legacy pairs or
+    ``(pc, expr_ast, kind)`` triples carrying a PRE-BUILT Boogie expression
+    AST (an ``interpreter.parser.expression`` node) — injected verbatim, with
+    NO text parse. ``kind`` is ``predicate`` or ``carrier_guard`` and is
+    retained in the result metadata and execution verdict. This is the
+    obligation-faithful path: the frozen obligation's live cvc5 term is
+    lowered to AST upstream (``cvc5_to_boogie_ast``) so the predicate never
+    round-trips through a lossy infix display string (``A => B /\\ C`` with
+    tabs, ambiguous grouping).
+
+    ``where`` (``"before"`` | ``"after"``) picks the state a PREDICATE assert
+    evaluates in — pre-state (entry to pc, candidate/precondition role) vs
+    post-state (exit from pc, obligation/postcondition role). Block probes are
+    observation-only and are never inserted. ``"after"`` is refused when
+    ``stmt(pc)`` is a block terminator (goto/return)."""
     from interpreter.parser.boogie_parser import parse_expr
-    from interpreter.parser.statement import AssertStatement
+    from interpreter.parser.statement import (
+        AssertStatement, GotoStatement, ReturnStatement)
     from interpreter.parser.declaration import ImplementationDeclaration
     from interpreter.parser.desugar import desugar_while_statements
     from interpreter.utils.program import initialize_code_metadata
@@ -353,33 +484,56 @@ def inject_asserts(program, assert_specs, block_probes):
     desugar_while_statements(program)
     impl = next(d for d in program.declarations
                 if isinstance(d, ImplementationDeclaration) and d.body)
-    pc_to_stmt, label_to_pc, pc_to_block, _ = initialize_code_metadata(impl)
+    pc_to_stmt, _, pc_to_block, _ = initialize_code_metadata(impl)
     blocks_by_name = {b.name: b for b in impl.body.blocks}
 
-    work = []  # (pc_for_ordering, expr_text, kind, block_label)
+    # Validate every requested label before mutating the program. The actual
+    # verdict is read from run_native's explored-block set after successful
+    # execution, so probes never inject statements.
+    for label in block_probes:
+        if label not in blocks_by_name:
+            raise ValueError(f"probe-block: no block labeled {label!r}")
+
+    # Each work item carries an expression payload tagged ("text", str) for the
+    # parse path or ("ast", node) for the pre-built-AST path.
+    work = []  # (pc_for_ordering, ("text"|"ast", payload), kind, block_label)
     for pc, text in assert_specs:
         pc = int(pc)
         if pc not in pc_to_stmt:
             raise ValueError(f"inject-assert: pc {pc} is not a statement pc")
-        work.append((pc, str(text), "predicate", pc_to_block[pc]))
-    for label in block_probes:
-        if label not in blocks_by_name:
-            raise ValueError(f"probe-block: no block labeled {label!r}")
-        work.append((label_to_pc.get(label, 0), "false",
-                     "block_probe", label))
+        work.append((pc, ("text", str(text)), "predicate", pc_to_block[pc]))
+    for pc, expr_ast, kind in _normalize_inject_assert_ast_specs(ast_specs):
+        if pc not in pc_to_stmt:
+            raise ValueError(
+                f"inject-assert-ast: pc {pc} is not a statement pc")
+        work.append((pc, ("ast", expr_ast), kind, pc_to_block[pc]))
+
+    # `after` (post-state) has no reachable slot when stmt(pc) is the block
+    # terminator — reject loudly rather than silently landing pre-terminator
+    # in a way that misreads the obligation.
+    if where == "after":
+        for pc, _payload, _kind, _label in work:
+            if isinstance(pc_to_stmt[int(pc)],
+                          (GotoStatement, ReturnStatement)):
+                raise ValueError(
+                    f"inject-assert: cannot insert 'after' pc {pc}: it is a "
+                    f"{type(pc_to_stmt[int(pc)]).__name__} (block terminator); "
+                    f"no reachable slot exists after it")
 
     inserted = []  # (stmt_obj, kind, expr_text, block_label, requested_pc)
     # Insert bottom-up so earlier insertions don't shift later targets.
-    for pc, text, kind, label in sorted(work, key=lambda w: -int(w[0])):
+    for pc, (ptype, payload), kind, label in sorted(
+            work, key=lambda w: -int(w[0])):
         stmt = AssertStatement()
-        stmt.expression = parse_expr(text)
+        stmt.expression = payload if ptype == "ast" else parse_expr(payload)
+        # `expr` is for the [INJECTED_ASSERT] log line only; render the AST.
+        expr_text = repr(payload) if ptype == "ast" else payload
         blk = blocks_by_name[label]
-        if kind == "block_probe":
-            blk.statements.insert(0, stmt)
-        else:
-            blk.statements.insert(
-                blk.statements.index(pc_to_stmt[int(pc)]), stmt)
-        inserted.append((stmt, kind, text, label, int(pc)))
+        # before → at stmt(pc) (pre-state); after → one past it (post-state,
+        # before the terminator, guaranteed a valid slot by the guard above).
+        idx = blk.statements.index(pc_to_stmt[int(pc)])
+        blk.statements.insert(idx + (1 if where == "after" else 0), stmt)
+        inserted.append((stmt, kind, expr_text, label, int(pc)))
 
     new_pc_to_stmt, _, _, _ = initialize_code_metadata(impl)
     by_id = {id(s): (k, t, l, rp) for s, k, t, l, rp in inserted}
@@ -392,6 +546,14 @@ def inject_asserts(program, assert_specs, block_probes):
     return final
 
 
+def _emit_block_probe_statuses(input_name, explored):
+    """Report passive block observations for one successfully completed run."""
+    explored = set(explored or ())
+    for label in _PROBE_BLOCK_SPECS:
+        status = "BLOCK_REACHED" if label in explored else "BLOCK_NOT_REACHED"
+        print(f"[{status}] input={input_name} block={label!r}")
+
+
 def _load_shared(test_path, engine):
     """Load program + compile bytecode once in the parent process."""
     global _SHARED_PROGRAM, _SHARED_COMPILED, _SHARED_PREPARED, _SHARED_FIELD_SIZES
@@ -401,11 +563,12 @@ def _load_shared(test_path, engine):
     with open(test_path, 'rb') as f:
         _SHARED_PROGRAM = pickle.load(f)
 
-    if _INJECT_ASSERT_SPECS or _PROBE_BLOCK_SPECS:
+    if _INJECT_ASSERT_SPECS or _INJECT_ASSERT_AST_SPECS or _PROBE_BLOCK_SPECS:
         import json as _json
         try:
             _INJECTED_ASSERTS = inject_asserts(
-                _SHARED_PROGRAM, _INJECT_ASSERT_SPECS, _PROBE_BLOCK_SPECS)
+                _SHARED_PROGRAM, _INJECT_ASSERT_SPECS, _PROBE_BLOCK_SPECS,
+                ast_specs=_INJECT_ASSERT_AST_SPECS, where=_INJECT_WHERE)
         except Exception as ex:
             print(f"[INJECT_ASSERT_ERROR] error={_json.dumps(str(ex))}")
             raise
@@ -414,6 +577,28 @@ def _load_shared(test_path, engine):
                   f"requested_pc={meta['requested_pc']} "
                   f"kind={meta['kind']} block={meta['block']!r} "
                   f"expr={_json.dumps(meta['expr'])}")
+        # Nondet-site visibility for falsification callers: which pc assigns
+        # which $-variable from a nondet call, so an attack input authored with
+        # an inverted `@params` mapping (e.g. n/k swapped) is visible in the
+        # tool result instead of silently running a vacuous attack.
+        try:
+            from interpreter.parser.declaration import ImplementationDeclaration
+            from interpreter.parser.statement import CallStatement
+            from interpreter.utils.program import initialize_code_metadata
+            _impl = next(d for d in _SHARED_PROGRAM.declarations
+                         if isinstance(d, ImplementationDeclaration) and d.body)
+            _pc_to_stmt, _, _, _ = initialize_code_metadata(_impl)
+            _sites = [
+                {"pc": int(fpc),
+                 "var": ", ".join(str(a) for a in (stmt.assignments or [])),
+                 "stmt": repr(stmt).strip()[:80]}
+                for fpc, stmt in sorted(_pc_to_stmt.items())
+                if isinstance(stmt, CallStatement)
+                and "nondet" in str(stmt.procedure).lower()]
+            if _sites:
+                print(f"[NONDET_SITES] {_json.dumps(_sites)}")
+        except Exception:
+            pass
 
     from interpreter.utils.input_parser import get_bpl_field_sizes
     _SHARED_FIELD_SIZES = get_bpl_field_sizes(test_path.parent, program=_SHARED_PROGRAM)
@@ -426,14 +611,12 @@ def _load_shared(test_path, engine):
             "cd interpreter/native && maturin develop --release"
         ) from exc
 
-    lh_live = _build_loop_header_live(test_path)
-    loop_meta = _build_loop_metadata(test_path)
-    _SHARED_COMPILED = swoosh_interp.lower(_SHARED_PROGRAM, lh_live, loop_meta)
-    _SHARED_PREPARED = prepare_native(
-        _SHARED_PROGRAM,
-        test_path=test_path,
-        compiled=_SHARED_COMPILED,
-    )
+    # Lower inside PreparedNativeProgram so the content-derived semantics
+    # mode is threaded to swoosh_interp.lower and cross-checked against the
+    # package manifest in ONE place (loop-header/loop-metadata loading is
+    # identical — see PreparedNativeProgram._lower_program).
+    _SHARED_PREPARED = prepare_native(_SHARED_PROGRAM, test_path=test_path)
+    _SHARED_COMPILED = _SHARED_PREPARED.compiled
 
 
 # ---------------------------------------------------------------------------
@@ -664,7 +847,9 @@ def run_native(program, program_inputs, test_name, input_name, raw_log_path,
             compiled = prepared.compiled
 
     if compiled is None:
-        compiled = swoosh_interp.lower(program)
+        from interpreter.utils.integer_encoding import detect_semantics_mode
+        compiled = swoosh_interp.lower(program,
+                                       mode=detect_semantics_mode(program))
 
     ext_data = extra_data
     if ext_data is None and hasattr(program_inputs, "extra_data"):
@@ -821,25 +1006,22 @@ def process_single_input(input_file, test_name, test_path, engine='native',
             # parent process reads child stdout to collect per-input
             # violations; expression is JSON-quoted so embedded quotes
             # / newlines in the Boogie expr don't break the line.
-            # Injected probes own their pc (the insertion renumbered the
-            # program), so a violation there is the probe's answer, not a
-            # program-assert failure.
+            # Injected predicates own their pc (the insertion renumbered the
+            # program), so a violation there is the injected assertion's
+            # answer, not a program-assert failure. Passive block probes emit
+            # nothing on this early-termination path.
             import json as _json
             inj = _INJECTED_ASSERTS.get(int(v.pc)) if _INJECTED_ASSERTS \
                 else None
-            if inj is not None and inj["kind"] == "block_probe":
-                print(f"[BLOCK_REACHED] input={input_name} "
-                      f"block={inj['block']!r} pc={v.pc}")
-                debug.event("exec", "input_block_probe_reached",
-                            pc=v.pc, block=inj["block"])
-                return (input_name, None, set())
             if inj is not None:
                 print(f"[INJECTED_ASSERT_VIOLATION] "
                       f"input={input_name} pc={inj['requested_pc']} "
-                      f"block={v.block!r} expr={_json.dumps(inj['expr'])}")
+                      f"kind={inj['kind']} block={v.block!r} "
+                      f"expr={_json.dumps(inj['expr'])}")
                 debug.event("exec", "input_injected_assert_violation",
                             pc=v.pc, requested_pc=inj["requested_pc"],
-                            block=v.block, expression=v.expr_str)
+                            kind=inj["kind"], block=v.block,
+                            expression=v.expr_str)
                 return (input_name, None, set())
             print(f"[ASSERT_VIOLATION] "
                   f"input={input_name} pc={v.pc} block={v.block!r} "
@@ -848,20 +1030,21 @@ def process_single_input(input_file, test_name, test_path, engine='native',
                         pc=v.pc, block=v.block, expression=v.expr_str)
             return (input_name, None, set())
 
+        # Observation-only probes are reported only after run_native returned
+        # normally. Assert/assume/error early exits above therefore emit no
+        # potentially partial BLOCK_* verdicts.
+        _emit_block_probe_statuses(input_name, explored)
+
         if _INJECTED_ASSERTS:
             # Run completed: every injected assert that executed HELD.
             # Block-visitation from the explored set tells executed-and-held
             # apart from never-reached.
             for fpc, meta in sorted(_INJECTED_ASSERTS.items()):
-                if meta["kind"] == "block_probe":
-                    print(f"[BLOCK_NOT_REACHED] input={input_name} "
-                          f"block={meta['block']!r}")
-                else:
-                    visited = meta["block"] in explored
-                    print(f"[INJECTED_ASSERT_SURVIVED] input={input_name} "
-                          f"pc={meta['requested_pc']} "
-                          f"block={meta['block']!r} "
-                          f"block_visited={'true' if visited else 'false'}")
+                visited = meta["block"] in explored
+                print(f"[INJECTED_ASSERT_SURVIVED] input={input_name} "
+                      f"pc={meta['requested_pc']} kind={meta['kind']} "
+                      f"block={meta['block']!r} "
+                      f"block_visited={'true' if visited else 'false'}")
 
         with open(explored_path, "w") as f:
             for block in explored:
@@ -972,31 +1155,64 @@ def main():
                              '(default: all; e.g. exec,branch,solver)')
     parser.add_argument('--inject-assert', action='append', default=[],
                         metavar='PC:EXPR',
-                        help='Inject `assert EXPR;` evaluating on entry to '
-                             'flat pc PC (obligation falsification probe; '
-                             'repeatable)')
+                        help='Inject `assert EXPR;` at flat pc PC, evaluating '
+                             'in the state chosen by --inject-at (falsification '
+                             'probe; repeatable)')
+    parser.add_argument('--inject-at', choices=['before', 'after'],
+                        default='before',
+                        help='State for injected predicate/carrier asserts '
+                             '(--inject-assert/--inject-assert-ast): before '
+                             '(default) = pre-state on entry to pc '
+                             '(candidate/precondition role); after = post-state '
+                             'on exit from pc, before the block terminator '
+                             '(obligation/postcondition role). Refused when pc '
+                             'is itself a goto/return. Does NOT affect '
+                             '--probe-block (observation-only).')
+    parser.add_argument('--inject-assert-ast', default=None,
+                        metavar='PICKLE_PATH',
+                        help='Path to a pickle of [(pc:int, expr_ast)] or '
+                             '[(pc:int, expr_ast, kind)] Boogie expression '
+                             'ASTs to inject verbatim; kind is predicate or '
+                             'carrier_guard — '
+                             'the obligation-faithful path that lowers the '
+                             'live cvc5 term to AST upstream instead of '
+                             'parsing a lossy display string')
     parser.add_argument('--probe-block', action='append', default=[],
                         metavar='LABEL',
-                        help='Inject `assert false;` at block LABEL entry — '
-                             'reports BLOCK_REACHED on first concrete visit '
-                             '(reachability probe; repeatable)')
+                        help='Observe block LABEL without changing execution; '
+                             'after a successful run reports BLOCK_REACHED or '
+                             'BLOCK_NOT_REACHED from the explored-block set '
+                             '(repeatable)')
     args = parser.parse_args()
     try:
         _reject_legacy_engine(args.engine)
     except RuntimeError as exc:
         parser.error(str(exc))
 
-    global _INJECT_ASSERT_SPECS, _PROBE_BLOCK_SPECS
+    global _INJECT_ASSERT_SPECS, _INJECT_ASSERT_AST_SPECS, _PROBE_BLOCK_SPECS
+    global _INJECT_WHERE
+    _INJECT_WHERE = args.inject_at
     for spec in args.inject_assert:
         pc_s, sep, expr = str(spec).partition(':')
         if not sep or not pc_s.strip().isdigit() or not expr.strip():
             parser.error(f"--inject-assert expects PC:EXPR, got {spec!r}")
         _INJECT_ASSERT_SPECS.append((int(pc_s), expr.strip()))
+    if args.inject_assert_ast:
+        try:
+            with open(args.inject_assert_ast, 'rb') as _f:
+                loaded = pickle.load(_f)
+            _INJECT_ASSERT_AST_SPECS.extend(
+                _normalize_inject_assert_ast_specs(loaded))
+        except Exception as ex:
+            parser.error(
+                f"--inject-assert-ast could not load {args.inject_assert_ast!r}: "
+                f"{type(ex).__name__}: {ex}")
     _PROBE_BLOCK_SPECS.extend(str(b).strip() for b in args.probe_block
                               if str(b).strip())
-    if _INJECT_ASSERT_SPECS or _PROBE_BLOCK_SPECS:
-        # Probe runs must actually execute (and never reuse stale results):
-        # the program text is mutated, so skip-if-unchanged is meaningless.
+    if _INJECT_ASSERT_SPECS or _INJECT_ASSERT_AST_SPECS or _PROBE_BLOCK_SPECS:
+        # Injection/probe runs must actually execute and never reuse stale
+        # results. Assertions mutate the program; passive block probes need
+        # one complete execution for an input-scoped observation.
         args.force = True
 
     test_pkg_dir = Path(args.test_pkg_path)

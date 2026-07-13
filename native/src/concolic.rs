@@ -290,6 +290,13 @@ pub fn suggest(
 ) -> PyResult<PyObject> {
     let wrapper: PyRef<'_, CompiledProgramWrapper> = compiled.extract()?;
     let program = &wrapper.inner;
+    if program.mode == crate::opcodes::SemanticsMode::Int {
+        // Concolic path reasoning is a BV-mode (wrapping i64) mirror of the
+        // interpreter; under exact-ℤ semantics its algebra is wrong. It only
+        // affects INPUT FINDING (never verdicts), so Int mode returns no
+        // candidates instead of unsound ones. See interpreter/README.md.
+        return int_mode_disabled_result(py);
+    }
 
     let symbols = parse_symbols(symbols_py, program)?;
     let covered = parse_covered(covered_blocks)?;
@@ -423,6 +430,10 @@ pub fn explore(
 ) -> PyResult<PyObject> {
     let wrapper: PyRef<'_, CompiledProgramWrapper> = compiled.extract()?;
     let program = &wrapper.inner;
+    if program.mode == crate::opcodes::SemanticsMode::Int {
+        // See the identical gate in `suggest` — BV-only engine.
+        return int_mode_disabled_result(py);
+    }
 
     let symbols = parse_symbols(symbols_py, program)?;
     let covered = parse_covered(covered_blocks)?;
@@ -1937,6 +1948,10 @@ impl<'a> Engine<'a> {
     fn set_eval_result(&mut self, var_id: VarId, ev: CEval) {
         match ev.value {
             EvalResult::Scalar(v) => self.vm.set_scalar(var_id, v, false),
+            EvalResult::Big(b) => unreachable!(
+                "concolic is BV-gated; Big value {} cannot occur",
+                b
+            ),
             EvalResult::Bool(b) => self.vm.set_scalar(var_id, b as i64, false),
             EvalResult::MapRef(map_idx) => {
                 let vid = var_id as usize;
@@ -1965,6 +1980,7 @@ impl<'a> Engine<'a> {
         let ev = self.eval(expr);
         let concrete = match ev.value {
             EvalResult::Scalar(v) => v != 0,
+            EvalResult::Big(_) => unreachable!("concolic is BV-gated; Big cannot occur"),
             EvalResult::Bool(b) => b,
             EvalResult::MapRef(_) => false,
         };
@@ -1978,6 +1994,7 @@ impl<'a> Engine<'a> {
         let ev = self.eval(expr);
         match ev.value {
             EvalResult::Scalar(_) | EvalResult::Bool(_) => ev,
+            EvalResult::Big(_) => unreachable!("concolic is BV-gated; Big cannot occur"),
             EvalResult::MapRef(_) => CEval {
                 value: EvalResult::Scalar(0),
                 sym: None,
@@ -1993,6 +2010,10 @@ impl<'a> Engine<'a> {
                 CEval {
                     value: match value {
                         Value::Scalar(v) => EvalResult::Scalar(v),
+                        Value::Big(b) => unreachable!(
+                            "concolic is BV-gated; Big value {} cannot occur",
+                            b
+                        ),
                         Value::Map(idx) => EvalResult::MapRef(idx),
                     },
                     sym: self.sym_vars[vid].clone(),
@@ -2002,6 +2023,10 @@ impl<'a> Engine<'a> {
                 value: EvalResult::Scalar(*v),
                 sym: None,
             },
+            Expr::ConstBig(b) => unreachable!(
+                "concolic is BV-gated; ConstBig literal {} cannot occur",
+                b
+            ),
             Expr::Bool(b) => CEval {
                 value: EvalResult::Bool(*b),
                 sym: None,
@@ -3198,6 +3223,10 @@ fn eval_to_i64(value: &EvalResult) -> i64 {
     match value {
         EvalResult::Scalar(v) => *v,
         EvalResult::Bool(b) => *b as i64,
+        EvalResult::Big(b) => unreachable!(
+            "concolic is BV-gated; Big value {} cannot occur",
+            b
+        ),
         EvalResult::MapRef(_) => 0,
     }
 }
@@ -3206,6 +3235,29 @@ fn scalar_value(value: &EvalResult) -> Option<i64> {
     match value {
         EvalResult::Scalar(v) => Some(*v),
         EvalResult::Bool(b) => Some(*b as i64),
+        EvalResult::Big(_) => None,
         EvalResult::MapRef(_) => None,
     }
+}
+
+/// Result returned when concolic/symbolic exploration is invoked on an
+/// Int-mode (exact-ℤ) program: no candidates, and a stats record that
+/// carries the reason. Shape-compatible with the real result dicts.
+fn int_mode_disabled_result(py: Python<'_>) -> PyResult<PyObject> {
+    let out = PyDict::new_bound(py);
+    out.set_item("candidates", PyList::empty_bound(py))?;
+    let stats = PyDict::new_bound(py);
+    stats.set_item("branches_seen", 0)?;
+    stats.set_item("objectives", 0)?;
+    stats.set_item("solver_queries", 0)?;
+    stats.set_item("unsupported", 0)?;
+    stats.set_item("elapsed_ms", 0.0)?;
+    stats.set_item("candidates_per_sec", 0.0)?;
+    stats.set_item("complete_within_bounds", false)?;
+    stats.set_item(
+        "disabled_reason",
+        "int-mode program: concolic engine is BV-only (input finding only,          never verdicts)",
+    )?;
+    out.set_item("stats", stats)?;
+    Ok(out.into())
 }

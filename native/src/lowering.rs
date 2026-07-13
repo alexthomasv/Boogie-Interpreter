@@ -15,20 +15,30 @@ pub struct Frame {
     pub locals: rustc_hash::FxHashSet<String>,
 }
 
-/// Intern table: variable name → VarId
+/// Intern table: variable name → VarId. Also carries the lowering context's
+/// `SemanticsMode` — it is threaded through every `lower_expr`/`lower_stmt`
+/// call, so mode-sensitive lowering (big literals, `$idiv`/`$smod`
+/// resolution, const-fold semantics) reads it from here.
 pub struct InternTable {
     pub map: FxHashMap<String, VarId>,
     names: Vec<String>,
     /// Active inlining frame (None at top level / the non-inlining lowering path).
     frame: Option<Frame>,
+    /// Semantics mode the program is being lowered under.
+    pub mode: SemanticsMode,
 }
 
 impl InternTable {
     pub fn new() -> Self {
+        Self::new_with_mode(SemanticsMode::default())
+    }
+
+    pub fn new_with_mode(mode: SemanticsMode) -> Self {
         Self {
             map: FxHashMap::default(),
             names: Vec::new(),
             frame: None,
+            mode,
         }
     }
 
@@ -106,18 +116,21 @@ pub fn lower_program(
     program: &Bound<'_, PyAny>,
     loop_header_live: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<CompiledProgram> {
-    lower_program_full(py, program, loop_header_live, None)
+    lower_program_full(py, program, loop_header_live, None, SemanticsMode::default())
 }
 
-/// Extended form that also carries loop metadata. `lower_program` is a
-/// back-compat wrapper that passes `None` for the metadata.
+/// Extended form that also carries loop metadata and the semantics mode.
+/// `lower_program` is a back-compat wrapper (None metadata, Bv mode).
+/// The mode must be known DURING lowering (not stamped after): big-literal
+/// handling, `$idiv`/`$smod` resolution and const-folding are mode-sensitive.
 pub fn lower_program_full(
     py: Python<'_>,
     program: &Bound<'_, PyAny>,
     loop_header_live: Option<&Bound<'_, PyDict>>,
     loop_metadata: Option<&Bound<'_, PyDict>>,
+    mode: SemanticsMode,
 ) -> PyResult<CompiledProgram> {
-    let mut intern = InternTable::new();
+    let mut intern = InternTable::new_with_mode(mode);
     let mut blocks = Vec::new();
     let mut label_to_block: FxHashMap<String, BlockId> = FxHashMap::default();
     let mut mem_maps = Vec::new();
@@ -514,13 +527,13 @@ pub fn lower_program_full(
 
     // Post-inline ConstantFoldPass equivalent for the direct lowering path
     // (the inline path folds interleaved in flush_block). Fold semantics
-    // match vm::eval exactly, so results and traces are unchanged.
+    // match vm::eval exactly PER MODE, so results and traces are unchanged.
     for block in blocks.iter_mut() {
         for stmt in block.body.iter_mut() {
-            fold::fold_stmt(stmt);
+            fold::fold_stmt(stmt, mode);
         }
         if let Some(cond) = block.assume_cond.as_mut() {
-            fold::fold_in_place(cond);
+            fold::fold_in_place(cond, mode);
         }
     }
     normalize_is_external_assumes(&mut blocks);
@@ -543,6 +556,7 @@ pub fn lower_program_full(
         block_innermost_header,
         loop_parent_header,
         static_scalars: Vec::new(),
+        mode,
     })
 }
 
@@ -550,7 +564,7 @@ pub fn lower_program_full(
 pub(crate) fn expr_contains_is_external(expr: &Expr) -> bool {
     match expr {
         Expr::IsExternal => true,
-        Expr::Var(_) | Expr::Const(_) | Expr::Bool(_) => false,
+        Expr::Var(_) | Expr::Const(_) | Expr::ConstBig(_) | Expr::Bool(_) => false,
         Expr::BinOp { lhs, rhs, .. } => {
             expr_contains_is_external(lhs) || expr_contains_is_external(rhs)
         }
@@ -1347,23 +1361,32 @@ fn lower_expr_impl(
             Ok(Expr::Var(var_id))
         }
         "IntegerLiteral" => {
-            // Boogie integers can be arbitrarily large; truncate to i64
+            // Boogie integers can be arbitrarily large.
+            //   Int mode  — keep the exact mathematical value: i64 fast path,
+            //               else ConstBig (exact-ℤ core evaluates it exactly).
+            //   BV mode   — a literal is a 64-bit pattern: i64 or the u64
+            //               two's-complement fold (e.g. SMACK's
+            //               18446744073709551615 mask constants). Beyond u64
+            //               there is NO faithful pattern: loud error (the old
+            //               silent 64-bit masking hid real data loss).
             let value_obj = expr.getattr("value")?;
-            let value: i64 = match value_obj.extract::<i64>() {
-                Ok(v) => v,
-                Err(_) => {
-                    // Large integer — extract as u64 or truncate
-                    match value_obj.extract::<u64>() {
-                        Ok(v) => v as i64,
-                        Err(_) => {
-                            // Very large — mask to 64 bits
-                            let py_int = value_obj.call_method1("__and__", (u64::MAX,))?;
-                            py_int.extract::<u64>()? as i64
-                        }
+            match value_obj.extract::<i64>() {
+                Ok(v) => Ok(Expr::Const(v)),
+                Err(_) => match intern.mode {
+                    SemanticsMode::Int => {
+                        let big: num_bigint::BigInt = value_obj.extract()?;
+                        Ok(Expr::ConstBig(Box::new(big)))
                     }
-                }
-            };
-            Ok(Expr::Const(value))
+                    SemanticsMode::Bv => match value_obj.extract::<u64>() {
+                        Ok(v) => Ok(Expr::Const(v as i64)),
+                        Err(_) => panic!(
+                            "BV-mode literal beyond u64 has no 64-bit \
+                             representation: {}",
+                            value_obj
+                        ),
+                    },
+                },
+            }
         }
         "BooleanLiteral" => {
             let value: bool = expr.getattr("value")?.extract()?;
@@ -1419,7 +1442,7 @@ fn lower_expr_impl(
             }
 
             // Resolve builtin function
-            if let Some(fn_id) = resolve_builtin(&f_name) {
+            if let Some(fn_id) = resolve_builtin(&f_name, intern.mode) {
                 let lowered_args: Vec<Expr> = args_list
                     .iter()
                     .map(|a| lower_expr_impl(py, &a, intern).unwrap())
@@ -1465,6 +1488,20 @@ fn lower_expr_impl(
             let lowered = lower_expr_impl(py, &inner, intern)?;
             Ok(Expr::Not(Box::new(lowered)))
         }
+        "ArithmeticNegation" => {
+            // Unary minus `-x` lowers to `0 - x` (Boogie integer negation).
+            // Dispatch is by EXACT class name, so without this arm an
+            // ArithmeticNegation node (a UnaryExpression subclass) falls
+            // through to the panic default — which crashed try-violate on
+            // every negated-arithmetic predicate (e.g. `-$i0 + 2*$i1`).
+            let inner = expr.getattr("expression")?;
+            let lowered = lower_expr_impl(py, &inner, intern)?;
+            Ok(Expr::BinOp {
+                op: BinOp::Sub,
+                lhs: Box::new(Expr::Const(0)),
+                rhs: Box::new(lowered),
+            })
+        }
         "IfExpression" => {
             let cond = expr.getattr("condition")?;
             let then = expr.getattr("then")?;
@@ -1501,7 +1538,22 @@ fn store_load_bitwidth(name: &str) -> u8 {
 }
 
 /// Resolve a function name to a BuiltinFn.
-fn resolve_builtin(name: &str) -> Option<BuiltinFn> {
+///
+/// Mode-sensitivity: `$idiv.iN` / `$smod.iN` are the SMACK integer-encoding
+/// prelude's residual division intrinsics ({:builtin "div"/"mod"}) and only
+/// resolve under `SemanticsMode::Int`. Every other name resolves in both
+/// modes; `vm::eval` dispatches the SEMANTICS per mode (`builtins::bv` vs
+/// `builtins::int`), so a pre-function-inline int package still evaluates
+/// its `$add.i32`-style intrinsics with exact-ℤ semantics.
+fn resolve_builtin(name: &str, mode: SemanticsMode) -> Option<BuiltinFn> {
+    if mode == SemanticsMode::Int {
+        if let Some(bits) = parse_intrinsic_width(name, "$idiv.") {
+            return Some(BuiltinFn::Idiv { bits });
+        }
+        if let Some(bits) = parse_intrinsic_width(name, "$smod.") {
+            return Some(BuiltinFn::Smod { bits });
+        }
+    }
     if let Some((src, dst)) = parse_bitwidth_cast(name, "$sext.") {
         return Some(BuiltinFn::Sext { src, dst });
     }
@@ -1686,6 +1738,15 @@ fn parse_bitwidth_cast(name: &str, prefix: &str) -> Option<(u8, u8)> {
     let rest = name.strip_prefix(prefix)?;
     let (src, dst) = rest.split_once('.')?;
     Some((parse_int_bitwidth(src)?, parse_int_bitwidth(dst)?))
+}
+
+/// Parse `$idiv.i32`-style residual intrinsic widths (`ref` counts as 64).
+fn parse_intrinsic_width(name: &str, prefix: &str) -> Option<u8> {
+    let rest = name.strip_prefix(prefix)?;
+    if rest == "ref" {
+        return Some(64);
+    }
+    parse_int_bitwidth(rest)
 }
 
 fn parse_int_bitwidth(token: &str) -> Option<u8> {

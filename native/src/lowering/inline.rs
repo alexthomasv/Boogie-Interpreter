@@ -68,6 +68,7 @@ pub fn inline_lower_program<'py>(
     py: Python<'py>,
     program: &Bound<'py, PyAny>,
     static_scalars: Option<&Bound<'py, PyDict>>,
+    mode: crate::opcodes::SemanticsMode,
 ) -> PyResult<CompiledProgram> {
     let declarations = program.getattr("declarations")?;
     let decls: &Bound<'_, PyList> = declarations.downcast()?;
@@ -139,7 +140,7 @@ pub fn inline_lower_program<'py>(
 
     let mut inl = Inliner {
         py,
-        intern: InternTable::new(),
+        intern: InternTable::new_with_mode(mode),
         mem_maps: Vec::new(),
         proto: Vec::new(),
         cur: None,
@@ -306,6 +307,7 @@ pub fn inline_lower_program<'py>(
         block_innermost_header: vec![None; n_blocks],
         loop_parent_header: vec![None; n_blocks],
         static_scalars: baked_scalars,
+        mode: inl.intern.mode,
     })
 }
 
@@ -429,7 +431,7 @@ impl<'py> Inliner<'py> {
             // is the post-inline ConstantFoldPass, run interleaved during inline.
             for ps in pb.stmts.iter_mut() {
                 if let ProtoStmt::Lowered(s) = ps {
-                    fold_stmt(s);
+                    fold_stmt(s, self.intern.mode);
                 }
             }
             self.proto.push(pb);
@@ -444,7 +446,7 @@ impl<'py> Inliner<'py> {
     fn cur_block_went_dead(&mut self) -> bool {
         match self.cur.as_mut().and_then(|b| b.stmts.last_mut()) {
             Some(ProtoStmt::Lowered(Stmt::Assume { expr })) => {
-                fold_in_place(expr);
+                fold_in_place(expr, self.intern.mode);
                 matches!(expr, Expr::Bool(false))
             }
             _ => false,
@@ -765,7 +767,7 @@ fn resolve_alloc_in_stmts(stmts: &mut Vec<Stmt>, var_names: &[String]) {
 fn expr_refs_var(expr: &Expr, target: VarId) -> bool {
     match expr {
         Expr::Var(v) => *v == target,
-        Expr::Const(_) | Expr::Bool(_) | Expr::IsExternal => false,
+        Expr::Const(_) | Expr::ConstBig(_) | Expr::Bool(_) | Expr::IsExternal => false,
         Expr::Not(e) => expr_refs_var(e, target),
         Expr::BinOp { lhs, rhs, .. } => expr_refs_var(lhs, target) || expr_refs_var(rhs, target),
         Expr::Builtin { args, .. } => args.iter().any(|a| expr_refs_var(a, target)),
@@ -798,7 +800,7 @@ fn expr_find_var_named(expr: &Expr, var_names: &[String], substr: &str) -> Optio
                 None
             }
         }
-        Expr::Const(_) | Expr::Bool(_) | Expr::IsExternal => None,
+        Expr::Const(_) | Expr::ConstBig(_) | Expr::Bool(_) | Expr::IsExternal => None,
         Expr::Not(e) => expr_find_var_named(e, var_names, substr),
         Expr::BinOp { lhs, rhs, .. } => expr_find_var_named(lhs, var_names, substr)
             .or_else(|| expr_find_var_named(rhs, var_names, substr)),

@@ -22,7 +22,10 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const TRACE_INDEX_VERSION: &str = "2";
+// v3: straight-line (iter_id==0) records get a per-execution unique id instead
+// of the shared 0 bucket, so a co-occurrence tuple can never pair variables from
+// two different input executions (the cross-trace fabrication bug).
+const TRACE_INDEX_VERSION: &str = "3";
 
 const NUM_DECODERS: usize = 8;
 const NUM_PARSERS: usize = 4;
@@ -192,24 +195,39 @@ pub fn build_trace_index_sqlite(
     );
 
     let build_result: io::Result<BuildResult> = (|| {
-        let mut next_iter_base: u32 = 0;
+        // Each raw file is one complete input execution. We assign every
+        // execution a disjoint slice of the iter-id space so observations from
+        // different executions never share a co-occurrence bucket:
+        //   iter_base            -> this execution's straight-line (iter_id==0) id
+        //   iter_base + k (k>=1) -> this execution's loop-iteration k
+        // The execution therefore occupies [iter_base, iter_base + max_raw_iter];
+        // the next execution starts one past that. Reserving a NON-ZERO id for
+        // the straight-line records is the fix for the cross-trace fabrication
+        // bug: previously every execution's iter_id==0 records collapsed into a
+        // single shared bucket, so a tuple at a non-loop pc could pair var X from
+        // one input run with var Y from another.
+        let mut next_used: u32 = 0;
         for path in raw_paths {
+            let iter_base = next_used.checked_add(1).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "trace iteration id space exhausted",
+                )
+            })?;
             let max_raw_iter = process_raw_file(
                 path,
-                next_iter_base,
+                iter_base,
                 kinds,
                 flush_members,
                 &mut run_writer,
                 Arc::clone(&counters),
             )?;
-            if max_raw_iter > 0 {
-                next_iter_base = next_iter_base.checked_add(max_raw_iter).ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "trace iteration context id offset overflow",
-                    )
-                })?;
-            }
+            next_used = iter_base.checked_add(max_raw_iter).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "trace iteration context id offset overflow",
+                )
+            })?;
         }
 
         let records = counters.records_indexed.load(Ordering::Relaxed);
@@ -313,7 +331,7 @@ fn keep_run_files() -> bool {
 
 fn process_raw_file(
     path: &Path,
-    iter_offset: u32,
+    iter_base: u32,
     kinds: IndexKinds,
     flush_members: u64,
     run_writer: &mut RunFileWriter,
@@ -347,11 +365,11 @@ fn process_raw_file(
     };
 
     eprintln!(
-        "[trace-index] reading {} ({:.2} GB compressed, {} frames, offset={})",
+        "[trace-index] reading {} ({:.2} GB compressed, {} frames, iter_base={})",
         path.display(),
         file_size as f64 / 1024.0 / 1024.0 / 1024.0,
         record_frames.len(),
-        iter_offset
+        iter_base
     );
 
     let (chunk_tx, chunk_rx) = bounded::<Vec<u8>>(256);
@@ -372,7 +390,7 @@ fn process_raw_file(
                 tx,
                 var_names,
                 block_names,
-                iter_offset,
+                iter_base,
                 kinds,
                 flush_members,
                 counters,
@@ -572,7 +590,7 @@ fn parser_loop(
     batch_tx: Sender<ParsedBatch>,
     var_names: Arc<Vec<String>>,
     block_names: Arc<Vec<String>>,
-    iter_offset: u32,
+    iter_base: u32,
     kinds: IndexKinds,
     flush_members: u64,
     counters: Arc<Counters>,
@@ -637,8 +655,8 @@ fn parser_loop(
                         max_raw_iter.fetch_max(pc, Ordering::Relaxed);
                     }
                     contexts.push(LocalContextDef {
-                        iter_id: offset_nonzero(var_id, iter_offset),
-                        parent_iter_id: offset_nonzero(pc, iter_offset),
+                        iter_id: offset_nonzero(var_id, iter_base),
+                        parent_iter_id: offset_nonzero(pc, iter_base),
                         depth: iter_id,
                         header_block_id: block_id,
                         iter_count: value,
@@ -665,11 +683,14 @@ fn parser_loop(
                 continue;
             }
 
+            // Loop records get this execution's per-iteration id; straight-line
+            // records (iter_id==0) get the execution's reserved base id — NOT a
+            // shared 0 — so co-occurrence tuples never cross executions.
             let eff_iter = if iter_id > 0 {
                 max_raw_iter.fetch_max(iter_id, Ordering::Relaxed);
-                offset_nonzero(iter_id, iter_offset)
+                offset_nonzero(iter_id, iter_base)
             } else {
-                0
+                iter_base
             };
             let mut member = [0u8; 12];
             member[..8].copy_from_slice(&(value as u64).to_le_bytes());

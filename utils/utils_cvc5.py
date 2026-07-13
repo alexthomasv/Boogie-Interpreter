@@ -4,7 +4,7 @@ from interpreter.parser.expression import FunctionApplication, MapSelect, Storag
 from interpreter.parser.statement import AssertStatement, AssumeStatement, AssignStatement, Block, CallStatement, GotoStatement, HavocStatement
 from interpreter.parser.declaration import StorageDeclaration, ImplementationDeclaration, ProcedureDeclaration
 from interpreter.parser.type import BooleanType, IntegerType, CustomType, MapType
-from interpreter.utils.cvc5_helper import term_to_string, sign_extend, zero_extend
+from interpreter.utils.cvc5_helper import pretty_print_term, sign_extend, zero_extend
 
 from interpreter.utils.utils import boogie_type_bitwidth
 from collections import deque
@@ -207,127 +207,187 @@ for _name, (_kind, _nargs, _width, _out) in fn_to_cvc5_op.items():
 
 
 def cvc5_to_boogie(term, depth=0) -> str:
-    """Convert a cvc5 term to Boogie/SMACK syntax.
+    """Render a cvc5 term as Boogie/SMACK syntax the parser can read back
+    (e.g. ``$mul.i32($i6, $sub.i32($i6, 1))``).
 
-    Unlike term_to_string (display-oriented), this produces syntax the LLM
-    can parse back: $mul.i32($i6, $sub.i32($i6, 1)) instead of $i6 * ($i6 - 1).
-    Handles cvc5 simplification artifacts (CONCAT→MUL, ITE→bool, etc.).
+    SINGLE SOURCE OF TRUTH: this is just the string rendering of
+    :func:`cvc5_to_boogie_ast` — the one structural cvc5->Boogie lowering. The
+    AST ``repr`` is fully parenthesized, so a biconditional ``(A==>B)&&(B==>A)``
+    keeps its grouping; the previous hand-written string emitter dropped those
+    parens and the relation collapsed under ``&&`` precedence (the bug that made
+    obligations like the pc2881 sign-guard un-parseable). Falls back to
+    ``pretty_print_term`` only for a Kind the lowering cannot express. ``depth`` is
+    accepted for backward signature compatibility and ignored.
     """
-    if depth > 30:
-        return "..."
     if term is None:
         return "EMPTY"
+    try:
+        return repr(cvc5_to_boogie_ast(term))
+    except Exception:
+        return pretty_print_term(term)
 
-    # Base case: leaf nodes
-    if term.getNumChildren() == 0:
-        if term.isBitVectorValue():
-            return str(int(term.getBitVectorValue(), 2))
+
+def cvc5_to_boogie_ast(term, depth: int = 0):
+    """Structurally lower a cvc5 ``Term`` into a Boogie expression AST — the
+    SAME ``interpreter.parser.expression`` nodes the Boogie parser builds —
+    WITHOUT round-tripping through an infix display string.
+
+    This is the term-faithful sibling of :func:`cvc5_to_boogie` (which renders
+    text and, for boolean connectives, drops the grouping parentheses a
+    biconditional ``(A ==> B) && (B ==> A)`` needs: under operator precedence
+    the printed ``A ==> B && B ==> A`` re-parses as ``A ==> (B && B) ==> A`` and
+    the relation collapses). Because an AST is a tree, grouping is exact by
+    construction — an ``AND`` of two ``IMPLIES`` is two distinct subtrees, never
+    a precedence-ambiguous flat string.
+
+    Used by the obligation-falsification inject path (``try-violate``): the
+    frozen obligation carries the live serialized cvc5 term, which is
+    deserialized and lowered here straight into the ``assert`` AST the native
+    interpreter evaluates — no printed-text parse in the loop.
+
+    Raises ``ValueError`` on a ``Kind`` it cannot lower so the caller can fall
+    back (logged) rather than silently inject a divergent predicate.
+    """
+    from interpreter.parser.expression import (
+        BinaryExpression, LogicalNegation, ArithmeticNegation,
+        FunctionApplication, FunctionIdentifier, StorageIdentifier,
+        IntegerLiteral, BooleanLiteral, IfExpression, MapSelect, MapUpdate,
+    )
+    if term is None:
+        raise ValueError("cvc5_to_boogie_ast: term is None")
+    if depth > 60:
+        raise ValueError("cvc5_to_boogie_ast: term nesting exceeds 60")
+
+    n = term.getNumChildren()
+
+    # --- leaves ---
+    if n == 0:
         if term.isBooleanValue():
-            return "true" if term.getBooleanValue() else "false"
+            return BooleanLiteral(bool(term.getBooleanValue()))
+        if term.isIntegerValue():
+            return IntegerLiteral(int(term.getIntegerValue()))
+        if term.isBitVectorValue():
+            return IntegerLiteral(int(term.getBitVectorValue(), 2))
         try:
-            return term.getSymbol()
+            sym = term.getSymbol()
         except Exception:
-            return str(term)
+            sym = str(term)
+        return StorageIdentifier(name=sym)
 
     kind = term.getKind()
+    rec = lambda i: cvc5_to_boogie_ast(term[i], depth + 1)
 
-    # --- Handle cvc5 simplification artifacts ---
-
-    # CONCAT patterns (cvc5 simplification artifacts)
-    if kind == Kind.BITVECTOR_CONCAT and term.getNumChildren() == 2:
-        hi, lo = term[0], term[1]
-        # CONCAT(EXTRACT(N-1,0,x), #b0...0) → $mul.i32(2^K, x)  (left-shift)
-        if lo.isBitVectorValue() and int(lo.getBitVectorValue(), 2) == 0:
-            n_zeros = lo.getSort().getBitVectorSize()
-            if hi.getKind() == Kind.BITVECTOR_EXTRACT:
-                inner = cvc5_to_boogie(hi[0], depth + 1)
-                return f"$mul.i32({1 << n_zeros}, {inner})"
-        # CONCAT(#b0...0, x) → x  (zero-extension, transparent in Boogie)
-        if hi.isBitVectorValue() and int(hi.getBitVectorValue(), 2) == 0:
-            return cvc5_to_boogie(lo, depth + 1)
-
-    # ITE(cond, bv(1), bv(0)) → cond  (Bool-to-BV cast)
-    if kind == Kind.ITE and term.getNumChildren() == 3:
-        t_val, f_val = term[1], term[2]
-        if (t_val.isBitVectorValue() and int(t_val.getBitVectorValue(), 2) == 1
-                and f_val.isBitVectorValue() and int(f_val.getBitVectorValue(), 2) == 0):
-            return cvc5_to_boogie(term[0], depth + 1)
-
-    # --- Standard mappings ---
-
-    if kind == Kind.EQUAL:
-        lhs = cvc5_to_boogie(term[0], depth + 1)
-        rhs = cvc5_to_boogie(term[1], depth + 1)
-        return f"{lhs} == {rhs}"
-
-    if kind == Kind.DISTINCT:
-        lhs = cvc5_to_boogie(term[0], depth + 1)
-        rhs = cvc5_to_boogie(term[1], depth + 1)
-        return f"{lhs} != {rhs}"
-
+    # --- unary ---
     if kind == Kind.NOT:
-        inner = cvc5_to_boogie(term[0], depth + 1)
-        return f"!({inner})"
+        return LogicalNegation(expression=rec(0))
+    if kind == Kind.NEG:                       # integer unary minus
+        return ArithmeticNegation(expression=rec(0))
+    if kind == Kind.BITVECTOR_NEG:             # SMACK has no $neg.i32
+        w = term.getSort().getBitVectorSize()
+        return FunctionApplication(
+            function=FunctionIdentifier(name=f"$sub.i{w}"),
+            arguments=[IntegerLiteral(0), rec(0)])
 
-    # bvneg($x) → $sub.i32(0, $x) (SMACK has no $neg.i32)
-    if kind == Kind.BITVECTOR_NEG:
-        inner = cvc5_to_boogie(term[0], depth + 1)
-        width = term.getSort().getBitVectorSize()
-        return f"$sub.i{width}(0, {inner})"
+    # --- n-ary connectives / arithmetic folded left into binary nodes ---
+    _FOLD = {Kind.AND: "&&", Kind.OR: "||", Kind.ADD: "+", Kind.MULT: "*"}
+    if kind in _FOLD:
+        node = rec(0)
+        for i in range(1, n):
+            node = BinaryExpression(lhs=node, op=_FOLD[kind], rhs=rec(i))
+        return node
 
-    if kind == Kind.AND:
-        parts = [cvc5_to_boogie(term[i], depth + 1) for i in range(term.getNumChildren())]
-        return " && ".join(parts)
+    # --- binary relational / connective / arithmetic ---
+    _BIN = {Kind.IMPLIES: "==>", Kind.EQUAL: "==", Kind.DISTINCT: "!=",
+            Kind.LT: "<", Kind.LEQ: "<=", Kind.GT: ">", Kind.GEQ: ">=",
+            Kind.SUB: "-", Kind.INTS_DIVISION: "/", Kind.INTS_MODULUS: "%"}
+    if kind in _BIN and n == 2:
+        return BinaryExpression(lhs=rec(0), op=_BIN[kind], rhs=rec(1))
 
-    if kind == Kind.OR:
-        parts = [cvc5_to_boogie(term[i], depth + 1) for i in range(term.getNumChildren())]
-        return " || ".join(parts)
+    # n-ary DISTINCT: all-pairwise !=  (rare; cvc5 usually binarizes)
+    if kind == Kind.DISTINCT and n > 2:
+        parts = [BinaryExpression(lhs=rec(i), op="!=", rhs=rec(j))
+                 for i in range(n) for j in range(i + 1, n)]
+        node = parts[0]
+        for p in parts[1:]:
+            node = BinaryExpression(lhs=node, op="&&", rhs=p)
+        return node
 
-    if kind == Kind.SELECT:
-        arr = cvc5_to_boogie(term[0], depth + 1)
-        idx = cvc5_to_boogie(term[1], depth + 1)
-        return f"{arr}[{idx}]"
+    # --- if-then-else ---
+    if kind == Kind.ITE and n == 3:
+        def _leaf_val(t, v):
+            if t.getNumChildren():
+                return False
+            try:
+                if t.isBitVectorValue():
+                    return int(t.getBitVectorValue(), 2) == v
+                if t.isIntegerValue():
+                    return int(t.getIntegerValue()) == v
+            except Exception:
+                return False
+            return False
+        # bool->bv cast ITE(c, 1, 0) is just the boolean c (matches cvc5_to_boogie)
+        if _leaf_val(term[1], 1) and _leaf_val(term[2], 0):
+            return rec(0)
+        return IfExpression(condition=rec(0), then=rec(1), else_=rec(2))
 
-    if kind == Kind.STORE:
-        arr = cvc5_to_boogie(term[0], depth + 1)
-        idx = cvc5_to_boogie(term[1], depth + 1)
-        val = cvc5_to_boogie(term[2], depth + 1)
-        return f"STORE({arr}, {idx}, {val})"
+    # --- arrays ---
+    if kind == Kind.SELECT and n == 2:
+        return MapSelect(map=rec(0), indexes=[rec(1)])
+    if kind == Kind.STORE and n == 3:
+        return MapUpdate(map=rec(0), indexes=[rec(1)], value=rec(2))
 
-    if kind == Kind.IMPLIES:
-        lhs = cvc5_to_boogie(term[0], depth + 1)
-        rhs = cvc5_to_boogie(term[1], depth + 1)
-        return f"({lhs}) ==> ({rhs})"
+    # --- cvc5 BV simplification artifacts -> readable SMACK form (semantics-
+    # preserving). These are the display niceties cvc5_to_boogie advertises;
+    # keeping them here means the LLM string AND the injected assert share one
+    # lowering. ---
+    def _mul32(a_ast, b_ast):
+        return FunctionApplication(
+            function=FunctionIdentifier(name="$mul.i32"),
+            arguments=[a_ast, b_ast])
 
-    # Refactor cvc5 simplification artifacts back to readable Boogie:
-    # ADD(MULT(X, X), NEG(X)) → $mul.i32(X, $sub.i32(X, 1))  [x² - x = x*(x-1)]
-    # ADD(MULT(X, X), X)      → $mul.i32(X, $add.i32(X, 1))  [x² + x = x*(x+1)]
-    if kind == Kind.BITVECTOR_ADD and term.getNumChildren() == 2:
+    if kind == Kind.BITVECTOR_CONCAT and n == 2:
+        hi, lo = term[0], term[1]
+        # CONCAT(EXTRACT(.,.,x), #b0..0) -> $mul.i32(2^K, x)  (left shift)
+        if (lo.isBitVectorValue() and int(lo.getBitVectorValue(), 2) == 0
+                and hi.getKind() == Kind.BITVECTOR_EXTRACT):
+            n_zeros = lo.getSort().getBitVectorSize()
+            return _mul32(IntegerLiteral(1 << n_zeros),
+                          cvc5_to_boogie_ast(hi[0], depth + 1))
+        # CONCAT(#b0..0, x) -> x  (zero-extension, transparent in Boogie)
+        if hi.isBitVectorValue() and int(hi.getBitVectorValue(), 2) == 0:
+            return cvc5_to_boogie_ast(lo, depth + 1)
+
+    if kind == Kind.BITVECTOR_ADD and n == 2:
         a, b = term[0], term[1]
-        # Pattern: X² - X → X*(X-1)
+        # X^2 - X  ->  $mul.i32(X, $sub.iW(X, 1))
         if (a.getKind() == Kind.BITVECTOR_MULT and a.getNumChildren() == 2
-                and b.getKind() == Kind.BITVECTOR_NEG):
-            if str(a[0]) == str(a[1]) == str(b[0]):
-                x = cvc5_to_boogie(a[0], depth + 1)
-                w = term.getSort().getBitVectorSize()
-                return f"$mul.i32({x}, $sub.i{w}({x}, 1))"
-        # Pattern: X² + X → X*(X+1)
+                and b.getKind() == Kind.BITVECTOR_NEG
+                and str(a[0]) == str(a[1]) == str(b[0])):
+            w = term.getSort().getBitVectorSize()
+            return _mul32(cvc5_to_boogie_ast(a[0], depth + 1),
+                          FunctionApplication(
+                              function=FunctionIdentifier(name=f"$sub.i{w}"),
+                              arguments=[cvc5_to_boogie_ast(a[0], depth + 1),
+                                         IntegerLiteral(1)]))
+        # X^2 + X  ->  $mul.i32(X, $add.iW(X, 1))
         if (a.getKind() == Kind.BITVECTOR_MULT and a.getNumChildren() == 2
-                and b.getKind() == Kind.CONSTANT and b.getSort().isBitVector()):
-            if str(a[0]) == str(a[1]) == str(b):
-                x = cvc5_to_boogie(a[0], depth + 1)
-                w = term.getSort().getBitVectorSize()
-                return f"$mul.i32({x}, $add.i{w}({x}, 1))"
+                and b.getKind() == Kind.CONSTANT and b.getSort().isBitVector()
+                and str(a[0]) == str(a[1]) == str(b)):
+            w = term.getSort().getBitVectorSize()
+            return _mul32(cvc5_to_boogie_ast(a[0], depth + 1),
+                          FunctionApplication(
+                              function=FunctionIdentifier(name=f"$add.i{w}"),
+                              arguments=[cvc5_to_boogie_ast(a[0], depth + 1),
+                                         IntegerLiteral(1)]))
 
-    # SMACK function call: Kind → $op.i32(args)
+    # --- SMACK intrinsic / BV-op function calls ($add.i32, $sge.i32, ...) ---
     if kind in _CVC5_KIND_TO_BOOGIE:
-        fn = _CVC5_KIND_TO_BOOGIE[kind]
-        args = ", ".join(cvc5_to_boogie(term[i], depth + 1)
-                        for i in range(term.getNumChildren()))
-        return f"{fn}({args})"
+        return FunctionApplication(
+            function=FunctionIdentifier(name=_CVC5_KIND_TO_BOOGIE[kind]),
+            arguments=[rec(i) for i in range(n)])
 
-    # Fallback: use term_to_string for unknown kinds
-    return term_to_string(term)
+    raise ValueError(
+        f"cvc5_to_boogie_ast: unhandled kind {kind} (nchildren={n})")
 
 
 def generate_cvc5_function_map(solver: Solver):
@@ -414,11 +474,11 @@ def dump_solver_assertions(solver, logger=None):
     if logger:
         logger.debug("solver assertions:")
         for a in solver.getAssertions():
-            logger.debug(f"  - {term_to_string(a)}")
+            logger.debug(f"  - {pretty_print_term(a)}")
     else:
         IndentLogger.debug("solver assertions:")
         for a in solver.getAssertions():
-            IndentLogger.debug(f"  - {term_to_string(a)}")
+            IndentLogger.debug(f"  - {pretty_print_term(a)}")
 
 def cvc5_cast_to_int(solver, expr):
     if expr.getSort() == solver.getIntegerSort():
@@ -573,45 +633,23 @@ _INT_ENC_FN_MAP = {
     "$uge.i64.bool": (Kind.GEQ, 2, None, bool),
     "$uge.i8":  (Kind.GEQ, 2, None, "int_cmp"),
     "$uge.i8.bool": (Kind.GEQ, 2, None, bool),
-    # Division / remainder → integer ops
+    # Division / remainder. The prelude defines $sdiv = $udiv = $idiv
+    # (SMT-LIB Euclidean div) and $urem = $smod (Euclidean mod); those map
+    # directly. $srem is NOT plain mod — the prelude's C-remainder
+    # correction formula is built by _int_enc_special_term (the old
+    # INTS_MODULUS entry here diverged from the prelude on negative
+    # dividends and was a verifier-model bug caught by the kernel diff).
     "$sdiv.i32": (Kind.INTS_DIVISION, 2, None, None),
     "$sdiv.i64": (Kind.INTS_DIVISION, 2, None, None),
     "$udiv.i32": (Kind.INTS_DIVISION, 2, None, None),
     "$udiv.i64": (Kind.INTS_DIVISION, 2, None, None),
-    "$srem.i32": (Kind.INTS_MODULUS, 2, None, None),
-    "$srem.i64": (Kind.INTS_MODULUS, 2, None, None),
     "$urem.i32": (Kind.INTS_MODULUS, 2, None, None),
     "$urem.i64": (Kind.INTS_MODULUS, 2, None, None),
-    # Bitwise ops — handled by _INT_ENC_BITWISE_OPS in convert_expr_cvc5
-    # (int→bv→op→nat wrapping for exact semantics). These entries are
-    # kept as placeholders so the fn_map lookup succeeds; the actual
-    # cvc5_op value is ignored because the bitwise path runs first.
-    "$and.i32": (Kind.MULT, 2, None, None),
-    "$and.i64": (Kind.MULT, 2, None, None),
-    "$and.i8":  (Kind.MULT, 2, None, None),
-    "$and.i1":  (Kind.MULT, 2, None, None),
-    "$and.ref":  (Kind.MULT, 2, None, None),
-    "$or.i32":  (Kind.ADD, 2, None, None),
-    "$or.i64":  (Kind.ADD, 2, None, None),
-    "$or.i8":   (Kind.ADD, 2, None, None),
-    "$or.i1":   (Kind.ADD, 2, None, None),
-    "$or.ref":   (Kind.ADD, 2, None, None),
-    "$xor.i32": (Kind.SUB, 2, None, None),
-    "$xor.i64": (Kind.SUB, 2, None, None),
-    "$xor.i8":  (Kind.SUB, 2, None, None),
-    "$xor.i1":  (Kind.SUB, 2, None, None),
-    "$xor.ref":  (Kind.SUB, 2, None, None),
-    "$not.i1":  (Kind.SUB, 2, None, None),
-    "$not.i8":  (Kind.SUB, 2, None, None),
-    "$not.i32": (Kind.SUB, 2, None, None),
-    "$not.i64": (Kind.SUB, 2, None, None),
-    "$not.ref": (Kind.SUB, 2, None, None),
-    "$shl.i32":  (Kind.MULT, 2, None, None),
-    "$shl.i64":  (Kind.MULT, 2, None, None),
-    "$lshr.i32": (Kind.INTS_DIVISION, 2, None, None),
-    "$lshr.i64": (Kind.INTS_DIVISION, 2, None, None),
-    "$ashr.i32": (Kind.INTS_DIVISION, 2, None, None),
-    "$ashr.i64": (Kind.INTS_DIVISION, 2, None, None),
+    # Bitwise/shift ops ($and/$or/$xor/$not/$shl/$lshr/$ashr.iN) are handled
+    # by the int→bv(width)→op→nat handler (_int_enc_special_term) BEFORE the
+    # fn-map lookup — no entries here. The historical placeholder kinds
+    # (MULT/ADD/SUB/DIVISION) silently computed garbage; the kernel diff
+    # (interpreter/tests/differential/test_smt_kernel_diff.py) pinned them.
     # Casts — identity in integer mode
     "$bitcast.ref.ref": (None, 1, None, None),
     "$p2i.ref.i64": (None, 1, None, None),
@@ -631,6 +669,96 @@ _INT_ENC_FN_MAP = {
     "||": (Kind.OR, 2, bool, bool),
     "==>": (Kind.IMPLIES, 2, None, None),
 }
+
+# Residual division intrinsics of the integer encoding: {:builtin "div"}
+# $idiv.iN and {:builtin "mod"} $smod.iN — the ONLY div/rem functions left in
+# statements once the FunctionInlinePass has expanded the {:inline} prelude
+# wrappers ($sdiv/$udiv/$srem/$urem). Width-insensitive in ℤ.
+for _w in ("i1", "i5", "i6", "i8", "i16", "i24", "i32", "i33", "i40", "i48",
+           "i56", "i64", "i128", "ref"):
+    _INT_ENC_FN_MAP[f"$idiv.{_w}"] = (Kind.INTS_DIVISION, 2, None, None)
+    _INT_ENC_FN_MAP[f"$smod.{_w}"] = (Kind.INTS_MODULUS, 2, None, None)
+del _w
+
+# --- Int-encoding special handler: bitwise/shift roundtrip + $srem ---------
+#
+# The int→bv(width)→op→nat handler (the "_INT_ENC_BITWISE_OPS handler" that
+# older comments referenced but was never built): bitwise and shift intrinsics
+# are the only width-sensitive residual ops in the integer encoding. Each is
+# modeled EXACTLY as SMT-LIB `bv2nat(bvop((_ int2bv w) a, (_ int2bv w) b))`,
+# which is also what the native interpreter's `builtins::int` implements.
+_INT_ENC_BITWISE_OPS = {
+    "$and": Kind.BITVECTOR_AND,
+    "$or": Kind.BITVECTOR_OR,
+    "$xor": Kind.BITVECTOR_XOR,
+    "$not": Kind.BITVECTOR_NOT,  # unary (the old fn-map entry declared 2-ary SUB)
+    "$shl": Kind.BITVECTOR_SHL,
+    "$lshr": Kind.BITVECTOR_LSHR,
+    "$ashr": Kind.BITVECTOR_ASHR,
+}
+
+_INT_ENC_WIDTH_SUFFIX = {
+    "i1": 1, "i5": 5, "i6": 6, "i8": 8, "i16": 16, "i24": 24, "i32": 32,
+    "i33": 33, "i40": 40, "i48": 48, "i56": 56, "i64": 64, "i128": 128,
+    "ref": 64,
+}
+
+
+def _int_enc_to_int(solver, term):
+    """Coerce a converted int-encoding operand to Int sort (Bool → 0/1)."""
+    if term.getSort().isBoolean():
+        return solver.mkTerm(Kind.ITE, term, solver.mkInteger(1),
+                             solver.mkInteger(0))
+    return term
+
+
+def _int_enc_special_term(solver, name, arg_terms):
+    """Int-encoding special forms over ALREADY-CONVERTED operand terms.
+
+    Returns a Term for the bitwise/shift intrinsics (int→bv→op→nat) and for
+    $srem.iN (the prelude's C-remainder correction formula), or None when
+    ``name`` is not special. Shared by convert_expr_cvc5 (AST path) and
+    _parse_infix_expr._mk_function_call (string path).
+    """
+    if "." not in name:
+        return None
+    base, _, suffix = name.partition(".")
+    if base == "$srem":
+        if suffix not in _INT_ENC_WIDTH_SUFFIX or len(arg_terms) != 2:
+            return None
+        a = _int_enc_to_int(solver, arg_terms[0])
+        b = _int_enc_to_int(solver, arg_terms[1])
+        zero = solver.mkInteger(0)
+        m = solver.mkTerm(Kind.INTS_MODULUS, a, b)
+        abs_b = solver.mkTerm(
+            Kind.ITE, solver.mkTerm(Kind.GEQ, b, zero), b,
+            solver.mkTerm(Kind.NEG, b))
+        cond = solver.mkTerm(
+            Kind.AND,
+            solver.mkTerm(Kind.DISTINCT, m, zero),
+            solver.mkTerm(Kind.LT, a, zero))
+        return solver.mkTerm(Kind.ITE, cond,
+                             solver.mkTerm(Kind.SUB, m, abs_b), m)
+    bv_kind = _INT_ENC_BITWISE_OPS.get(base)
+    if bv_kind is None:
+        return None
+    width = _INT_ENC_WIDTH_SUFFIX.get(suffix)
+    if width is None:
+        return None
+    expected = 1 if base == "$not" else 2
+    if len(arg_terms) != expected:
+        raise ValueError(
+            f"{name} expects {expected} arg(s), got {len(arg_terms)}")
+    int2bv = solver.mkOp(Kind.INT_TO_BITVECTOR, width)
+    bv_args = []
+    for t in arg_terms:
+        t = _int_enc_to_int(solver, t)
+        if t.getSort().isBitVector():
+            bv_args.append(cvc5_cast_to_bv(solver, t, width))
+        else:
+            bv_args.append(solver.mkTerm(int2bv, t))
+    bv_result = solver.mkTerm(bv_kind, *bv_args)
+    return solver.mkTerm(Kind.BITVECTOR_UBV_TO_INT, bv_result)
 
 def get_fn_map():
     """Return the appropriate function map for current encoding mode."""
@@ -659,56 +787,12 @@ def set_integer_encoding(enabled: bool):
     global _INTEGER_ENCODING
     _INTEGER_ENCODING = enabled
 
-def detect_integer_encoding(program):
-    """Detect if program uses SMACK unbounded-integer encoding.
-
-    ``SMACK ≥ 2.8.0`` always emits ``type i32 = int`` as a Boogie alias
-    regardless of the actual SMT encoding, but the program then uses
-    BV-named function intrinsics (``$add.bv32``, ``$slt.bv32`` etc.)
-    when SMACK is invoked with ``--integer-encoding bit-vector``. The
-    truthful signal is the presence of ``$add.bv*`` or similar BV
-    function declarations: BV mode → present; pure-int mode → absent.
-
-    Returns True iff this is truly unbounded-integer mode (no BV
-    function declarations found). Defaults to False (BV) on ambiguity
-    so existing BV-tested verification proofs keep working.
-    """
-    from interpreter.parser.declaration import (
-        FunctionDeclaration,
-        TypeDeclaration,
-    )
-    from interpreter.parser.type import IntegerType
-
-    has_int_alias = False
-    for d in program.declarations:
-        if isinstance(d, TypeDeclaration):
-            if hasattr(d, 'names') and 'i32' in d.names:
-                if hasattr(d, 'type') and isinstance(d.type, IntegerType):
-                    has_int_alias = True
-                    break
-    if not has_int_alias:
-        return False
-
-    # Look for SMACK's BV-mode integer arithmetic intrinsics — present
-    # only when SMACK was invoked with --integer-encoding bit-vector for
-    # the iN program types. Pointer/ref conversion helpers like
-    # ``$bv2int.64`` and ``$int2bv.64`` are emitted in both modes (SMACK
-    # always uses bv64 for ref) and must NOT be treated as BV-mode
-    # markers; restrict the check to the iN-arith intrinsics.
-    bv_arith_prefixes = (
-        '$add.bv', '$sub.bv', '$mul.bv', '$div.bv', '$rem.bv',
-        '$slt.bv', '$sle.bv', '$sgt.bv', '$sge.bv',
-        '$ult.bv', '$ule.bv', '$ugt.bv', '$uge.bv',
-        '$shl.bv', '$lshr.bv', '$ashr.bv',
-        '$and.bv', '$or.bv', '$xor.bv', '$not.bv',
-    )
-    for d in program.declarations:
-        if isinstance(d, FunctionDeclaration):
-            name = getattr(d, 'name', '') or ''
-            if name.startswith(bv_arith_prefixes):
-                return False  # BV-mode arithmetic intrinsics present
-
-    return True
+# Canonical implementation lives in the cvc5-free module
+# interpreter.utils.integer_encoding so the PyPy compile stage (which cannot
+# import cvc5, and therefore not this module) can share the ONE detector.
+# Re-exported here for the existing CPython consumers
+# (tools/common.py, tools/drivers/driver.py, src/state/state_cache.py).
+from interpreter.utils.integer_encoding import detect_integer_encoding
 
 def convert_type_to_cvc5(solver, type_, mono_mem = True) -> Sort:
     if isinstance(type_, BooleanType):
@@ -894,6 +978,18 @@ def convert_expr_cvc5(cvc5_fn_map, state_cache, solver, expr, mono_mem: bool) ->
         then_branch, else_branch = assign_fix_type(solver, then_branch, else_branch)
         return solver.mkTerm(Kind.ITE, cond, then_branch, else_branch)
     elif isinstance(expr, FunctionApplication):
+        if _INTEGER_ENCODING and "." in expr.function.name:
+            _base = expr.function.name.partition(".")[0]
+            if _base == "$srem" or _base in _INT_ENC_BITWISE_OPS:
+                arg_terms = [
+                    convert_expr_cvc5(cvc5_fn_map, state_cache, solver, arg,
+                                      mono_mem)
+                    for arg in expr.arguments
+                ]
+                special = _int_enc_special_term(
+                    solver, expr.function.name, arg_terms)
+                if special is not None:
+                    return special
         if expr.function.name in cvc5_fn_map:
             fn_entry = cvc5_fn_map[expr.function.name]
             cvc5_op = fn_entry[0]
@@ -1123,6 +1219,10 @@ KIND_TO_NUM = {
     Kind.FORALL: 65,
     Kind.VARIABLE_LIST: 66,
     Kind.VARIABLE: 67,
+    # Additive wire tags: never renumber existing kinds because persisted
+    # Predicate pickles carry these integers across processes/runs.
+    Kind.CONST_RATIONAL: 68,
+    Kind.CONST_STRING: 69,
 }
 
 NUM_TO_KIND = {num: kind for kind, num in KIND_TO_NUM.items()}
@@ -1135,6 +1235,9 @@ sort_to_num = {
     SortKind.INTERNAL_SORT_KIND: 5,
     SortKind.SET_SORT: 6,
     SortKind.UNINTERPRETED_SORT: 7,
+    SortKind.FUNCTION_SORT: 8,
+    SortKind.REAL_SORT: 9,
+    SortKind.STRING_SORT: 10,
 }
 
 NUM_TO_SORT = {num: sort for sort, num in sort_to_num.items()}
@@ -1222,6 +1325,10 @@ def deserialize_cvc5_term(state_cache, root_term):
                     res = mkConst(solver.mkBitVectorSort(term.bitwidth), term.var_name)
                 elif sort_kind == SortKind.INTEGER_SORT:
                     res = mkConst(solver.getIntegerSort(), term.var_name)
+                elif sort_kind == SortKind.REAL_SORT:
+                    res = mkConst(solver.getRealSort(), term.var_name)
+                elif sort_kind == SortKind.STRING_SORT:
+                    res = mkConst(solver.getStringSort(), term.var_name)
                 elif sort_kind == SortKind.ARRAY_SORT:
                     idx_sort = solver.mkBitVectorSort(term.array_index_width) if term.array_index_width > 0 else solver.getIntegerSort()
                     elem_sort = solver.mkBitVectorSort(term.array_element_width) if term.array_element_width > 0 else solver.getIntegerSort()
@@ -1257,6 +1364,10 @@ def deserialize_cvc5_term(state_cache, root_term):
                     res = solver.mkVar(solver.mkBitVectorSort(term.bitwidth), term.var_name)
                 elif sort_kind == SortKind.INTEGER_SORT:
                     res = solver.mkVar(solver.getIntegerSort(), term.var_name)
+                elif sort_kind == SortKind.REAL_SORT:
+                    res = solver.mkVar(solver.getRealSort(), term.var_name)
+                elif sort_kind == SortKind.STRING_SORT:
+                    res = solver.mkVar(solver.getStringSort(), term.var_name)
                 elif sort_kind == SortKind.ARRAY_SORT:
                     idx_s = solver.mkBitVectorSort(term.array_index_width) if term.array_index_width > 0 else solver.getIntegerSort()
                     elem_s = solver.mkBitVectorSort(term.array_element_width) if term.array_element_width > 0 else solver.getIntegerSort()
@@ -1280,6 +1391,16 @@ def deserialize_cvc5_term(state_cache, root_term):
 
         if op_kind == Kind.CONST_INTEGER:
             memo[term] = solver.mkInteger(str(term.value))
+            stack.pop()
+            continue
+
+        if op_kind == Kind.CONST_RATIONAL:
+            memo[term] = solver.mkReal(str(term.value))
+            stack.pop()
+            continue
+
+        if op_kind == Kind.CONST_STRING:
+            memo[term] = solver.mkString(str(term.value))
             stack.pop()
             continue
 
@@ -1435,7 +1556,10 @@ def serialize_cvc5_term(term: Term):
         kind = parent.getKind()
 
         # 2. LEAF HANDLING: Memoize and pop immediately
-        if kind == Kind.CONSTANT or kind == Kind.VARIABLE or kind == Kind.CONST_BITVECTOR or kind == Kind.CONST_BOOLEAN or kind == Kind.CONST_INTEGER:
+        if kind in (
+                Kind.CONSTANT, Kind.VARIABLE, Kind.CONST_BITVECTOR,
+                Kind.CONST_BOOLEAN, Kind.CONST_INTEGER,
+                Kind.CONST_RATIONAL, Kind.CONST_STRING):
             done[parent] = HollowCvc5Term(parent)
             stack_pop()
             continue
@@ -1507,6 +1631,10 @@ class HollowCvc5Term:
             self.value = int(term.getIntegerValue())
         elif kind == Kind.CONST_BOOLEAN:
             self.value = bool(term.getBooleanValue())
+        elif kind == Kind.CONST_RATIONAL:
+            self.value = str(term.getRealValue())
+        elif kind == Kind.CONST_STRING:
+            self.value = term.getStringValue()
         elif kind == Kind.BITVECTOR_EXTRACT:
             bitvector_op = term.getOp()
             self.bv_extract_start = bitvector_op[1].getIntegerValue()
@@ -1637,6 +1765,10 @@ def hollow_to_str(term, max_depth=8):
         return str(term.value)
     if op == 48:  # CONST_BOOLEAN
         return "true" if term.value else "false"
+    if op == 68:  # CONST_RATIONAL
+        return str(term.value)
+    if op == 69:  # CONST_STRING
+        return repr(str(term.value))
     if op == 52:  # SET_EMPTY
         return "{}"
 
@@ -2160,7 +2292,7 @@ def parse_constraint_tuple(tuple_str):
     return result
 
 def _parse_infix_expr(s, state_cache):
-    """Parse an infix expression (from term_to_string output) into a cvc5 Term.
+    """Parse an infix expression (from pretty_print_term output) into a cvc5 Term.
 
     Handles variables, integers, array select, STORE, and binary operators.
     All arithmetic is bitvector (64-bit default, or inferred from variable sort).
@@ -2285,6 +2417,7 @@ def _parse_infix_expr(s, state_cache):
     # bit-vector term".  Swap to the integer-theory equivalents.
     _INT_OPS = {
         '+': Kind.ADD, '-': Kind.SUB, '*': Kind.MULT,
+        '/': Kind.INTS_DIVISION, '%': Kind.INTS_MODULUS,
         '<': Kind.LT, '>': Kind.GT, '<=': Kind.LEQ, '>=': Kind.GEQ,
         '==': Kind.EQUAL, '!=': Kind.DISTINCT,
     }
@@ -2425,6 +2558,10 @@ def _parse_infix_expr(s, state_cache):
             return args
 
     def _mk_function_call(name, args):
+        if _INTEGER_ENCODING:
+            special = _int_enc_special_term(solver, name, args)
+            if special is not None:
+                return special
         fn_map = get_fn_map()
         if name not in fn_map:
             raise ValueError(f"Unknown function: {name}")
@@ -2571,9 +2708,14 @@ def _parse_infix_expr(s, state_cache):
                 expect(']')
                 return solver.mkTerm(Kind.SELECT, expr, idx)
             return expr
-        elif typ == 'ID' and val in ('true', 'false'):
+        elif typ == 'ID' and val in ('true', 'True', 'false', 'False'):
+            # Accept Python-stringified booleans ("True"/"False") as well as the
+            # cvc5/Boogie lowercase spelling. A re-parsed capital "True" (e.g. a
+            # vacuously-true WP printed via str(bool)) would otherwise fall to
+            # the ID->variable branch below and become an unresolved FREE
+            # VARIABLE named "True", defeating the is_true discharge gate.
             advance()
-            return solver.mkBoolean(val == 'true')
+            return solver.mkBoolean(val.lower() == 'true')
         elif typ == 'ID' and val == 'STORE':
             advance()
             expect('(')
