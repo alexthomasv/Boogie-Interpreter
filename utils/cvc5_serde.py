@@ -571,10 +571,17 @@ serialize_cvc5_term.cache_info = _serialize_cvc5_term_cached.cache_info  # type:
 
 
 def _ensure_term_cache(state_cache):
+    # Solver-identity guard: cached Terms belong to the solver (term manager)
+    # that built them. Handing a stale-manager Term to a new solver is the
+    # documented cvc5 footgun (wrong results / native crash), so the cache
+    # dies with the solver instead of relying on manual clears.
+    solver = getattr(state_cache, "solver", None)
     cache = getattr(state_cache, "cvc5_term_cache", None)
-    if cache is None:
+    bound = getattr(state_cache, "_cvc5_term_cache_solver", None)
+    if cache is None or bound is not solver:
         cache = LRUCache(maxsize=50000)
         state_cache.cvc5_term_cache = cache
+        state_cache._cvc5_term_cache_solver = solver
     return cache
 
 
@@ -604,10 +611,15 @@ def _subterm_cache_keys(root_term: SerializedCvc5TermV2):
 
 
 def _ensure_sort_cache(state_cache):
+    # Same solver-identity guard as the term cache: Sorts are also bound to
+    # their term manager.
+    solver = getattr(state_cache, "solver", None)
     cache = getattr(state_cache, "cvc5_sort_cache", None)
-    if cache is None:
+    bound = getattr(state_cache, "_cvc5_sort_cache_solver", None)
+    if cache is None or bound is not solver:
         cache = {}
         state_cache.cvc5_sort_cache = cache
+        state_cache._cvc5_sort_cache_solver = solver
     return cache
 
 
@@ -812,6 +824,81 @@ def _canonical_node_obj(term: SerializedCvc5TermV2, idx: int):
     if node.kind in _COMMUTATIVE_KINDS:
         children = tuple(sorted(children, key=repr))
     return (node.kind, _sort_to_obj(node.sort), node.op_indices, children)
+
+
+def canonical_wire(term) -> SerializedCvc5TermV2:
+    """Return deterministic wire bytes for an *already canonicalized* term.
+
+    This is the final representation step of the predicate canonicalizer
+    (``src.solver.predicate.canonicalize_predicate``), not another semantic
+    canonicalizer.  It does not simplify, rewrite, or decide equivalence.  It
+    only removes cvc5's process-local DAG numbering and commutative-child-
+    order nondeterminism from the canonicalizer's result.
+
+    Lives HERE (beside ``_canonical_node_obj``) so both canonical projections
+    — the fingerprint object and the wire — share the ONE
+    ``_COMMUTATIVE_KINDS`` set; a second independently-maintained set was the
+    identity-drift footgun this fold removes.
+    """
+    serialized = serialize_cvc5_term(term)
+    records: dict = {}
+
+    def visit(idx):
+        hit = records.get(idx)
+        if hit is not None:
+            return hit
+        node = serialized.nodes[idx]
+        children = [visit(child) for child in node.children]
+        if node.kind in _COMMUTATIVE_KINDS:
+            children.sort(key=lambda child: repr(child[0]))
+
+        if node.kind == "CONST_BITVECTOR":
+            identity = ("bv", node.value, node.sort.args[0])
+        elif node.kind == "CONST_INTEGER":
+            identity = ("int", node.value)
+        elif node.kind == "CONST_BOOLEAN":
+            identity = ("bool", bool(node.value))
+        elif node.kind in {"CONSTANT", "VARIABLE"}:
+            identity = (node.kind.lower(), node.symbol,
+                        _sort_to_obj(node.sort))
+        else:
+            identity = (
+                node.kind,
+                _sort_to_obj(node.sort),
+                node.op_indices,
+                node.value,
+                node.symbol,
+                tuple(child[0] for child in children),
+            )
+        record = (identity, node, tuple(children))
+        records[idx] = record
+        return record
+
+    root_record = visit(serialized.root)
+    emitted: dict = {}
+    nodes: list = []
+
+    def emit(record):
+        identity, node, children = record
+        hit = emitted.get(identity)
+        if hit is not None:
+            return hit
+        child_indices = tuple(emit(child) for child in children)
+        out = SerializedNode(
+            kind=node.kind,
+            sort=node.sort,
+            op_indices=node.op_indices,
+            value=node.value,
+            symbol=node.symbol,
+            children=child_indices,
+        )
+        index = len(nodes)
+        nodes.append(out)
+        emitted[identity] = index
+        return index
+
+    root = emit(root_record)
+    return SerializedCvc5TermV2(2, root, tuple(nodes))
 
 
 @lru_cache(maxsize=200000)

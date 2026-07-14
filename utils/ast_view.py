@@ -271,9 +271,9 @@ def _serialized_target_pattern(root: Any) -> dict[str, Any]:
     without needing a program-specific solver/state cache.  Keep this traversal
     deliberately isomorphic to :func:`term_to_pattern`.
     """
-    from interpreter.utils.utils_cvc5 import HollowCvc5Term, NUM_TO_KIND
+    from interpreter.utils.cvc5_serde import SerializedCvc5TermV2
 
-    if not isinstance(root, HollowCvc5Term):
+    if not isinstance(root, SerializedCvc5TermV2):
         raise ValueError("native predicate pickle has no serialized cvc5 term")
     captures: dict[tuple[Any, str], str] = {}
 
@@ -288,13 +288,14 @@ def _serialized_target_pattern(root: Any) -> dict[str, Any]:
         return captures[key]
 
     def walk(node: Any, depth: int) -> dict[str, Any]:
-        if not isinstance(node, HollowCvc5Term):
+        if not isinstance(node, SerializedCvc5TermV2):
             raise ValueError("native predicate pickle has a malformed cvc5 term")
         try:
-            kind = NUM_TO_KIND[node.op]
+            kind = Kind[node.node.kind]
         except Exception as exc:
             raise ValueError(
-                f"native predicate pickle has unsupported cvc5 op {node.op!r}"
+                "native predicate pickle has unsupported cvc5 kind "
+                f"{node.node.kind!r}"
             ) from exc
         if kind in (Kind.CONST_INTEGER, Kind.CONST_BITVECTOR):
             return {"const": int(node.value)}
