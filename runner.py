@@ -9,19 +9,25 @@ Architecture:
     Per-input concretization and execution run in Rust.
 """
 import argparse
-import hashlib
+from contextlib import ExitStack
 import json
 import multiprocessing
 import pickle
 import struct
-import shutil
 import time
 from pathlib import Path
 from multiprocessing.connection import wait as wait_for_process_message
 import functools
 import os
 
-from swoosh_cli.layout import current_layout, first_existing, legacy_input_dir
+from swoosh_cli.layout import current_layout
+from swoosh_cli.trace_contract import (
+    TraceBundle,
+    TraceContractError,
+    TraceOutputPlan,
+    TraceState,
+    native_runtime_fingerprint,
+)
 
 from interpreter.errors import AssertViolation, AssumeViolation
 from interpreter.utils.debug_log import DebugLogger
@@ -71,7 +77,27 @@ def _reject_legacy_engine(engine: str):
         _legacy_python_runtime_disabled(f"engine={engine!r}")
 
 
-def _build_loop_header_live(test_path):
+def _admit_runtime_generation(
+    expected_fingerprint: str | None,
+    *,
+    read_trace: bool,
+    full_trace: bool,
+) -> str:
+    """Require the exec'd runner to match its parent's producer generation."""
+    current = native_runtime_fingerprint(
+        read_trace=read_trace,
+        full_trace=full_trace,
+    )
+    if expected_fingerprint is not None and expected_fingerprint != current:
+        raise RuntimeError(
+            "interpreter runtime changed between Swoosh launch and child "
+            "admission: expected "
+            f"{expected_fingerprint}, got {current}"
+        )
+    return current
+
+
+def _build_loop_header_live(test_path, *, package_outputs=None):
     """Load loop header → live variable names from compiled package metadata.
 
     Returns dict {block_name: [var_name, ...]} suitable for swoosh_interp.lower().
@@ -79,12 +105,20 @@ def _build_loop_header_live(test_path):
     pkg_dir = test_path.parent
     name = test_path.stem
     try:
-        live_in_path = pkg_dir / f"{name}_live_in.pkl"
-        loops_path = pkg_dir / f"{name}_loops.pkl"
-        if not live_in_path.exists() or not loops_path.exists():
-            return None
-        live_in = pickle.load(open(live_in_path, 'rb'))
-        loops = pickle.load(open(loops_path, 'rb'))
+        if package_outputs is None:
+            live_in_path = pkg_dir / f"{name}_live_in.pkl"
+            loops_path = pkg_dir / f"{name}_loops.pkl"
+            if not live_in_path.exists() or not loops_path.exists():
+                return None
+            live_in = pickle.loads(live_in_path.read_bytes())
+            loops = pickle.loads(loops_path.read_bytes())
+        else:
+            live_in_bytes = package_outputs.get(f"{name}_live_in.pkl")
+            loops_bytes = package_outputs.get(f"{name}_loops.pkl")
+            if live_in_bytes is None or loops_bytes is None:
+                return None
+            live_in = pickle.loads(live_in_bytes)
+            loops = pickle.loads(loops_bytes)
         result = {}
         for proc, proc_loops in loops.items():
             proc_live = live_in.get(proc, {})
@@ -97,7 +131,7 @@ def _build_loop_header_live(test_path):
         return None
 
 
-def _build_loop_metadata(test_path):
+def _build_loop_metadata(test_path, *, package_outputs=None):
     """Load loop nesting metadata from the compiled package.
 
     Returns a dict with three keys ready for ``swoosh_interp.lower``:
@@ -113,15 +147,22 @@ def _build_loop_metadata(test_path):
     pkg_dir = test_path.parent
     name = test_path.stem
     try:
-        loops_path = pkg_dir / f"{name}_loops.pkl"
-        parents_path = pkg_dir / f"{name}_loop_parents.pkl"
-        btl_path = pkg_dir / f"{name}_block_to_loop.pkl"
-        for p in (loops_path, parents_path, btl_path):
-            if not p.exists():
+        filenames = (
+            f"{name}_loops.pkl",
+            f"{name}_loop_parents.pkl",
+            f"{name}_block_to_loop.pkl",
+        )
+        if package_outputs is None:
+            paths = tuple(pkg_dir / filename for filename in filenames)
+            if any(not path.exists() for path in paths):
                 return None
-        loops = pickle.load(open(loops_path, 'rb'))
-        parents = pickle.load(open(parents_path, 'rb'))
-        btl = pickle.load(open(btl_path, 'rb'))
+            values = tuple(pickle.loads(path.read_bytes()) for path in paths)
+        else:
+            encoded = tuple(package_outputs.get(filename) for filename in filenames)
+            if any(value is None for value in encoded):
+                return None
+            values = tuple(pickle.loads(value) for value in encoded)
+        loops, parents, btl = values
 
         # Flatten across procedures.  The package only ever has one
         # entry procedure after inlining, but the dicts are still
@@ -197,7 +238,7 @@ def _build_trace_name_tables(program, entry):
     return var_names, block_names
 
 
-def _package_manifest_mode(test_path):
+def _package_manifest_mode(test_path, *, package_manifest=None):
     """Semantics mode recorded in the package build manifest, or None.
 
     Reads ``<pkg_dir>/<name>.manifest.json`` written by ``tools/compile.py``.
@@ -210,14 +251,19 @@ def _package_manifest_mode(test_path):
 
     if test_path is None:
         return None
-    manifest_path = Path(test_path).parent / f"{Path(test_path).stem}.manifest.json"
-    if not manifest_path.exists():
-        return None
-    try:
-        with open(manifest_path) as fp:
-            manifest = json.load(fp)
-    except (json.JSONDecodeError, OSError):
-        return None
+    if package_manifest is None:
+        manifest_path = (
+            Path(test_path).parent / f"{Path(test_path).stem}.manifest.json"
+        )
+        if not manifest_path.exists():
+            return None
+        try:
+            with open(manifest_path) as fp:
+                manifest = json.load(fp)
+        except (json.JSONDecodeError, OSError):
+            return None
+    else:
+        manifest = package_manifest
     flag = manifest.get("integer_encoding")
     if flag is None:
         return None
@@ -259,7 +305,14 @@ class PreparedNativeProgram:
     lowering.
     """
 
-    def __init__(self, program, *, test_path=None, compiled=None):
+    def __init__(
+        self,
+        program,
+        *,
+        test_path=None,
+        compiled=None,
+        package_publication=None,
+    ):
         from interpreter.parser.declaration import (
             AxiomDeclaration,
             ImplementationDeclaration,
@@ -277,6 +330,16 @@ class PreparedNativeProgram:
         # on the block list. The pass is a no-op for SMACK-generated input.
         desugar_while_statements(self.program)
         self.test_path = Path(test_path) if test_path is not None else None
+        self.package_manifest = (
+            package_publication.manifest
+            if package_publication is not None
+            else None
+        )
+        self.package_outputs = (
+            {output.name: output.content for output in package_publication.outputs}
+            if package_publication is not None
+            else None
+        )
 
         impl_decls = [
             d for d in program.declarations
@@ -323,7 +386,10 @@ class PreparedNativeProgram:
         self.semantics_mode = detect_semantics_mode(self.program)
         _check_semantics_mode(
             self.semantics_mode,
-            _package_manifest_mode(self.test_path),
+            _package_manifest_mode(
+                self.test_path,
+                package_manifest=self.package_manifest,
+            ),
             getattr(compiled, "mode", None) if compiled is not None else None,
             context=(f"package {self.test_path}" if self.test_path is not None
                      else f"program entry {self.impl_decl_name!r}"),
@@ -337,8 +403,12 @@ class PreparedNativeProgram:
 
         try:
             if self.test_path is not None:
-                lh_live = _build_loop_header_live(self.test_path)
-                loop_meta = _build_loop_metadata(self.test_path)
+                lh_live = _build_loop_header_live(
+                    self.test_path, package_outputs=self.package_outputs
+                )
+                loop_meta = _build_loop_metadata(
+                    self.test_path, package_outputs=self.package_outputs
+                )
                 return swoosh_interp.lower(self.program, lh_live, loop_meta,
                                            mode=self.semantics_mode)
             return swoosh_interp.lower(self.program, mode=self.semantics_mode)
@@ -391,9 +461,16 @@ class PreparedNativeProgram:
         }
 
 
-def prepare_native(program, *, test_path=None, compiled=None):
+def prepare_native(
+    program, *, test_path=None, compiled=None, package_publication=None
+):
     """Prepare reusable static state for high-throughput native execution."""
-    return PreparedNativeProgram(program, test_path=test_path, compiled=compiled)
+    return PreparedNativeProgram(
+        program,
+        test_path=test_path,
+        compiled=compiled,
+        package_publication=package_publication,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -554,14 +631,17 @@ def _emit_block_probe_statuses(input_name, explored):
         print(f"[{status}] input={input_name} block={label!r}")
 
 
-def _load_shared(test_path, engine):
+def _load_shared(test_path, engine, *, package_publication):
     """Load program + compile bytecode once in the parent process."""
     global _SHARED_PROGRAM, _SHARED_COMPILED, _SHARED_PREPARED, _SHARED_FIELD_SIZES
     global _INJECTED_ASSERTS
     _reject_legacy_engine(engine)
 
-    with open(test_path, 'rb') as f:
-        _SHARED_PROGRAM = pickle.load(f)
+    program_output = next(
+        output for output in package_publication.outputs
+        if output.name == Path(test_path).name
+    )
+    _SHARED_PROGRAM = pickle.loads(program_output.content)
 
     if _INJECT_ASSERT_SPECS or _INJECT_ASSERT_AST_SPECS or _PROBE_BLOCK_SPECS:
         import json as _json
@@ -604,7 +684,7 @@ def _load_shared(test_path, engine):
     _SHARED_FIELD_SIZES = get_bpl_field_sizes(test_path.parent, program=_SHARED_PROGRAM)
 
     try:
-        import swoosh_interp
+        __import__("swoosh_interp")
     except ImportError as exc:
         raise ImportError(
             "Rust native interpreter not built. Run: "
@@ -615,7 +695,11 @@ def _load_shared(test_path, engine):
     # mode is threaded to swoosh_interp.lower and cross-checked against the
     # package manifest in ONE place (loop-header/loop-metadata loading is
     # identical — see PreparedNativeProgram._lower_program).
-    _SHARED_PREPARED = prepare_native(_SHARED_PROGRAM, test_path=test_path)
+    _SHARED_PREPARED = prepare_native(
+        _SHARED_PROGRAM,
+        test_path=test_path,
+        package_publication=package_publication,
+    )
     _SHARED_COMPILED = _SHARED_PREPARED.compiled
 
 
@@ -944,10 +1028,15 @@ def run_native(program, program_inputs, test_name, input_name, raw_log_path,
 def process_single_input(input_file, test_name, test_path, engine='native',
                          force=False, full_trace=False, no_read_trace=False,
                          program=None, field_sizes=None, compiled=None,
-                         prepared=None, debug_logger=None):
-    """Process a single input file with the chosen engine.
-    Returns (input_name, coverage_dict, explored_blocks) or None if skipped.
-    If program/field_sizes/compiled are provided, uses them instead of loading from disk."""
+                         prepared=None, debug_logger=None,
+                         trace_output_plan: TraceOutputPlan | None = None):
+    """Process one input selected by the parent's immutable output plan.
+
+    Cache selection happens once, in :func:`main`.  This worker therefore
+    always replaces the selected input's output pair instead of applying an
+    independent existence-based skip rule.  ``force`` remains in the public
+    signature for compatibility with direct callers.
+    """
     try:
         _reject_legacy_engine(engine)
         if program is None:
@@ -965,29 +1054,29 @@ def process_single_input(input_file, test_name, test_path, engine='native',
             field_sizes = get_bpl_field_sizes(test_path.parent, program=program)
         program_inputs = parse_input_file(input_file, field_sizes=field_sizes)
 
-        trace_dir = current_layout().trace_dir(test_name)
+        trace_dir = (
+            trace_output_plan.trace_dir
+            if trace_output_plan is not None
+            else current_layout().trace_dir(test_name)
+        )
         trace_dir.mkdir(parents=True, exist_ok=True)
-        explored_path = trace_dir / f"{input_name}.explored_blocks.txt"
-        raw_log_path = trace_dir / f"{input_name}.trace.raw.zst"
-        init_raw_log_path = trace_dir / f"{input_name}.init.raw.zst"
+        if trace_output_plan is not None:
+            raw_log_path, explored_path = trace_output_plan.output_paths(
+                Path(input_file).name
+            )
+            init_raw_log_path = trace_output_plan.init_output_path(
+                Path(input_file).name
+            )
+        else:
+            explored_path = trace_dir / f"{input_name}.explored_blocks.txt"
+            raw_log_path = trace_dir / f"{input_name}.trace.raw.zst"
+            init_raw_log_path = trace_dir / f"{input_name}.init.raw.zst"
 
-        has_trace = raw_log_path.exists() and raw_log_path.stat().st_size > 0
-        if not force and explored_path.exists() and has_trace:
-            debug.event("exec", "input_skip_existing",
-                        explored_path=explored_path, raw_log_path=raw_log_path)
-            print(f"Skipping input file: {input_file} (already explored)")
-            with open(explored_path) as f:
-                explored = {line.strip() for line in f if line.strip()}
-            cov = compute_coverage(program, explored)
-            if cov:
-                unreachable = cov.get('unreachable_blocks', 0)
-                rblk = f" (reachable: {cov['reachable_block_pct']}%)" if unreachable else ""
-                print(f"[coverage] {input_name}: {cov['blocks_covered']}/{cov['blocks_total']} blocks ({cov['block_pct']}%){rblk}, "
-                      f"{cov['stmts_covered']}/{cov['stmts_total']} stmts ({cov['stmt_pct']}%)")
-            return (input_name, cov, explored)
-
-        for p in (raw_log_path, init_raw_log_path):
-            if p.exists() and not explored_path.exists():
+        # A raw trace and explored-block marker are one logical output.  Remove
+        # both before replacement so a failed run cannot pair new partial raw
+        # bytes with an old completion marker.
+        for p in (raw_log_path, init_raw_log_path, explored_path):
+            if p.exists() or p.is_symlink():
                 p.unlink()
 
         try:
@@ -1047,7 +1136,7 @@ def process_single_input(input_file, test_name, test_path, engine='native',
                       f"block_visited={'true' if visited else 'false'}")
 
         with open(explored_path, "w") as f:
-            for block in explored:
+            for block in sorted(explored):
                 f.write(f"{block}\n")
 
         cov = compute_coverage(program, explored)
@@ -1066,7 +1155,7 @@ def process_single_input(input_file, test_name, test_path, engine='native',
 
 def _process_input_shared(input_file, test_name, test_path, engine='native',
                           force=False, full_trace=False, no_read_trace=False,
-                          debug_logger=None):
+                          debug_logger=None, trace_output_plan=None):
     """Worker function that uses fork-inherited _SHARED_* globals."""
     return process_single_input(
         input_file, test_name=test_name, test_path=test_path, engine=engine,
@@ -1075,6 +1164,7 @@ def _process_input_shared(input_file, test_name, test_path, engine='native',
         compiled=_SHARED_COMPILED,
         prepared=_SHARED_PREPARED,
         debug_logger=debug_logger,
+        trace_output_plan=trace_output_plan,
     )
 
 
@@ -1094,7 +1184,7 @@ def _run_worker_to_conn(worker_func, input_file, conn):
 # Coverage summary
 # ---------------------------------------------------------------------------
 
-def _print_coverage_summary(results, test_name, test_path):
+def _print_coverage_summary(results, test_name, test_path, *, trace_bundle=None):
     """Print aggregate coverage and write coverage.json."""
     per_input = {}
     all_explored = set()
@@ -1126,7 +1216,11 @@ def _print_coverage_summary(results, test_name, test_path):
           f"{agg['stmts_covered']}/{agg['stmts_total']} stmts ({agg['stmt_pct']}%)")
 
     # Write coverage.json
-    trace_dir = current_layout().trace_dir(test_name)
+    trace_dir = (
+        trace_bundle.trace_dir
+        if trace_bundle is not None
+        else current_layout().trace_dir(test_name)
+    )
     trace_dir.mkdir(parents=True, exist_ok=True)
     coverage_data = {
         "per_input": per_input,
@@ -1140,14 +1234,22 @@ def _print_coverage_summary(results, test_name, test_path):
 # CLI entry point
 # ---------------------------------------------------------------------------
 
-def main():
+def _main(publication_stack: ExitStack):
     parser = argparse.ArgumentParser(description='Rust Boogie interpreter runner')
     parser.add_argument('test_pkg_path', type=str, help='Path to the test package')
-    parser.add_argument('--engine', choices=['native', 'python', 'both'], default='native',
-                        help='Interpreter engine to use (python/both are archived)')
+    parser.add_argument('--engine', choices=['native'], default='native',
+                        help='Interpreter engine (native is the only supported runtime)')
     parser.add_argument('--force', action='store_true', help='Force re-interpretation')
     parser.add_argument('--full-trace', action='store_true', help='Write full text trace')
     parser.add_argument('--no-read-trace', action='store_true', help='Skip read tracing')
+    parser.add_argument(
+        '--expected-runtime-fingerprint',
+        default=None,
+        help=(
+            'Parent-computed interpreter producer identity; Swoosh passes '
+            'this to reject an exec that imported a different code generation'
+        ),
+    )
     parser.add_argument('--debug-log',
                         help='Directory for structured debug JSONL sidecar logs')
     parser.add_argument('--debug-categories', default='all',
@@ -1183,9 +1285,24 @@ def main():
                              'after a successful run reports BLOCK_REACHED or '
                              'BLOCK_NOT_REACHED from the explored-block set '
                              '(repeatable)')
+    parser.add_argument('--diagnostic-input', default=None,
+                        metavar='INPUT_PATH',
+                        help='Execute exactly one scratch .input file for an '
+                             'injected assertion or block probe. The file is '
+                             'admitted through the same typed trace recipe as '
+                             'canonical inputs, but is not published as part '
+                             'of the target input corpus.')
     args = parser.parse_args()
     try:
         _reject_legacy_engine(args.engine)
+    except RuntimeError as exc:
+        parser.error(str(exc))
+    try:
+        _admit_runtime_generation(
+            args.expected_runtime_fingerprint,
+            read_trace=not args.no_read_trace,
+            full_trace=args.full_trace,
+        )
     except RuntimeError as exc:
         parser.error(str(exc))
 
@@ -1209,7 +1326,14 @@ def main():
                 f"{type(ex).__name__}: {ex}")
     _PROBE_BLOCK_SPECS.extend(str(b).strip() for b in args.probe_block
                               if str(b).strip())
-    if _INJECT_ASSERT_SPECS or _INJECT_ASSERT_AST_SPECS or _PROBE_BLOCK_SPECS:
+    instrumented_run = bool(
+        _INJECT_ASSERT_SPECS or _INJECT_ASSERT_AST_SPECS or _PROBE_BLOCK_SPECS
+    )
+    if args.diagnostic_input and not instrumented_run:
+        parser.error(
+            '--diagnostic-input requires an injected assertion or block probe'
+        )
+    if instrumented_run:
         # Injection/probe runs must actually execute and never reuse stale
         # results. Assertions mutate the program; passive block probes need
         # one complete execution for an input-scoped observation.
@@ -1218,7 +1342,19 @@ def main():
     test_pkg_dir = Path(args.test_pkg_path)
     test_name = test_pkg_dir.name.removesuffix("_pkg")
     test_path = test_pkg_dir / f"{test_name}.pkl"
-    assert test_path.exists(), f"Test path does not exist: {test_path}"
+    from tools.build_manifest import ValidatedPackagePublication
+    from tools.package_contract import package_publication_lock
+    try:
+        publication_stack.enter_context(
+            package_publication_lock(test_pkg_dir, exclusive=False)
+        )
+        package_publication = ValidatedPackagePublication.open(
+            test_pkg_dir,
+            test_name,
+            capture_outputs=True,
+        )
+    except (OSError, TypeError, ValueError) as exc:
+        parser.error(f"package publication is invalid: {exc}")
     debug_logger = DebugLogger.from_options(
         args.debug_log,
         args.debug_categories,
@@ -1227,70 +1363,111 @@ def main():
     debug_logger.event("exec", "runner_start",
                        test_pkg_path=str(test_pkg_dir), engine=args.engine)
 
-    inline_bpl = first_existing(
-        current_layout().bpl_out_dir / test_name / f"{test_name}_inline.bpl",
-        Path("bpl_out") / test_name / f"{test_name}_inline.bpl",
-    )
-    hash_file = current_layout().trace_dir(test_name) / f"{test_name}.interp.hash"
+    input_directory = current_layout().input_dir(test_name)
     trace_dir = current_layout().trace_dir(test_name)
+    diagnostic_inputs = None
+    if args.diagnostic_input:
+        diagnostic_inputs = (Path(args.diagnostic_input),)
+    selected_inputs = diagnostic_inputs
+    if selected_inputs is None:
+        from swoosh_cli.input_contract import read_input_publication
 
-    if inline_bpl.exists():
-        bpl_hash = hashlib.sha256(inline_bpl.read_bytes()).hexdigest()
-    else:
-        bpl_hash = None
-    debug_logger.event("exec", "runner_context", bpl_hash=bpl_hash)
+        input_publication = publication_stack.enter_context(
+            read_input_publication(
+                input_directory,
+                expected_target=test_name,
+            )
+        )
+        selected_inputs = input_publication.paths
+    try:
+        bundle = TraceBundle.create(
+            test_name,
+            package_dir=test_pkg_dir,
+            input_dir=input_directory,
+            trace_dir=trace_dir,
+            input_paths=selected_inputs,
+            read_trace=not args.no_read_trace,
+            full_trace=args.full_trace,
+        )
+    except (OSError, TraceContractError) as exc:
+        parser.error(str(exc))
+    if bundle.recipe.package_fingerprint != package_publication.fingerprint:
+        parser.error(
+            "package publication changed while constructing the trace recipe"
+        )
+    all_input_files = [
+        input_directory / item.filename for item in bundle.recipe.inputs
+    ]
+
+    # The current recipe owns the canonical raw/marker/init filenames.  Drop
+    # contract-owned outputs for inputs that disappeared before inspecting a
+    # prior manifest, so a corpus shrink cannot leak evidence downstream.
+    removed_outputs = bundle.prune_obsolete_outputs()
+    if removed_outputs:
+        debug_logger.event(
+            "exec",
+            "trace_obsolete_outputs_removed",
+            files=[path.name for path in removed_outputs],
+        )
+
+    inspection = bundle.inspect()
+    debug_logger.event(
+        "exec",
+        "runner_context",
+        package_fingerprint=bundle.recipe.package_fingerprint,
+        native_runtime_fingerprint=bundle.recipe.native_runtime_fingerprint,
+        trace_state=inspection.state.value,
+        trace_reason=inspection.reason,
+    )
     debug_logger.event("unsupported", "support_matrix",
                        summary=support_matrix_summary())
 
-    # Engine mismatch check: clear traces if engine changed
-    engine_file = trace_dir / f"{test_name}.engine"
-    if trace_dir.exists() and engine_file.exists():
-        stored_engine = engine_file.read_text().strip()
-        if stored_engine != args.engine and args.engine != "both":
-            print(f"Engine changed ({stored_engine} → {args.engine}) — clearing old traces in {trace_dir}")
-            shutil.rmtree(trace_dir)
-            trace_dir.mkdir(parents=True, exist_ok=True)
-            mem_trace_dir = Path("mem_ops_traces") / test_name
-            if mem_trace_dir.exists():
-                shutil.rmtree(mem_trace_dir)
+    if inspection.state is TraceState.NOT_APPLICABLE:
+        # An empty corpus publishes the exact empty output set.  A manifest
+        # from an older non-empty corpus must not remain as a plausible commit
+        # marker even though consumers already ignore it.
+        bundle.invalidate_manifest()
+        print(f"No input files found in {input_directory} — tracing not applicable")
+        return
+    if not args.force and inspection.is_ready:
+        print("Skipping interpretation — trace recipe and all outputs match")
+        return
 
-    if not args.force and bpl_hash and hash_file.exists() and trace_dir.exists():
-        stored_hash = hash_file.read_text().strip()
-        if stored_hash == bpl_hash:
-            input_directory_check = first_existing(
-                current_layout().input_dir(test_name),
-                legacy_input_dir(test_name),
-            )
-            input_files_check = list(input_directory_check.glob("*.input"))
-            all_done = all(
-                (trace_dir / f"{p.stem}.explored_blocks.txt").exists()
-                for p in input_files_check
-            )
-            if all_done and input_files_check:
-                print(f"Skipping interpretation — {inline_bpl} unchanged and all inputs complete")
-                exit(0)
-        elif stored_hash != bpl_hash:
-            print(f"Hash mismatch — trashing old trace files in {trace_dir}")
-            shutil.rmtree(trace_dir)
-            trace_dir.mkdir(parents=True, exist_ok=True)
-            mem_trace_dir = Path("mem_ops_traces") / test_name
-            if mem_trace_dir.exists():
-                shutil.rmtree(mem_trace_dir)
+    if args.force or inspection.state is TraceState.STALE:
+        pending_names = {item.filename for item in bundle.recipe.inputs}
+    else:
+        pending_names = set(inspection.pending_inputs)
+    input_files = [path for path in all_input_files if path.name in pending_names]
+    if not input_files:
+        parser.error(
+            f"trace bundle is {inspection.state.value} but has no pending inputs: "
+            f"{inspection.reason}"
+        )
 
-    input_directory = first_existing(
-        current_layout().input_dir(test_name),
-        legacy_input_dir(test_name),
+    # Publication is a parent-owned transaction.  Revoke the old commit and
+    # remove every selected output pair *before* workers parse inputs or start
+    # native execution.  Otherwise an early parse/startup failure can leave an
+    # old pair in place and a later write_manifest() can falsely certify those
+    # bytes under the new package/runtime/input recipe.
+    publication = publication_stack.enter_context(
+        bundle.rebuild(input_file.name for input_file in input_files)
     )
-    input_files = list(input_directory.glob("*.input"))
-    assert len(input_files) > 0, f"No input files found in {input_directory}"
+    worker_output_plan = publication.output_plan()
 
     max_workers = min(max(1, os.cpu_count() - 1), len(input_files))
-    print(f"Using {max_workers} workers for {len(input_files)} inputs (engine={args.engine})")
+    print(
+        f"Using {max_workers} workers for {len(input_files)}/{len(all_input_files)} "
+        f"inputs (engine={args.engine}; {inspection.reason})"
+    )
 
     # Load program + compile bytecode once, then fork workers to share via COW
     assert hasattr(os, 'fork'), "Fork-based multiprocessing required (Linux only)"
     t0 = time.time()
-    _load_shared(test_path, args.engine)
+    _load_shared(
+        test_path,
+        args.engine,
+        package_publication=package_publication,
+    )
     print(f"Loaded program + compiled bytecode in {time.time() - t0:.1f}s (shared via fork)")
     mp_context = multiprocessing.get_context('fork')
     worker_func = functools.partial(
@@ -1298,10 +1475,13 @@ def main():
         test_name=test_name,
         test_path=test_path,
         engine=args.engine,
-        force=args.force,
+        # Selection was validated centrally.  A selected worker must replace
+        # its pair even when this is a non-forced partial resume.
+        force=True,
         full_trace=args.full_trace,
         no_read_trace=args.no_read_trace,
         debug_logger=debug_logger,
+        trace_output_plan=worker_output_plan,
     )
 
     per_input_timeout = int(os.environ.get("SWOOSH_INTERP_TIMEOUT", "60"))
@@ -1429,23 +1609,68 @@ def main():
     for task in active:
         _finish_worker(task, "timeout", None)
 
-    if failed and not results:
-        print("Interpretation did not complete — run again to resume")
-        exit(1)
+    post_inspection = None
+    publication_error = None
+    if instrumented_run or failed or skipped:
+        # Probe/assert injection changes program semantics but writes to the
+        # same diagnostic output paths. Failed/timed-out workers likewise do
+        # not own a complete generation. None of those outputs may certify the
+        # unmodified package recipe.
+        publication.abort()
+    else:
+        try:
+            publication.commit()
+        except TraceContractError as exc:
+            publication_error = str(exc)
+        else:
+            post_inspection = publication.inspect()
+
     if skipped:
         print(f"Skipped {skipped} non-terminating input(s)")
 
+    # A partial resume dispatches only pending inputs.  Include contract-
+    # validated outputs in the aggregate so coverage.json still describes the
+    # whole corpus rather than only this invocation's repaired subset.
+    result_names = {result[0] for result in results}
+    reusable_results = (
+        inspection.valid_inputs
+        if not args.force and inspection.state is not TraceState.STALE
+        else ()
+    )
+    for filename in reusable_results:
+        input_name = Path(filename).stem
+        if input_name in result_names:
+            continue
+        explored_path = bundle.output_paths(filename)[1]
+        with explored_path.open() as stream:
+            explored = {line.strip() for line in stream if line.strip()}
+        results.append(
+            (input_name, compute_coverage(_SHARED_PROGRAM, explored), explored)
+        )
+
     # Coverage summary
     if results:
-        _print_coverage_summary(results, test_name, test_path)
+        _print_coverage_summary(
+            results, test_name, test_path, trace_bundle=bundle
+        )
 
-    if bpl_hash:
-        trace_dir.mkdir(parents=True, exist_ok=True)
-        hash_file.write_text(bpl_hash + "\n")
+    # Coverage reuses explored-block paths from the selected generation, so
+    # it is part of the protected read lifetime too. ExitStack also closes the
+    # publication transaction on every exception above.
+    publication_stack.close()
 
-    # Record which engine produced these traces
-    trace_dir.mkdir(parents=True, exist_ok=True)
-    engine_file.write_text(args.engine + "\n")
+    if failed:
+        print("Interpretation did not complete — run again to resume")
+        raise SystemExit(1)
+    if publication_error is not None:
+        print(f"Interpretation did not produce a complete trace bundle — {publication_error}")
+        raise SystemExit(1)
+    if post_inspection is not None and not post_inspection.is_ready:
+        print(
+            "Interpretation did not produce a complete trace bundle — "
+            f"{post_inspection.reason}"
+        )
+        raise SystemExit(1)
 
     print(f"Done. Engine={args.engine}")
     debug_logger.event("exec", "runner_end",
@@ -1454,6 +1679,12 @@ def main():
                        results=len(results),
                        failed=failed,
                        skipped=skipped)
+
+
+def main():
+    """Run one trace publication with failure-safe transaction cleanup."""
+    with ExitStack() as publication_stack:
+        return _main(publication_stack)
 
 
 if __name__ == '__main__':

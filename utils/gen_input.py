@@ -499,7 +499,7 @@ def _private_inputs_from_requires(proc_decl, bpl_param_names):
 # Public API
 # ---------------------------------------------------------------------------
 
-def generate_template(pkg_path):
+def generate_template(pkg_path, *, program=None):
     """Generate a JSON-serializable template list from a compiled package.
 
     Tries to find and parse the C harness file for accurate names/sizes.
@@ -512,10 +512,10 @@ def generate_template(pkg_path):
     """
     pkg_path = Path(pkg_path)
     name = pkg_path.name.removesuffix("_pkg")
-    program_pkl = pkg_path / f"{name}.pkl"
-
-    with open(program_pkl, 'rb') as f:
-        program = pickle.load(f)
+    if program is None:
+        program_pkl = pkg_path / f"{name}.pkl"
+        with open(program_pkl, 'rb') as f:
+            program = pickle.load(f)
 
     bpl_param_names, impl_decl, proc_decl = _get_bpl_param_names(program)
     assert impl_decl is not None, "No {:entrypoint} implementation found in program"
@@ -539,15 +539,15 @@ def generate_template(pkg_path):
     return _generate_bpl_fallback(program, bpl_param_names, impl_decl, proc_decl)
 
 
-def _load_template_context(pkg_path):
+def _load_template_context(pkg_path, *, program=None):
     """Load template plus enough metadata to render C-style .input files."""
     pkg_path = Path(pkg_path)
     name = pkg_path.name.removesuffix("_pkg")
-    json_template = generate_template(pkg_path)
-
-    program_pkl = pkg_path / f"{name}.pkl"
-    with open(program_pkl, 'rb') as f:
-        program = pickle.load(f)
+    if program is None:
+        program_pkl = pkg_path / f"{name}.pkl"
+        with open(program_pkl, 'rb') as f:
+            program = pickle.load(f)
+    json_template = generate_template(pkg_path, program=program)
     _bpl_param_names, impl_decl, _proc_decl = _get_bpl_param_names(program)
     entry_name = impl_decl.name.rsplit('.cross_product', 1)[0]
 
@@ -769,9 +769,9 @@ def _apply_seed_variant(entries, variant):
             scalar_idx += 1
 
 
-def generate_seed_inputs(pkg_path):
+def generate_seed_inputs(pkg_path, *, program=None):
     """Return deterministic seed .input contents keyed by filename."""
-    ctx = _load_template_context(pkg_path)
+    ctx = _load_template_context(pkg_path, program=program)
     base_entries = _with_havoc_entries(
         ctx["json_template"], ctx["havoc_vars"])
 
