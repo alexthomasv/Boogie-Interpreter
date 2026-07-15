@@ -10,6 +10,7 @@ Architecture:
 """
 import argparse
 from contextlib import ExitStack
+from dataclasses import dataclass
 import json
 import multiprocessing
 import pickle
@@ -842,41 +843,76 @@ def write_trace_binary(path, compact_trace):
 # Native engine
 # ---------------------------------------------------------------------------
 
+#: The native execution status vocabulary. MINTED IN RUST — the PyO3
+#: boundary (native/src/lib.rs) stamps these strings on the result dict; the
+#: interpreter test suite pins this tuple against the Rust source so the two
+#: cannot drift.
+NATIVE_STATUSES = ("ok", "assert_violation", "assume_violation", "step_limit")
+
+
+@dataclass(frozen=True)
+class NativeResult:
+    """Typed view of the dict the Rust VM returns across PyO3.
+
+    The raw dict stays the wire shape (callers with ``return_status=True``
+    receive it untouched); this wrapper is the ONE Python-side reading of
+    its key vocabulary, so consumers stop re-guessing field names.
+    """
+
+    status: str
+    violation_pc: "int | None"
+    violation_block: "str | None"
+    invalid_detail: str
+    invalid_reason: str
+    raw: dict
+
+    @classmethod
+    def from_dict(cls, result) -> "NativeResult":
+        return cls(
+            status=result.get("status", "ok"),
+            violation_pc=result.get("violation_pc"),
+            violation_block=result.get("violation_block"),
+            invalid_detail=(result.get("invalid_detail") or "").strip(),
+            invalid_reason=result.get("invalid_reason") or "assume",
+            raw=result,
+        )
+
+
 def _finish_native_result(result, *, return_status):
     if return_status:
         return result
 
-    status = result.get('status', 'ok')
-    if status == 'assert_violation':
+    native = NativeResult.from_dict(result)
+    if native.status == 'assert_violation':
         raise AssertViolation(
             None,
-            pc=result.get('violation_pc'),
-            block=result.get('violation_block'),
+            pc=native.violation_pc,
+            block=native.violation_block,
             expr_str='<native assertion>',
         )
-    if status == 'assume_violation':
+    if native.status == 'assume_violation':
         # `invalid_detail` (from the native VM) names exactly which assume failed
         # and the concrete values that violated it, e.g.
         #   ($i3 >= 0)  [where $i3=-1]
         # so an agent fixing a stale input knows precisely which precondition to
         # satisfy rather than just "an assume failed somewhere".
-        _detail = (result.get("invalid_detail") or "").strip()
-        _reason = result.get("invalid_reason") or "assume"
-        if _detail:
-            _expr_str = f"the {_reason} condition is false: {_detail}"
+        if native.invalid_detail:
+            _expr_str = (f"the {native.invalid_reason} condition is false: "
+                         f"{native.invalid_detail}")
         else:
-            _expr_str = f"concrete {_reason} failed (no condition detail available)"
+            _expr_str = (f"concrete {native.invalid_reason} failed "
+                         f"(no condition detail available)")
         raise AssumeViolation(
-            result.get('violation_pc'),
-            result.get('violation_block'),
+            native.violation_pc,
+            native.violation_block,
             _expr_str,
-            reason=_reason,
+            reason=native.invalid_reason,
         )
-    if status == 'step_limit':
+    if native.status == 'step_limit':
         raise TimeoutError(
             "native execution step limit reached at "
-            f"pc={result.get('violation_pc')} "
-            f"block={result.get('violation_block')!r}"
+            f"pc={native.violation_pc} "
+            f"block={native.violation_block!r}"
         )
 
     return result['explored_blocks']
