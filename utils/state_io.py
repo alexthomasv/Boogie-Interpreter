@@ -4,6 +4,22 @@ import pickle
 import zlib
 from functools import lru_cache
 
+
+def _key_mints():
+    """The wire-frozen proof-state key mints, resolved lazily.
+
+    Minted ONCE in ``src.state.state_store`` so the spelling cannot fork
+    between this hot path and the driver/StateCache deleters/maskers.
+    Lazy for the same reason ``cached_proof_obligation_id`` lazily imports
+    persistence: ``src.state`` package init reaches back into
+    ``interpreter.utils`` (cvc5 serde), so a module-level import here is a
+    cycle. The module is cached after the first call — per-call cost is a
+    dict lookup, noise against the Redis round-trip these keys gate.
+    """
+    from src.state.state_store import (
+        coi_key_name, state_key_from_id, state_serialized_key_name)
+    return state_key_from_id, coi_key_name, state_serialized_key_name
+
 __all__ = [
     'cached_proof_obligation_id',
     'get_state', 'get_state_batch', 'get_state_only', 'get_state_raw',
@@ -26,10 +42,11 @@ def cached_proof_obligation_id(data: bytes) -> str:
 
 
 def get_state(serialized_state_key: bytes, state_cache):
+    state_key_from_id, coi_key_name, _ = _key_mints()
     proof_obligation_id = cached_proof_obligation_id(serialized_state_key)
     pipe = state_cache.redis_runtime.pipeline()
-    pipe.get(f"state_key_{proof_obligation_id}")
-    pipe.get(f"coi_key_{proof_obligation_id}")
+    pipe.get(state_key_from_id(proof_obligation_id))
+    pipe.get(coi_key_name(proof_obligation_id))
     serialized_state, serialized_coi = pipe.execute()
     if serialized_state:
         state = pickle.loads(zlib.decompress(serialized_state))
@@ -52,12 +69,13 @@ def get_state_batch(serialized_keys, state_cache):
     """
     if not serialized_keys:
         return {}
+    state_key_from_id, coi_key_name, _ = _key_mints()
     keys = list(serialized_keys)
     proof_obligation_ids = [cached_proof_obligation_id(k) for k in keys]
     pipe = state_cache.redis_runtime.pipeline()
     for h in proof_obligation_ids:
-        pipe.get(f"state_key_{h}")
-        pipe.get(f"coi_key_{h}")
+        pipe.get(state_key_from_id(h))
+        pipe.get(coi_key_name(h))
     raw = pipe.execute()
     out = {}
     for i, key in enumerate(keys):
@@ -76,8 +94,9 @@ def get_state_batch(serialized_keys, state_cache):
 
 
 def get_state_only(serialized_state_key: bytes, state_cache):
+    state_key_from_id, _, _ = _key_mints()
     proof_obligation_id = cached_proof_obligation_id(serialized_state_key)
-    serialized_state = state_cache.redis_runtime.get(f"state_key_{proof_obligation_id}")
+    serialized_state = state_cache.redis_runtime.get(state_key_from_id(proof_obligation_id))
     if serialized_state:
         state = pickle.loads(zlib.decompress(serialized_state))
         return state
@@ -106,13 +125,14 @@ def put_state(serialized_state_key: bytes, state, state_cache):
         traceback.print_exc()
         find_unpicklable(state.iterator)
         raise
+    state_key_from_id, coi_key_name, state_serialized_key_name = _key_mints()
     proof_obligation_id = cached_proof_obligation_id(serialized_state_key)
     compressed_state = zlib.compress(serialized_state)
     compressed_coi = zlib.compress(serialized_coi)
     pipe = state_cache.redis_runtime.pipeline()
-    pipe.set(f"state_key_{proof_obligation_id}", compressed_state)
-    pipe.set(f"state_serialized_key_{proof_obligation_id}", serialized_state_key)
-    pipe.set(f"coi_key_{proof_obligation_id}", compressed_coi)
+    pipe.set(state_key_from_id(proof_obligation_id), compressed_state)
+    pipe.set(state_serialized_key_name(proof_obligation_id), serialized_state_key)
+    pipe.set(coi_key_name(proof_obligation_id), compressed_coi)
     pipe.execute()
 
 

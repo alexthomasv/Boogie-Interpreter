@@ -31,8 +31,11 @@ uncompressed bytes (default 64 MiB), which yields ~50 frames for a
 pkcs1-sized trace. Legacy single-frame files are backwards-compatible
 (the reader just sees 1 frame).
 
-This is the only trace format; everything else (compact pickle, compact
-binary v1/v2/v3) was removed.
+SWRL is the only RAW trace format. The SWTR compact-binary v1 writer
+survives in ``interpreter.runner.write_trace_binary`` (the golden-trace
+on-disk contract), and ``src.state.trace_loader._iter_swtr`` still reads
+SWTR v1/2/3 — the v2/3 writers were removed but their artifacts remain
+readable. The compact pickle path was removed entirely.
 """
 
 from __future__ import annotations
