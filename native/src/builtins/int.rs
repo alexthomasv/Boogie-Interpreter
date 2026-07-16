@@ -397,18 +397,14 @@ pub fn exec_binary(fn_id: BuiltinFn, a: &Z, b: &Z) -> ZResult {
 
         // Exact comparisons. In ℤ the prelude defines signed AND unsigned
         // variants identically as (i1 < i2) etc.
-        BuiltinFn::Slt { .. } | BuiltinFn::Ult { .. } => {
-            ZResult::Num(Z::S((ord() == Less) as i64))
-        }
+        BuiltinFn::Slt { .. } | BuiltinFn::Ult { .. } => ZResult::Num(Z::S((ord() == Less) as i64)),
         BuiltinFn::Sle { .. } | BuiltinFn::Ule { .. } => {
             ZResult::Num(Z::S((ord() != Greater) as i64))
         }
         BuiltinFn::Sgt { .. } | BuiltinFn::Ugt { .. } => {
             ZResult::Num(Z::S((ord() == Greater) as i64))
         }
-        BuiltinFn::Sge { .. } | BuiltinFn::Uge { .. } => {
-            ZResult::Num(Z::S((ord() != Less) as i64))
-        }
+        BuiltinFn::Sge { .. } | BuiltinFn::Uge { .. } => ZResult::Num(Z::S((ord() != Less) as i64)),
         BuiltinFn::SltBool { .. } => ZResult::Bool(ord() == Less),
         BuiltinFn::SleBool { .. } => ZResult::Bool(ord() != Greater),
         BuiltinFn::SgtBool { .. } => ZResult::Bool(ord() == Greater),

@@ -2,26 +2,26 @@
 Rust interpreter runner.
 
 Usage:
-    python -m interpreter.runner <test_pkg_path> [--engine=native] [--force] [--full-trace]
+    python -m interpreter.runner <test_pkg_path> [--force] [--full-trace]
 
 Architecture:
     Python still loads pickled Boogie ASTs and performs one-time PyO3 lowering.
     Per-input concretization and execution run in Rust.
 """
 import argparse
+from collections.abc import Mapping
 from contextlib import ExitStack
 from dataclasses import dataclass
 import json
 import multiprocessing
 import pickle
-import struct
 import time
 from pathlib import Path
 from multiprocessing.connection import wait as wait_for_process_message
 import functools
 import os
 
-from swoosh_cli.layout import current_layout
+from swoosh_cli.workspace import Workspace
 from swoosh_cli.trace_contract import (
     TraceBundle,
     TraceContractError,
@@ -42,40 +42,55 @@ from interpreter.utils.static_eval import (
 )
 
 
-def _normalize_engine_result(result: dict, *, engine: str, input_name: str) -> dict:
+def _normalize_engine_result(result: dict, *, input_name: str) -> dict:
+    """Validate and decorate the current Rust result wire.
+
+    Rust owns the status-dependent wire shape.  This boundary may add the two
+    runner labels consumed by Python callers, but it must not invent fields for
+    an older or partial native module.
+    """
+    if type(result) is not dict:
+        raise TypeError(
+            f"native result must be a dict, got {type(result).__name__}")
+    required = {
+        "status", "explored_blocks", "trace_records", "memory_summary",
+        "external_consumed", "exec_ns", "exec_ms", "blocks_explored",
+        "block_sequence_len", "no_trace", "trace_big_skips",
+        "mem_big_folds", "vars", "memory_map_count", "state_ns", "state_ms",
+    }
+    missing = required - result.keys()
+    if missing:
+        raise ValueError(
+            f"native result is missing required fields: {sorted(missing)}")
+    status = result["status"]
+    if status not in NATIVE_STATUSES:
+        raise ValueError(f"native result has unsupported status: {status!r}")
+    if status in {"assert_violation", "assume_violation", "step_limit"}:
+        violation_fields = {"violation_pc", "violation_block"}
+        missing = violation_fields - result.keys()
+        if missing:
+            raise ValueError(
+                "native violation result is missing required fields: "
+                f"{sorted(missing)}")
+    if status == "assume_violation":
+        assume_fields = {"invalid_input", "invalid_reason", "invalid_detail"}
+        missing = assume_fields - result.keys()
+        if missing:
+            raise ValueError(
+                "native assume result is missing required fields: "
+                f"{sorted(missing)}")
+
     out = dict(result)
-    out["engine"] = engine
+    out["engine"] = "native"
     out["input_name"] = input_name
-    out["status"] = out.get("status", "ok")
-    out["explored_blocks"] = set(out.get("explored_blocks") or [])
+    out["explored_blocks"] = set(out["explored_blocks"])
     out.setdefault("violation_pc", None)
     out.setdefault("violation_block", None)
     out.setdefault("message", None)
-    out.setdefault("trace_records", None)
-    out.setdefault("memory_summary", {})
-    if out["status"] == "assume_violation":
-        out["invalid_input"] = True
-        out.setdefault("invalid_reason", "assume")
-    else:
-        out.setdefault("invalid_input", False)
-        out.setdefault("invalid_reason", None)
+    out.setdefault("invalid_input", False)
+    out.setdefault("invalid_reason", None)
+    out.setdefault("invalid_detail", "")
     return out
-
-
-_LEGACY_PYTHON_MESSAGE = (
-    "The Python interpreter runtime has been archived at "
-    "archive/legacy_python/runtime/python and is no longer an active engine. "
-    "Use the Rust native engine."
-)
-
-
-def _legacy_python_runtime_disabled(feature: str):
-    raise RuntimeError(f"{feature} is deprecated. {_LEGACY_PYTHON_MESSAGE}")
-
-
-def _reject_legacy_engine(engine: str):
-    if engine != "native":
-        _legacy_python_runtime_disabled(f"engine={engine!r}")
 
 
 def _admit_runtime_generation(
@@ -240,55 +255,61 @@ def _build_trace_name_tables(program, entry):
 
 
 def _package_manifest_mode(test_path, *, package_manifest=None):
-    """Semantics mode recorded in the package build manifest, or None.
-
-    Reads ``<pkg_dir>/<name>.manifest.json`` written by ``tools/compile.py``.
-    Returns "int"/"bv" from the ``integer_encoding`` key, or None when the
-    manifest (or the key — legacy pre-mode packages) is absent.
-    """
+    """Return the mandatory semantics mode from a current package manifest."""
     import json
 
     from interpreter.utils.integer_encoding import mode_from_integer_encoding
 
     if test_path is None:
-        return None
+        raise ValueError("package semantics mode requires a package path")
     if package_manifest is None:
         manifest_path = (
             Path(test_path).parent / f"{Path(test_path).stem}.manifest.json"
         )
         if not manifest_path.exists():
-            return None
-        try:
-            with open(manifest_path) as fp:
-                manifest = json.load(fp)
-        except (json.JSONDecodeError, OSError):
-            return None
+            raise FileNotFoundError(
+                f"package manifest is missing: {manifest_path}")
+        with open(manifest_path) as fp:
+            manifest = json.load(fp)
     else:
         manifest = package_manifest
-    flag = manifest.get("integer_encoding")
-    if flag is None:
-        return None
+    if not isinstance(manifest, Mapping):
+        raise TypeError("package manifest must be a mapping")
+    if "integer_encoding" not in manifest:
+        raise ValueError("package manifest is missing integer_encoding")
+    flag = manifest["integer_encoding"]
+    if type(flag) is not bool:
+        raise TypeError("package manifest integer_encoding must be bool")
     return mode_from_integer_encoding(flag)
 
 
-def _check_semantics_mode(ast_mode, manifest_mode, compiled_mode, *, context):
-    """FAIL LOUDLY if any two PRESENT semantics-mode tags disagree.
+_MODE_NOT_APPLICABLE = object()
+_SEMANTICS_MODES = frozenset({"int", "bv"})
 
-    The three tags are: content-derived from the loaded AST
-    (``detect_integer_encoding``), the package manifest's
-    ``integer_encoding`` key, and the mode baked into an already-compiled
-    program (``swoosh_interp`` wrapper / ``.swcp``). Absent tags (legacy
-    packages / manifests) are skipped — absence cannot disagree.
-    """
-    tags = {
-        "ast": ast_mode,
-        "manifest": manifest_mode,
-        "compiled": compiled_mode,
+
+def _check_semantics_mode(
+    ast_mode,
+    *,
+    context,
+    manifest_mode=_MODE_NOT_APPLICABLE,
+    compiled_mode=_MODE_NOT_APPLICABLE,
+):
+    """Require every applicable semantics tag and reject disagreement."""
+    tags = {"ast": ast_mode}
+    if manifest_mode is not _MODE_NOT_APPLICABLE:
+        tags["manifest"] = manifest_mode
+    if compiled_mode is not _MODE_NOT_APPLICABLE:
+        tags["compiled"] = compiled_mode
+    malformed = {
+        name: mode for name, mode in tags.items()
+        if mode not in _SEMANTICS_MODES
     }
-    present = {k: v for k, v in tags.items() if v is not None}
-    if len(set(present.values())) > 1:
+    if malformed:
         raise RuntimeError(
-            f"semantics-mode mismatch for {context}: {present} — the package "
+            f"semantics mode is missing or invalid for {context}: {malformed}")
+    if len(set(tags.values())) > 1:
+        raise RuntimeError(
+            f"semantics-mode mismatch for {context}: {tags} — the package "
             "on disk, the loaded AST and/or the pre-lowered bytecode were "
             "produced under different integer encodings. Rebuild the package "
             "('./swoosh build <name>') and any .swcp so all tags agree; "
@@ -385,15 +406,29 @@ class PreparedNativeProgram:
         # lowered/serialized with). Any disagreement is a hard error.
         from interpreter.utils.integer_encoding import detect_semantics_mode
         self.semantics_mode = detect_semantics_mode(self.program)
-        _check_semantics_mode(
-            self.semantics_mode,
+        manifest_mode = (
             _package_manifest_mode(
                 self.test_path,
                 package_manifest=self.package_manifest,
-            ),
-            getattr(compiled, "mode", None) if compiled is not None else None,
+            )
+            if self.test_path is not None
+            else _MODE_NOT_APPLICABLE
+        )
+        if compiled is None:
+            compiled_mode = _MODE_NOT_APPLICABLE
+        else:
+            try:
+                compiled_mode = compiled.mode
+            except AttributeError as exc:
+                raise TypeError(
+                    "compiled native program is missing its semantics mode"
+                ) from exc
+        _check_semantics_mode(
+            self.semantics_mode,
             context=(f"package {self.test_path}" if self.test_path is not None
                      else f"program entry {self.impl_decl_name!r}"),
+            manifest_mode=manifest_mode,
+            compiled_mode=compiled_mode,
         )
 
         self.compiled = compiled if compiled is not None else self._lower_program()
@@ -402,25 +437,16 @@ class PreparedNativeProgram:
     def _lower_program(self):
         import swoosh_interp
 
-        try:
-            if self.test_path is not None:
-                lh_live = _build_loop_header_live(
-                    self.test_path, package_outputs=self.package_outputs
-                )
-                loop_meta = _build_loop_metadata(
-                    self.test_path, package_outputs=self.package_outputs
-                )
-                return swoosh_interp.lower(self.program, lh_live, loop_meta,
-                                           mode=self.semantics_mode)
-            return swoosh_interp.lower(self.program, mode=self.semantics_mode)
-        except TypeError as exc:
-            if "mode" not in str(exc):
-                raise
-            raise RuntimeError(
-                "Installed Rust native module is too old: lower() has no "
-                "semantics-mode parameter. Rebuild with: "
-                "cd interpreter/native && maturin develop --release"
-            ) from exc
+        if self.test_path is not None:
+            lh_live = _build_loop_header_live(
+                self.test_path, package_outputs=self.package_outputs
+            )
+            loop_meta = _build_loop_metadata(
+                self.test_path, package_outputs=self.package_outputs
+            )
+            return swoosh_interp.lower(self.program, lh_live, loop_meta,
+                                       mode=self.semantics_mode)
+        return swoosh_interp.lower(self.program, mode=self.semantics_mode)
 
     def _build_native_meta(self):
         """Build static metadata for Rust-side per-input concretization."""
@@ -507,37 +533,45 @@ _INJECTED_ASSERTS = {}        # final_pc -> {kind, expr, block, requested_pc}
 _INJECT_ASSERT_KINDS = frozenset({"predicate", "carrier_guard"})
 
 
-def _normalize_inject_assert_ast_specs(rows):
-    """Normalize pickle rows to ``(pc, expr_ast, kind)`` triples.
+def _validate_inject_assert_ast_specs(rows):
+    """Validate the exact ``(pc, expression, kind)`` pickle wire."""
+    from interpreter.parser.expression import Expression
 
-    Two-element rows are the legacy predicate form. Three-element rows may
-    explicitly identify a normal predicate or the reachability carrier guard.
-    """
-    normalized = []
-    for index, row in enumerate(rows or ()):
-        if not isinstance(row, (tuple, list)) or len(row) not in (2, 3):
+    if type(rows) is not list:
+        raise ValueError("inject-assert-ast: payload must be a list")
+    validated = []
+    for index, row in enumerate(rows):
+        if type(row) is not tuple or len(row) != 3:
             raise ValueError(
                 "inject-assert-ast: row "
-                f"{index} must be (pc, expr_ast) or (pc, expr_ast, kind)")
-        pc, expr_ast = row[:2]
-        kind = "predicate" if len(row) == 2 else str(row[2]).strip()
+                f"{index} must be (pc, expr_ast, kind)")
+        pc, expr_ast, kind = row
+        if type(pc) is not int:
+            raise ValueError(
+                f"inject-assert-ast: row {index} pc must be int")
+        if not isinstance(expr_ast, Expression):
+            raise ValueError(
+                f"inject-assert-ast: row {index} expression must be a "
+                "Boogie Expression")
+        if type(kind) is not str:
+            raise ValueError(
+                f"inject-assert-ast: row {index} kind must be str")
         if kind not in _INJECT_ASSERT_KINDS:
             allowed = "|".join(sorted(_INJECT_ASSERT_KINDS))
             raise ValueError(
                 f"inject-assert-ast: row {index} kind must be {allowed}, "
                 f"got {kind!r}")
-        normalized.append((int(pc), expr_ast, kind))
-    return normalized
+        validated.append(row)
+    return validated
 
 
-def inject_asserts(program, assert_specs, block_probes, ast_specs=(),
+def inject_asserts(program, assert_specs, block_probes, ast_specs=None,
                    where="before"):
     """Mutate ``program`` in place, inserting requested asserts; return the
     final-pc map (the program is renumbered by the insertions).
 
     ``assert_specs`` are ``(pc, expr_text)`` pairs whose text is parsed.
-    ``ast_specs`` are ``(pc, expr_ast)`` legacy pairs or
-    ``(pc, expr_ast, kind)`` triples carrying a PRE-BUILT Boogie expression
+    ``ast_specs`` are ``(pc, expr_ast, kind)`` triples carrying a PRE-BUILT Boogie expression
     AST (an ``interpreter.parser.expression`` node) — injected verbatim, with
     NO text parse. ``kind`` is ``predicate`` or ``carrier_guard`` and is
     retained in the result metadata and execution verdict. This is the
@@ -580,7 +614,8 @@ def inject_asserts(program, assert_specs, block_probes, ast_specs=(),
         if pc not in pc_to_stmt:
             raise ValueError(f"inject-assert: pc {pc} is not a statement pc")
         work.append((pc, ("text", str(text)), "predicate", pc_to_block[pc]))
-    for pc, expr_ast, kind in _normalize_inject_assert_ast_specs(ast_specs):
+    ast_rows = [] if ast_specs is None else ast_specs
+    for pc, expr_ast, kind in _validate_inject_assert_ast_specs(ast_rows):
         if pc not in pc_to_stmt:
             raise ValueError(
                 f"inject-assert-ast: pc {pc} is not a statement pc")
@@ -632,12 +667,10 @@ def _emit_block_probe_statuses(input_name, explored):
         print(f"[{status}] input={input_name} block={label!r}")
 
 
-def _load_shared(test_path, engine, *, package_publication):
+def _load_shared(test_path, *, package_publication):
     """Load program + compile bytecode once in the parent process."""
     global _SHARED_PROGRAM, _SHARED_COMPILED, _SHARED_PREPARED, _SHARED_FIELD_SIZES
     global _INJECTED_ASSERTS
-    _reject_legacy_engine(engine)
-
     program_output = next(
         output for output in package_publication.outputs
         if output.name == Path(test_path).name
@@ -802,43 +835,6 @@ def compute_coverage(program, explored_blocks):
     }
 
 
-def write_trace_binary(path, compact_trace):
-    """Write a compact trace dict in the legacy streaming binary format.
-
-    This compatibility writer is still used by golden trace tests and older
-    trace readers.  New execution paths may use the raw v2 format, but v1 is a
-    stable on-disk contract for pickled compact traces.
-    """
-    import zstandard as zstd
-
-    categories = [
-        (0, "pc_values"),
-        (1, "block_values"),
-        (2, "op_values"),
-        (3, "pc_registry"),
-        (4, "block_registry"),
-    ]
-
-    total = compact_trace.get("total", 0)
-    cctx = zstd.ZstdCompressor(level=3, threads=-1)
-    with open(path, "wb") as fh:
-        with cctx.stream_writer(fh) as writer:
-            writer.write(b"SWTR")
-            writer.write(struct.pack("<BQ", 1, total))
-            for cat_id, section_name in categories:
-                section = compact_trace.get(section_name, {})
-                writer.write(struct.pack("<BI", cat_id, len(section)))
-                for key_str, members in section.items():
-                    key_bytes = key_str.encode() if isinstance(key_str, str) else key_str
-                    writer.write(struct.pack("<H", len(key_bytes)))
-                    writer.write(key_bytes)
-                    writer.write(struct.pack("<I", len(members)))
-                    for member in members:
-                        writer.write(struct.pack("<H", len(member)))
-                        writer.write(member)
-            writer.write(b"DONE")
-
-
 # ---------------------------------------------------------------------------
 # Native engine
 # ---------------------------------------------------------------------------
@@ -868,12 +864,19 @@ class NativeResult:
 
     @classmethod
     def from_dict(cls, result) -> "NativeResult":
+        status = result["status"]
         return cls(
-            status=result.get("status", "ok"),
+            status=status,
             violation_pc=result.get("violation_pc"),
             violation_block=result.get("violation_block"),
-            invalid_detail=(result.get("invalid_detail") or "").strip(),
-            invalid_reason=result.get("invalid_reason") or "assume",
+            invalid_detail=(
+                result["invalid_detail"].strip()
+                if status == "assume_violation" else ""
+            ),
+            invalid_reason=(
+                result["invalid_reason"]
+                if status == "assume_violation" else ""
+            ),
             raw=result,
         )
 
@@ -918,22 +921,29 @@ def _finish_native_result(result, *, return_status):
     return result['explored_blocks']
 
 
-def run_native(program, program_inputs, test_name, input_name, raw_log_path,
-               extra_data=None, log_read=True, compiled=None, no_trace=False,
-               init_raw_log_path=None, return_status=False,
+def run_native(program, program_inputs, input_name, raw_log_path, *,
+               log_read=True, compiled=None, no_trace=False,
+               return_status=False,
                debug_logger=None, prepared=None,
-               return_memory_summary=True, validate_handoff=True,
+               return_memory_summary=True,
                quiet=True, max_steps=0, return_scalar_summary=False,
                return_raw_memory=False):
-    """Run the Rust native interpreter.
-
-    ``raw_log_path`` is the ``.trace.raw.zst`` the Rust VM writes its
-    execution records to.  ``init_raw_log_path`` is accepted for old callers
-    but no separate Python-init trace is produced in the Rust-only runtime.
+    """Run the current Rust interpreter with canonical ``ProgramInputs``.
 
     Returns ``explored_blocks`` by default. With ``return_status=True``, returns
     the native result dict including ``status`` and any violation metadata.
     """
+    from interpreter.utils.inputs import ProgramInputs
+
+    if type(program_inputs) is not ProgramInputs:
+        raise TypeError(
+            "run_native requires ProgramInputs; raw input dictionaries are "
+            "unsupported")
+    if prepared is not None and compiled is not None:
+        raise ValueError("pass prepared or compiled, not both")
+    if prepared is not None and prepared.program is not program:
+        raise ValueError("prepared native program does not own this program")
+
     try:
         import swoosh_interp
     except ImportError:
@@ -947,80 +957,36 @@ def run_native(program, program_inputs, test_name, input_name, raw_log_path,
                 raw_log_path=raw_log_path, no_trace=no_trace,
                 log_read=log_read, prepared=prepared is not None,
                 return_memory_summary=return_memory_summary,
-                validate_handoff=validate_handoff,
-                init_raw_log_path=init_raw_log_path,
                 quiet=quiet,
                 return_scalar_summary=return_scalar_summary)
-
-    if not hasattr(swoosh_interp, "execute_inputs"):
-        raise RuntimeError(
-            "Installed Rust native module is too old: execute_inputs is missing. "
-            "Rebuild with: cd interpreter/native && maturin develop --release"
-        )
 
     if prepared is None:
         prepared = prepare_native(program, compiled=compiled)
         compiled = prepared.compiled
     else:
-        program = prepared.program
-        if compiled is None:
-            compiled = prepared.compiled
-
-    if compiled is None:
-        from interpreter.utils.integer_encoding import detect_semantics_mode
-        compiled = swoosh_interp.lower(program,
-                                       mode=detect_semantics_mode(program))
-
-    ext_data = extra_data
-    if ext_data is None and hasattr(program_inputs, "extra_data"):
-        ext_data = program_inputs.extra_data
+        compiled = prepared.compiled
 
     env_updates = debug.native_env()
     old_env = {key: os.environ.get(key) for key in env_updates}
     try:
         os.environ.update(env_updates)
-        try:
-            result = swoosh_interp.execute_inputs(
-                compiled,
-                prepared.native_meta,
-                program_inputs,
-                str(raw_log_path),
-                extra_data=ext_data,
-                log_read=log_read,
-                no_trace=no_trace,
-                return_memory_summary=return_memory_summary,
-                quiet=quiet,
-                max_steps=max_steps,
-                return_scalar_summary=return_scalar_summary,
-                return_raw_memory=return_raw_memory,
-                # The runner never reads the per-entry block sequence and on
-                # long runs it is tens of millions of PyStrings — skip it.
-                return_block_sequence=False,
-            )
-        except TypeError as exc:
-            msg = str(exc)
-            if ("return_scalar_summary" not in msg
-                    and "return_raw_memory" not in msg
-                    and "return_block_sequence" not in msg):
-                raise
-            if return_scalar_summary or return_raw_memory:
-                raise RuntimeError(
-                    "Installed Rust native module is too old for "
-                    "return_scalar_summary/return_raw_memory. Rebuild with: "
-                    "cd interpreter/native && maturin develop --release"
-                ) from exc
-            result = swoosh_interp.execute_inputs(
-                compiled,
-                prepared.native_meta,
-                program_inputs,
-                str(raw_log_path),
-                extra_data=ext_data,
-                log_read=log_read,
-                no_trace=no_trace,
-                return_memory_summary=return_memory_summary,
-                quiet=quiet,
-                max_steps=max_steps,
-            )
+        result = swoosh_interp.execute_inputs(
+            compiled,
+            prepared.native_meta,
+            program_inputs,
+            str(raw_log_path),
+            extra_data=program_inputs.extra_data,
+            log_read=log_read,
+            no_trace=no_trace,
+            return_memory_summary=return_memory_summary,
+            quiet=quiet,
+            max_steps=max_steps,
+            return_scalar_summary=return_scalar_summary,
+            return_raw_memory=return_raw_memory,
+            # The runner never reads the per-entry block sequence and on
+            # long runs it is tens of millions of PyStrings — skip it.
+            return_block_sequence=False,
+        )
     finally:
         for key, old in old_env.items():
             if old is None:
@@ -1028,7 +994,7 @@ def run_native(program, program_inputs, test_name, input_name, raw_log_path,
             else:
                 os.environ[key] = old
 
-    result = _normalize_engine_result(result, engine="native", input_name=input_name)
+    result = _normalize_engine_result(result, input_name=input_name)
     result["init_ms"] = 0.0
     result["handoff_ms"] = result.get("state_ms", 0.0)
     result["prepared"] = True
@@ -1038,16 +1004,16 @@ def run_native(program, program_inputs, test_name, input_name, raw_log_path,
         "exec",
         "engine_end",
         engine="native",
-        status=result.get("status", "ok"),
-        explored_blocks=len(result.get("explored_blocks") or []),
-        trace_records=result.get("trace_records"),
-        exec_ms=result.get("exec_ms"),
-        state_ms=result.get("state_ms"),
+        status=result["status"],
+        explored_blocks=len(result["explored_blocks"]),
+        trace_records=result["trace_records"],
+        exec_ms=result["exec_ms"],
+        state_ms=result["state_ms"],
         init_ms=0.0,
         handoff_ms=result.get("handoff_ms"),
         prepared=True,
         rust_input_state=True,
-        blocks_explored=result.get("blocks_explored"),
+        blocks_explored=result["blocks_explored"],
         max_steps=max_steps,
         violation_pc=result.get("violation_pc"),
         violation_block=result.get("violation_block"),
@@ -1061,8 +1027,8 @@ def run_native(program, program_inputs, test_name, input_name, raw_log_path,
 # Single-input processing
 # ---------------------------------------------------------------------------
 
-def process_single_input(input_file, test_name, test_path, engine='native',
-                         force=False, full_trace=False, no_read_trace=False,
+def process_single_input(input_file, test_name, test_path, *,
+                         no_read_trace=False,
                          program=None, field_sizes=None, compiled=None,
                          prepared=None, debug_logger=None,
                          trace_output_plan: TraceOutputPlan | None = None):
@@ -1070,18 +1036,16 @@ def process_single_input(input_file, test_name, test_path, engine='native',
 
     Cache selection happens once, in :func:`main`.  This worker therefore
     always replaces the selected input's output pair instead of applying an
-    independent existence-based skip rule.  ``force`` remains in the public
-    signature for compatibility with direct callers.
+    independent existence-based skip rule.
     """
     try:
-        _reject_legacy_engine(engine)
         if program is None:
             with open(test_path, 'rb') as file:
                 program = pickle.load(file)
 
         input_name = Path(str(input_file)).stem
         debug = (debug_logger or DebugLogger.disabled()).bind(
-            input_name=input_name, engine=engine)
+            input_name=input_name, engine="native")
         debug.event("exec", "input_start", input_file=str(input_file))
 
         print(f"Processing input file: {input_file}")
@@ -1093,7 +1057,7 @@ def process_single_input(input_file, test_name, test_path, engine='native',
         trace_dir = (
             trace_output_plan.trace_dir
             if trace_output_plan is not None
-            else current_layout().trace_dir(test_name)
+            else Workspace.from_env().target_paths(test_name).traces
         )
         trace_dir.mkdir(parents=True, exist_ok=True)
         if trace_output_plan is not None:
@@ -1117,12 +1081,10 @@ def process_single_input(input_file, test_name, test_path, engine='native',
 
         try:
             explored = run_native(
-                program, program_inputs, test_name, input_name,
+                program, program_inputs, input_name,
                 raw_log_path=raw_log_path,
-                init_raw_log_path=init_raw_log_path,
-                extra_data=program_inputs.extra_data,
                 log_read=not no_read_trace,
-                compiled=compiled,
+                compiled=compiled if prepared is None else None,
                 debug_logger=debug,
                 prepared=prepared,
             )
@@ -1189,13 +1151,13 @@ def process_single_input(input_file, test_name, test_path, engine='native',
         raise
 
 
-def _process_input_shared(input_file, test_name, test_path, engine='native',
-                          force=False, full_trace=False, no_read_trace=False,
+def _process_input_shared(input_file, test_name, test_path, *,
+                          no_read_trace=False,
                           debug_logger=None, trace_output_plan=None):
     """Worker function that uses fork-inherited _SHARED_* globals."""
     return process_single_input(
-        input_file, test_name=test_name, test_path=test_path, engine=engine,
-        force=force, full_trace=full_trace, no_read_trace=no_read_trace,
+        input_file, test_name=test_name, test_path=test_path,
+        no_read_trace=no_read_trace,
         program=_SHARED_PROGRAM, field_sizes=_SHARED_FIELD_SIZES,
         compiled=_SHARED_COMPILED,
         prepared=_SHARED_PREPARED,
@@ -1255,7 +1217,7 @@ def _print_coverage_summary(results, test_name, test_path, *, trace_bundle=None)
     trace_dir = (
         trace_bundle.trace_dir
         if trace_bundle is not None
-        else current_layout().trace_dir(test_name)
+        else Workspace.from_env().target_paths(test_name).traces
     )
     trace_dir.mkdir(parents=True, exist_ok=True)
     coverage_data = {
@@ -1273,8 +1235,6 @@ def _print_coverage_summary(results, test_name, test_path, *, trace_bundle=None)
 def _main(publication_stack: ExitStack):
     parser = argparse.ArgumentParser(description='Rust Boogie interpreter runner')
     parser.add_argument('test_pkg_path', type=str, help='Path to the test package')
-    parser.add_argument('--engine', choices=['native'], default='native',
-                        help='Interpreter engine (native is the only supported runtime)')
     parser.add_argument('--force', action='store_true', help='Force re-interpretation')
     parser.add_argument('--full-trace', action='store_true', help='Write full text trace')
     parser.add_argument('--no-read-trace', action='store_true', help='Skip read tracing')
@@ -1308,7 +1268,7 @@ def _main(publication_stack: ExitStack):
                              '--probe-block (observation-only).')
     parser.add_argument('--inject-assert-ast', default=None,
                         metavar='PICKLE_PATH',
-                        help='Path to a pickle of [(pc:int, expr_ast)] or '
+                        help='Path to a pickle of '
                              '[(pc:int, expr_ast, kind)] Boogie expression '
                              'ASTs to inject verbatim; kind is predicate or '
                              'carrier_guard — '
@@ -1329,10 +1289,6 @@ def _main(publication_stack: ExitStack):
                              'canonical inputs, but is not published as part '
                              'of the target input corpus.')
     args = parser.parse_args()
-    try:
-        _reject_legacy_engine(args.engine)
-    except RuntimeError as exc:
-        parser.error(str(exc))
     try:
         _admit_runtime_generation(
             args.expected_runtime_fingerprint,
@@ -1355,7 +1311,7 @@ def _main(publication_stack: ExitStack):
             with open(args.inject_assert_ast, 'rb') as _f:
                 loaded = pickle.load(_f)
             _INJECT_ASSERT_AST_SPECS.extend(
-                _normalize_inject_assert_ast_specs(loaded))
+                _validate_inject_assert_ast_specs(loaded))
         except Exception as ex:
             parser.error(
                 f"--inject-assert-ast could not load {args.inject_assert_ast!r}: "
@@ -1397,10 +1353,11 @@ def _main(publication_stack: ExitStack):
         run_id=f"{test_name}-{int(time.time())}",
     ).bind(test_name=test_name, command="runner")
     debug_logger.event("exec", "runner_start",
-                       test_pkg_path=str(test_pkg_dir), engine=args.engine)
+                       test_pkg_path=str(test_pkg_dir), engine="native")
 
-    input_directory = current_layout().input_dir(test_name)
-    trace_dir = current_layout().trace_dir(test_name)
+    target_paths = Workspace.from_env().target_paths(test_name)
+    input_directory = target_paths.inputs
+    trace_dir = target_paths.traces
     diagnostic_inputs = None
     if args.diagnostic_input:
         diagnostic_inputs = (Path(args.diagnostic_input),)
@@ -1493,7 +1450,7 @@ def _main(publication_stack: ExitStack):
     max_workers = min(max(1, os.cpu_count() - 1), len(input_files))
     print(
         f"Using {max_workers} workers for {len(input_files)}/{len(all_input_files)} "
-        f"inputs (engine={args.engine}; {inspection.reason})"
+        f"inputs (engine=native; {inspection.reason})"
     )
 
     # Load program + compile bytecode once, then fork workers to share via COW
@@ -1501,7 +1458,6 @@ def _main(publication_stack: ExitStack):
     t0 = time.time()
     _load_shared(
         test_path,
-        args.engine,
         package_publication=package_publication,
     )
     print(f"Loaded program + compiled bytecode in {time.time() - t0:.1f}s (shared via fork)")
@@ -1510,11 +1466,6 @@ def _main(publication_stack: ExitStack):
         _process_input_shared,
         test_name=test_name,
         test_path=test_path,
-        engine=args.engine,
-        # Selection was validated centrally.  A selected worker must replace
-        # its pair even when this is a non-forced partial resume.
-        force=True,
-        full_trace=args.full_trace,
         no_read_trace=args.no_read_trace,
         debug_logger=debug_logger,
         trace_output_plan=worker_output_plan,
@@ -1708,9 +1659,9 @@ def _main(publication_stack: ExitStack):
         )
         raise SystemExit(1)
 
-    print(f"Done. Engine={args.engine}")
+    print("Done. Engine=native")
     debug_logger.event("exec", "runner_end",
-                       engine=args.engine,
+                       engine="native",
                        inputs=len(input_files),
                        results=len(results),
                        failed=failed,

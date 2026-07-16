@@ -1,10 +1,9 @@
 """Program input parsing and array/field metadata extraction."""
 
-import json
 import os
 import re
 from collections import defaultdict
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 
 from interpreter.parser.declaration import ImplementationDeclaration
 from interpreter.parser.statement import CallStatement
@@ -98,21 +97,34 @@ class Input:
 
 
 class ProgramInputs:
-    """Parsed program inputs from a .input file."""
+    """Canonical input payload passed to the native interpreter.
+
+    Shadow lanes are explicit data, not derived aliases. If the compiled
+    program exposes ``name.shadow`` for a supplied input, ``variables`` must
+    contain a separate ``Input`` under that exact key with the same payload
+    kind. The native boundary rejects omitted or structurally mismatched
+    shadow rows.
+    """
 
     def __init__(self, variables: dict[str, Input], extra_data: bytes | None = None):
-        self.variables = variables
+        if type(variables) is not dict:
+            raise TypeError("ProgramInputs.variables must be a dict")
+        for name, value in variables.items():
+            if type(name) is not str or not name:
+                raise TypeError(
+                    "ProgramInputs variable names must be non-empty strings")
+            if type(value) is not Input:
+                raise TypeError(
+                    f"ProgramInputs[{name!r}] must be Input, got "
+                    f"{type(value).__name__}")
+            if value.name != name:
+                raise ValueError(
+                    f"ProgramInputs key {name!r} does not match Input.name "
+                    f"{value.name!r}")
+        if extra_data is not None and type(extra_data) is not bytes:
+            raise TypeError("ProgramInputs.extra_data must be bytes or None")
+        self.variables = dict(variables)
         self.extra_data = extra_data
-
-    def with_shadows(self) -> dict[str, Input]:
-        """Return variables dict with legacy shadow copies for public variables."""
-        result = dict(self.variables)
-        for name, inp in self.variables.items():
-            if name.endswith(".shadow"):
-                continue
-            if not inp.private:
-                result[f"{name}.shadow"] = replace(inp, name=f"{name}.shadow")
-        return result
 
 
 def input_contract_from_requires(proc_decl, input_names=None) -> tuple[set[str], set[str]]:
@@ -313,35 +325,3 @@ def gather_ptr_aliases(proc):
                 aliases[this] = first
                 aliases[f"{this}.shadow"] = f"{first}.shadow"
     return aliases
-
-
-# ── Legacy JSON input parsing ────────────────────────────────────────────
-
-def parse_inputs(input_json) -> ProgramInputs:
-    """Parse a legacy JSON input file into ProgramInputs.
-
-    Kept for backward compatibility with existing tests and .json input files.
-    New code should use input_parser.parse_input_file() for .input files.
-    """
-    with open(input_json, 'r') as f:
-        raw = json.load(f)
-
-    variables = {}
-    extra_data = None
-
-    for entry in raw:
-        if 'extra_data' in entry:
-            extra_data = bytes.fromhex(entry['extra_data'])
-            continue
-
-        name = entry['var']
-        inp = Input(
-            name=name,
-            private=entry['private'],
-            value=entry.get('value'),
-            buffers=entry.get('buffers'),
-            struct=entry.get('struct'),
-        )
-        variables[name] = inp
-
-    return ProgramInputs(variables=variables, extra_data=extra_data)

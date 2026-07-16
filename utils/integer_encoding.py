@@ -1,10 +1,8 @@
 """SMACK integer-encoding detection and the interpreter semantics-mode tag.
 
-Canonical, dependency-light home for :func:`detect_integer_encoding` — it is
-imported by BOTH the PyPy compile stage (``tools/compile.py``, which cannot
-import cvc5) and the CPython verify/trace stages (via
-``interpreter.utils.utils_cvc5``, which re-exports it for its existing
-consumers). Keep this module stdlib + parser-AST only.
+Canonical, dependency-light home for :func:`detect_integer_encoding`, imported
+directly by both the PyPy compile stage and the CPython verify/trace stages.
+Keep this module stdlib + parser-AST only.
 
 The semantics mode is content-derived from the program (never guessed from
 flags): SMACK >= 2.8.0 always emits ``type i32 = int``; the truthful signal

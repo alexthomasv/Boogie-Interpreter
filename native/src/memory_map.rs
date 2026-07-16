@@ -53,6 +53,7 @@ impl Page {
     }
 
     #[inline]
+    #[cfg(test)]
     fn init_count(&self) -> usize {
         self.init.iter().map(|w| w.count_ones() as usize).sum()
     }
@@ -164,12 +165,11 @@ impl MemoryMap {
 
     /// True iff no slot is initialized.
     pub fn is_init_empty(&self) -> bool {
-        self.pages
-            .values()
-            .all(|p| p.init.iter().all(|w| *w == 0))
+        self.pages.values().all(|p| p.init.iter().all(|w| *w == 0))
     }
 
     /// Number of initialized slots.
+    #[cfg(test)]
     pub fn init_len(&self) -> usize {
         self.pages.values().map(|p| p.init_count()).sum()
     }
@@ -457,16 +457,6 @@ impl MemoryMap {
         })
     }
 
-    /// Initialized entries with `addr < bound`.
-    pub fn iter_init_below(&self, bound: i64) -> impl Iterator<Item = (i64, i64)> + '_ {
-        self.iter_init().filter(move |(addr, _)| *addr < bound)
-    }
-
-    /// Initialized entries with `addr >= bound`.
-    pub fn iter_init_from(&self, bound: i64) -> impl Iterator<Item = (i64, i64)> + '_ {
-        self.iter_init().filter(move |(addr, _)| *addr >= bound)
-    }
-
     /// Initialized entries with `start <= addr < end`.
     pub fn iter_init_range(&self, start: i64, end: i64) -> impl Iterator<Item = (i64, i64)> + '_ {
         self.iter_init()
@@ -491,8 +481,16 @@ mod tests {
         fn new(index_bw: u8, element_bw: u8) -> Self {
             Model {
                 entries: BTreeMap::new(),
-                index_mask: if index_bw >= 64 { -1 } else { (1i64 << index_bw) - 1 },
-                element_mask: if element_bw >= 64 { -1 } else { (1i64 << element_bw) - 1 },
+                index_mask: if index_bw >= 64 {
+                    -1
+                } else {
+                    (1i64 << index_bw) - 1
+                },
+                element_mask: if element_bw >= 64 {
+                    -1
+                } else {
+                    (1i64 << element_bw) - 1
+                },
             }
         }
         fn get(&self, addr: i64) -> i64 {
@@ -626,8 +624,9 @@ mod tests {
         dst.copy_range_values(&src, 100, 200, 3);
         // ALL three destination slots initialized; uninit src read as 0.
         let got = map_init_set(&dst);
-        let want: BTreeSet<(i64, i64)> =
-            [(200, 7), (201, 0), (202, 9), (1_000, 42)].into_iter().collect();
+        let want: BTreeSet<(i64, i64)> = [(200, 7), (201, 0), (202, 9), (1_000, 42)]
+            .into_iter()
+            .collect();
         assert_eq!(got, want);
     }
 

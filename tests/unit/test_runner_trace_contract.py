@@ -16,11 +16,7 @@ def test_selected_worker_replaces_output_pair_without_local_skip(
 ):
     trace_root = tmp_path / "traces"
 
-    class _Layout:
-        def trace_dir(self, name):
-            return trace_root / name
-
-    monkeypatch.setattr(runner, "current_layout", lambda: _Layout())
+    monkeypatch.setenv("SWOOSH_OUT_DIR", str(tmp_path))
     monkeypatch.setattr(
         "interpreter.utils.input_parser.parse_input_file",
         lambda *_args, **_kwargs: SimpleNamespace(extra_data=None),
@@ -49,7 +45,6 @@ def test_selected_worker_replaces_output_pair_without_local_skip(
         input_file,
         test_name="demo",
         test_path=tmp_path / "demo.pkl",
-        force=False,
         program=object(),
         field_sizes={},
     )
@@ -58,12 +53,6 @@ def test_selected_worker_replaces_output_pair_without_local_skip(
     assert raw.read_bytes() == b"new-raw"
     assert explored.read_text() == "new-block\n"
     assert result == ("sample", {}, {"new-block"})
-
-
-@pytest.mark.unit
-def test_runner_cli_rejects_archived_python_engine():
-    with pytest.raises(RuntimeError, match="archived"):
-        runner._reject_legacy_engine("python")
 
 
 @pytest.mark.unit
@@ -92,3 +81,11 @@ def test_native_preparation_uses_pinned_package_metadata_bytes(tmp_path):
         test_path,
         package_manifest={"integer_encoding": True},
     ) == "int"
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("manifest", [{}, {"integer_encoding": None}])
+def test_package_manifest_requires_current_semantics_mode(tmp_path, manifest):
+    with pytest.raises((TypeError, ValueError), match="integer_encoding"):
+        runner._package_manifest_mode(
+            tmp_path / "demo.pkl", package_manifest=manifest)

@@ -832,9 +832,14 @@ fn expr_find_var_named(expr: &Expr, var_names: &[String], substr: &str) -> Optio
 /// call fallback, or a const-folded false guard). The VM treats `assume false`
 /// as a failed assertion (vm.rs), so such a block contributes no successor edges.
 fn block_is_dead_end(blk: &Block) -> bool {
-    blk.body
-        .iter()
-        .any(|s| matches!(s, Stmt::Assume { expr: Expr::Bool(false) }))
+    blk.body.iter().any(|s| {
+        matches!(
+            s,
+            Stmt::Assume {
+                expr: Expr::Bool(false)
+            }
+        )
+    })
 }
 
 /// Post-inline dead-block elimination — the Python `DeadBlockEliminationPass`,
@@ -915,4 +920,3 @@ fn dead_block_elim(blocks: &mut Vec<Block>, label_to_block: &mut FxHashMap<Strin
         removed, n
     );
 }
-

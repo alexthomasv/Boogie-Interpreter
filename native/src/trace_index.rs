@@ -353,16 +353,11 @@ fn process_raw_file(
         ));
     }
 
-    let (var_names, block_names, header_consumed) =
-        parse_header_from_frame0(&mmap[frame_ranges[0].clone()])?;
+    let (var_names, block_names) = parse_header_from_frame0(&mmap[frame_ranges[0].clone()])?;
     let var_names = Arc::new(var_names);
     let block_names = Arc::new(block_names);
 
-    let (record_frames, skip_header_bytes_in_first) = if frame_ranges.len() == 1 {
-        (frame_ranges.clone(), header_consumed)
-    } else {
-        (frame_ranges[1..].to_vec(), 0)
-    };
+    let record_frames = frame_ranges[1..].to_vec();
 
     eprintln!(
         "[trace-index] reading {} ({:.2} GB compressed, {} frames, iter_base={})",
@@ -402,16 +397,9 @@ fn process_raw_file(
     drop(batch_tx);
 
     let (frame_tx, frame_rx) = bounded::<FrameJob>(record_frames.len().max(1));
-    for (idx, range) in record_frames.iter().cloned().enumerate() {
+    for range in record_frames.iter().cloned() {
         frame_tx
-            .send(FrameJob {
-                range,
-                skip_bytes: if idx == 0 {
-                    skip_header_bytes_in_first
-                } else {
-                    0
-                },
-            })
+            .send(FrameJob { range })
             .expect("frame channel capacity matches job count");
     }
     drop(frame_tx);
@@ -463,7 +451,6 @@ fn process_raw_file(
 
 struct FrameJob {
     range: std::ops::Range<usize>,
-    skip_bytes: usize,
 }
 
 fn scan_frame_ranges_exact(data: &[u8]) -> io::Result<Vec<std::ops::Range<usize>>> {
@@ -493,7 +480,7 @@ fn scan_frame_ranges_exact(data: &[u8]) -> io::Result<Vec<std::ops::Range<usize>
     Ok(out)
 }
 
-fn parse_header_from_frame0(frame_bytes: &[u8]) -> io::Result<(Vec<String>, Vec<String>, usize)> {
+fn parse_header_from_frame0(frame_bytes: &[u8]) -> io::Result<(Vec<String>, Vec<String>)> {
     let mut reader = zstd::stream::read::Decoder::new(Cursor::new(frame_bytes))?;
     let mut magic = [0u8; 4];
     reader.read_exact(&mut magic)?;
@@ -505,7 +492,7 @@ fn parse_header_from_frame0(frame_bytes: &[u8]) -> io::Result<(Vec<String>, Vec<
     }
     let mut version = [0u8; 1];
     reader.read_exact(&mut version)?;
-    if version[0] != 1 && version[0] != VERSION {
+    if version[0] != VERSION {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("raw log: unsupported version {}", version[0]),
@@ -513,8 +500,14 @@ fn parse_header_from_frame0(frame_bytes: &[u8]) -> io::Result<(Vec<String>, Vec<
     }
     let var_names = read_name_table(&mut reader)?;
     let block_names = read_name_table(&mut reader)?;
-    let header_consumed = header_encoded_size(&var_names, &block_names);
-    Ok((var_names, block_names, header_consumed))
+    let mut trailing = [0u8; 1];
+    if reader.read(&mut trailing)? != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "raw log: frame 0 must contain only the SWRL header",
+        ));
+    }
+    Ok((var_names, block_names))
 }
 
 fn read_name_table<R: Read>(reader: &mut R) -> io::Result<Vec<String>> {
@@ -533,12 +526,6 @@ fn read_name_table<R: Read>(reader: &mut R) -> io::Result<Vec<String>> {
     Ok(names)
 }
 
-fn header_encoded_size(var_names: &[String], block_names: &[String]) -> usize {
-    let table =
-        |names: &[String]| -> usize { 4 + names.iter().map(|name| 2 + name.len()).sum::<usize>() };
-    4 + 1 + table(var_names) + table(block_names)
-}
-
 fn decoder_loop(
     frame_rx: Receiver<FrameJob>,
     chunk_tx: Sender<Vec<u8>>,
@@ -552,22 +539,16 @@ fn decoder_loop(
         let out_len = dctx
             .decompress_to_buffer(&mmap[job.range], &mut out_buf)
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))?;
-        let mut offset = job.skip_bytes;
-        if offset > out_len {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "raw log header skip exceeds decoded frame size",
-            ));
-        }
-        if (out_len - offset) % RECORD_SIZE != 0 {
+        if out_len % RECORD_SIZE != 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
                     "raw log frame has trailing partial record: {} bytes",
-                    (out_len - offset) % RECORD_SIZE
+                    out_len % RECORD_SIZE
                 ),
             ));
         }
+        let mut offset = 0;
         while offset < out_len {
             let take = CHUNK_BYTES.min(out_len - offset);
             let take_aligned = (take / RECORD_SIZE) * RECORD_SIZE;

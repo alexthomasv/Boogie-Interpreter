@@ -8,6 +8,8 @@ violation as a clean run.
 import re
 from pathlib import Path
 
+import pytest
+
 from interpreter.runner import NATIVE_STATUSES, NativeResult
 
 RUST_SRC_DIR = Path(__file__).resolve().parents[1] / "native" / "src"
@@ -37,6 +39,5 @@ def test_from_dict_reads_the_wire_keys():
     assert native.violation_block == "$bb7"
     assert native.invalid_detail.startswith("($i3 >= 0)")
     assert native.raw is raw
-    # defaults for a minimal ok dict
-    ok = NativeResult.from_dict({"explored_blocks": []})
-    assert ok.status == "ok" and ok.invalid_reason == "assume"
+    with pytest.raises(KeyError, match="status"):
+        NativeResult.from_dict({"explored_blocks": []})

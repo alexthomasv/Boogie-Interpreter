@@ -351,7 +351,7 @@ def _run_batch(lane, cases, tmp_path):
     program = make_program(source)
     prepared = prepare_native(program)
     result = run_native(
-        program, scalar_inputs(values), f"kernel_{lane}", "batch",
+        program, scalar_inputs(values), "batch",
         tmp_path / f"kernel_{lane}.raw.zst",
         no_trace=True, log_read=False, return_status=True,
         prepared=prepared, return_scalar_summary=True,

@@ -110,7 +110,6 @@ def test_prepared_native_matches_automatic_native(tmp_path):
     automatic = run_native(
         program,
         inputs,
-        "prepared_auto",
         "input_0",
         tmp_path / "auto.raw.zst",
         no_trace=True,
@@ -120,7 +119,6 @@ def test_prepared_native_matches_automatic_native(tmp_path):
     prepared_result = run_native(
         program,
         inputs,
-        "prepared_native",
         "input_0",
         tmp_path / "prepared.raw.zst",
         no_trace=True,
@@ -154,7 +152,6 @@ def test_native_no_trace_fast_options_skip_files_and_memory_summary(tmp_path):
         result = run_native(
             program,
             scalar_inputs({"$x": 1}),
-            "no_trace_fast",
             "input_0",
             tmp_path / "unused.raw.zst",
             no_trace=True,
@@ -162,7 +159,6 @@ def test_native_no_trace_fast_options_skip_files_and_memory_summary(tmp_path):
             return_status=True,
             prepared=prepared,
             return_memory_summary=False,
-            validate_handoff=False,
             quiet=True,
         )
 

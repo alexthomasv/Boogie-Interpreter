@@ -28,13 +28,13 @@ use vm::ExecutionStatus;
 /// When provided, the interpreter snapshots those variables on each
 /// loop header visit, enabling iteration-aware trace data.
 #[pyfunction]
-#[pyo3(signature = (program, loop_header_live=None, loop_metadata=None, mode=None))]
+#[pyo3(signature = (program, loop_header_live=None, loop_metadata=None, *, mode))]
 fn lower(
     py: Python<'_>,
     program: &Bound<'_, PyAny>,
     loop_header_live: Option<&Bound<'_, PyDict>>,
     loop_metadata: Option<&Bound<'_, PyDict>>,
-    mode: Option<&str>,
+    mode: &str,
 ) -> PyResult<PyObject> {
     let mode = parse_semantics_mode(mode)?;
     let compiled =
@@ -43,11 +43,9 @@ fn lower(
     Ok(Py::new(py, wrapper)?.into_py(py))
 }
 
-/// Parse the Python-side semantics-mode tag ("int"/"bv"; None → Bv, the
-/// pre-mode default so legacy callers keep today's semantics).
-fn parse_semantics_mode(mode: Option<&str>) -> PyResult<opcodes::SemanticsMode> {
-    opcodes::SemanticsMode::from_str_opt(mode)
-        .map_err(pyo3::exceptions::PyValueError::new_err)
+/// Parse the required Python-side semantics-mode tag ("int"/"bv").
+fn parse_semantics_mode(mode: &str) -> PyResult<opcodes::SemanticsMode> {
+    opcodes::SemanticsMode::from_str(mode).map_err(pyo3::exceptions::PyValueError::new_err)
 }
 
 #[pyclass]
@@ -69,12 +67,8 @@ impl CompiledProgramWrapper {
 /// shadowed AST — inlining happens natively in Rust (no Boogie, no reparse).
 /// Used by the differential test harness and the in-memory interpret path.
 #[pyfunction]
-#[pyo3(signature = (program, mode=None))]
-fn inline_lower(
-    py: Python<'_>,
-    program: &Bound<'_, PyAny>,
-    mode: Option<&str>,
-) -> PyResult<PyObject> {
+#[pyo3(signature = (program, mode))]
+fn inline_lower(py: Python<'_>, program: &Bound<'_, PyAny>, mode: &str) -> PyResult<PyObject> {
     let mode = parse_semantics_mode(mode)?;
     let compiled = lowering::inline::inline_lower_program(py, program, None, mode)?;
     let wrapper = CompiledProgramWrapper { inner: compiled };
@@ -87,18 +81,19 @@ fn inline_lower(
 /// Python from the un-inlined program) is baked in so a concrete run needs no
 /// Python-AST-derived native_meta.
 #[pyfunction]
-#[pyo3(signature = (program, path, static_scalars=None, mode=None))]
+#[pyo3(signature = (program, path, static_scalars=None, *, mode))]
 fn inline_lower_to_file(
     py: Python<'_>,
     program: &Bound<'_, PyAny>,
     path: &str,
     static_scalars: Option<&Bound<'_, PyDict>>,
-    mode: Option<&str>,
+    mode: &str,
 ) -> PyResult<()> {
     let mode = parse_semantics_mode(mode)?;
     let compiled = lowering::inline::inline_lower_program(py, program, static_scalars, mode)?;
-    let bytes = bincode::serialize(&compiled)
-        .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("bincode serialize: {}", e)))?;
+    let bytes = bincode::serialize(&compiled).map_err(|e| {
+        pyo3::exceptions::PyValueError::new_err(format!("bincode serialize: {}", e))
+    })?;
     let compressed = zstd::encode_all(&bytes[..], 3)
         .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("zstd compress: {}", e)))?;
     std::fs::write(path, compressed)
@@ -118,9 +113,6 @@ fn load_compiled(py: Python<'_>, path: &str) -> PyResult<PyObject> {
         pyo3::exceptions::PyValueError::new_err(format!("bincode deserialize: {}", e))
     })?;
     compiled.rebuild_lookup_maps();
-    // Packages serialized before the lowering-time assume normalization may
-    // still carry `$isExternal` assumes — normalize on load.
-    lowering::normalize_is_external_assumes(&mut compiled.blocks);
     let wrapper = CompiledProgramWrapper { inner: compiled };
     Ok(Py::new(py, wrapper)?.into_py(py))
 }
@@ -479,9 +471,7 @@ fn execute(
     if !quiet {
         eprintln!(
             "[native] Execution: {:.1?}, {} blocks, {} trace entries",
-            exec_elapsed,
-            vm.explored_count,
-            vm.trace.total
+            exec_elapsed, vm.explored_count, vm.trace.total
         );
     }
     debug_log::event(
@@ -563,10 +553,7 @@ fn execute_inputs(
     if !quiet {
         eprintln!(
             "[native] State: {:.1?}, execution: {:.1?}, {} blocks, {} trace entries",
-            state_elapsed,
-            exec_elapsed,
-            vm.explored_count,
-            vm.trace.total
+            state_elapsed, exec_elapsed, vm.explored_count, vm.trace.total
         );
     }
     debug_log::event(

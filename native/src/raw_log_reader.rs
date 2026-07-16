@@ -73,14 +73,8 @@ const CHUNK_BYTES: usize = RECORD_SIZE * CHUNK_RECORDS;
 
 /// Number of parallel frame-decoder threads. pkcs1's multi-frame trace
 /// has ~50 frames (one per ~64 MiB uncompressed); with 8 decoders we
-/// saturate the 300 MB/s single-frame zstd ceiling 8-fold. Legacy
-/// single-frame files produce just 1 frame, so only 1 decoder runs —
-/// identical throughput to the pre-T2 code path.
+/// saturate the 300 MB/s single-frame zstd ceiling 8-fold.
 const NUM_DECODERS: usize = 8;
-
-/// zstd frame magic number (`ZSTD_MAGICNUMBER`, little-endian on disk).
-/// Used to scan a multi-frame file for frame boundaries.
-const ZSTD_FRAME_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
 
 /// Aggregate flush thresholds across ALL parsers. Each parser gets
 /// `TOTAL / NUM_PARSERS` of each so the global RAM ceiling stays
@@ -126,11 +120,6 @@ struct Counters {
 ///   5. ``NUM_WORKERS`` redis threads drain ``flush_rx`` and execute
 ///      SADD-of-many per key across pipelined batches.
 ///
-/// Legacy single-frame files (written before the frame-flush feature
-/// was added) decompress under a single decoder thread — identical
-/// to pre-T2 behaviour; no performance regression, just no speedup.
-/// Multi-frame files unlock N-way parallel zstd decode, lifting the
-/// single-frame ~300 MB/s decode ceiling.
 pub fn load_raw_log_to_redis(path: &Path, redis_url: &str, iter_id_offset: u32) -> io::Result<u64> {
     let file = File::open(path)?;
     let file_size = file.metadata()?.len();
@@ -143,7 +132,7 @@ pub fn load_raw_log_to_redis(path: &Path, redis_url: &str, iter_id_offset: u32) 
     }
     let mmap_arc: Arc<Mmap> = Arc::new(mmap);
 
-    let frame_ranges = scan_frame_ranges(&mmap_arc);
+    let frame_ranges = scan_frame_ranges(&mmap_arc)?;
     if frame_ranges.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -152,29 +141,13 @@ pub fn load_raw_log_to_redis(path: &Path, redis_url: &str, iter_id_offset: u32) 
     }
 
     // --- Decode frame 0 for the header ---
-    let (var_names, block_names, header_consumed) =
-        parse_header_from_frame0(&mmap_arc[frame_ranges[0].clone()])?;
+    let (var_names, block_names) = parse_header_from_frame0(&mmap_arc[frame_ranges[0].clone()])?;
     let var_names = Arc::new(var_names);
     let block_names = Arc::new(block_names);
     let n_vars = var_names.len();
 
-    // Build the list of record-bearing frame ranges. In a multi-frame
-    // trace, frame 0 is header-only (writer flushes a frame right after
-    // writing the SWRL header) — so `header_consumed == frame 0 length`
-    // and frame 0 contributes no records. In a legacy single-frame
-    // trace, frame 0 contains both header + records — we then treat
-    // frame 0 as a record frame and skip the header bytes when parsing
-    // its decompressed output.
-    let (record_frames, skip_header_bytes_in_first): (Vec<std::ops::Range<usize>>, usize) =
-        if frame_ranges.len() == 1 {
-            // Legacy single-frame: one decoder for the whole file, but
-            // its first ``header_consumed`` bytes of decompressed output
-            // are the header and must be dropped before record parsing.
-            (frame_ranges.clone(), header_consumed)
-        } else {
-            // Multi-frame: frames 1..N are the record frames.
-            (frame_ranges[1..].to_vec(), 0)
-        };
+    // Frame 0 is header-only by contract; every later frame contains records.
+    let record_frames = frame_ranges[1..].to_vec();
 
     let counters = Arc::new(Counters::default());
 
@@ -241,17 +214,9 @@ pub fn load_raw_log_to_redis(path: &Path, redis_url: &str, iter_id_offset: u32) 
     // work-stealing queue (crossbeam bounded) keeps all decoders busy
     // when frames have variable sizes.
     let (frame_tx, frame_rx) = bounded::<FrameJob>(record_frames.len().max(1));
-    for (idx, range) in record_frames.iter().cloned().enumerate() {
-        let skip = if idx == 0 {
-            skip_header_bytes_in_first
-        } else {
-            0
-        };
+    for range in record_frames.iter().cloned() {
         frame_tx
-            .send(FrameJob {
-                range,
-                skip_bytes: skip,
-            })
+            .send(FrameJob { range })
             .expect("frame_tx bounded cap == frames.len(), send can't fail");
     }
     drop(frame_tx);
@@ -341,48 +306,41 @@ pub fn load_raw_log_to_redis(path: &Path, redis_url: &str, iter_id_offset: u32) 
     Ok(total)
 }
 
-/// One frame-decoding task: the byte range within the mmap'd file and
-/// an optional number of *decompressed* bytes to drop at the start
-/// (used only for legacy single-frame files where the SWRL header
-/// sits at the start of the one and only frame).
+/// One record-frame decoding task: the byte range within the mmap'd file.
 struct FrameJob {
     range: std::ops::Range<usize>,
-    skip_bytes: usize,
 }
 
-/// Scan compressed-file bytes for all occurrences of the zstd frame
-/// magic (`0x28B52FFD`). Each occurrence marks the start of a frame;
-/// the next occurrence marks the end of the previous. If only one
-/// magic is found, the file is a single-frame legacy trace.
-///
-/// We drop frames whose compressed-byte size is ``< MIN_REAL_FRAME``
-/// — that catches the trailing zero-content frame some writers leave
-/// when the last record happens to land on a flush boundary (an empty
-/// zstd frame is ~15 bytes). The record-frames we actually want are
-/// tens of KB minimum, so this threshold is comfortably above noise.
-fn scan_frame_ranges(data: &[u8]) -> Vec<std::ops::Range<usize>> {
-    const MIN_REAL_FRAME: usize = 64;
-    let starts: Vec<usize> = memchr::memmem::find_iter(data, &ZSTD_FRAME_MAGIC).collect();
-    if starts.is_empty() {
-        return Vec::new();
+/// Parse concatenated zstd frames with zstd's own frame-size routine.
+fn scan_frame_ranges(data: &[u8]) -> io::Result<Vec<std::ops::Range<usize>>> {
+    let mut out = Vec::new();
+    let mut offset = 0usize;
+    while offset < data.len() {
+        let size = zstd::zstd_safe::find_frame_compressed_size(&data[offset..])
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))?;
+        if size == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "zstd frame reported zero compressed size",
+            ));
+        }
+        let end = offset.checked_add(size).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "zstd frame size overflow")
+        })?;
+        if end > data.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "zstd frame extends past end of file",
+            ));
+        }
+        out.push(offset..end);
+        offset = end;
     }
-    let mut out = Vec::with_capacity(starts.len());
-    for i in 0..starts.len() - 1 {
-        out.push(starts[i]..starts[i + 1]);
-    }
-    out.push(starts[starts.len() - 1]..data.len());
-    // Filter out trailing empty frames.
-    out.retain(|r| r.end - r.start >= MIN_REAL_FRAME);
-    out
+    Ok(out)
 }
 
-/// Decompress frame 0 and parse the SWRL header from its decompressed
-/// prefix. Returns `(var_names, block_names, header_bytes_consumed)`.
-/// `header_bytes_consumed` is the number of *decompressed* bytes the
-/// header occupies — relevant for legacy single-frame files where the
-/// caller needs to skip past the header before record parsing in the
-/// same decompressed stream.
-fn parse_header_from_frame0(frame_bytes: &[u8]) -> io::Result<(Vec<String>, Vec<String>, usize)> {
+/// Decompress frame 0 and require it to contain exactly the SWRL v2 header.
+fn parse_header_from_frame0(frame_bytes: &[u8]) -> io::Result<(Vec<String>, Vec<String>)> {
     let mut reader = zstd::stream::read::Decoder::new(Cursor::new(frame_bytes))?;
 
     let mut magic = [0u8; 4];
@@ -395,7 +353,7 @@ fn parse_header_from_frame0(frame_bytes: &[u8]) -> io::Result<(Vec<String>, Vec<
     }
     let mut ver = [0u8; 1];
     reader.read_exact(&mut ver)?;
-    if ver[0] != 1 && ver[0] != VERSION {
+    if ver[0] != VERSION {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("raw log: unsupported version {}", ver[0]),
@@ -403,21 +361,14 @@ fn parse_header_from_frame0(frame_bytes: &[u8]) -> io::Result<(Vec<String>, Vec<
     }
     let var_names = read_name_table(&mut reader)?;
     let block_names = read_name_table(&mut reader)?;
-
-    // Compute decompressed header length by re-measuring via a counting
-    // reader — simpler than threading a counter through read_name_table.
-    let header_consumed = header_encoded_size(&var_names, &block_names);
-    Ok((var_names, block_names, header_consumed))
-}
-
-/// Exact byte size of the SWRL header as written by raw_log.py
-/// (decompressed).
-fn header_encoded_size(var_names: &[String], block_names: &[String]) -> usize {
-    // MAGIC(4) + VERSION(1) + var_table_len(4) +
-    //   Σ (len u16 + utf8 bytes) + block_table_len(4) + Σ ...
-    let table =
-        |names: &[String]| -> usize { 4 + names.iter().map(|n| 2 + n.len()).sum::<usize>() };
-    4 + 1 + table(var_names) + table(block_names)
+    let mut trailing = [0u8; 1];
+    if reader.read(&mut trailing)? != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "raw log: frame 0 must contain only the SWRL header",
+        ));
+    }
+    Ok((var_names, block_names))
 }
 
 /// Decoder thread: pulls frame jobs off ``frame_rx``, streams each
@@ -450,31 +401,19 @@ fn decoder_loop(
         // contains exactly one frame, which is what bulk decompress
         // wants.
         //
-        // Per-frame error tolerance: if a frame fails to decode (e.g.
-        // trailing empty frame from a writer that happened to roll on
-        // the last record, or a false-positive magic byte inside
-        // compressed data), log and skip it rather than failing the
-        // whole load. We lose at most ~64 MiB of records, which is
-        // negligible against pkcs1's 33 GB uncompressed total.
-        let out_len = match dctx.decompress_to_buffer(frame_slice, &mut out_buf) {
-            Ok(n) => n,
-            Err(e) => {
-                eprintln!(
-                    "[raw-log] WARN skipping frame at {:?} ({} bytes): {}",
-                    job.range,
-                    job.range.end - job.range.start,
-                    e,
-                );
-                continue;
-            }
-        };
-        let mut offset = job.skip_bytes;
-        if offset > out_len {
+        let out_len = dctx
+            .decompress_to_buffer(frame_slice, &mut out_buf)
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))?;
+        if out_len % RECORD_SIZE != 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "raw log: skip_bytes exceeds decoded frame size",
+                format!(
+                    "raw log frame has trailing partial record: {} bytes",
+                    out_len % RECORD_SIZE
+                ),
             ));
         }
+        let mut offset = 0;
 
         while offset + RECORD_SIZE <= out_len {
             let take = std::cmp::min(CHUNK_BYTES, out_len - offset);

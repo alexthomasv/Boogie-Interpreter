@@ -53,7 +53,7 @@ def havoc_inputs(values: Mapping[str, list[int]], *,
     )
 
 
-def run_native_case(source: str, inputs: ProgramInputs | dict | None = None,
+def run_native_case(source: str, inputs: ProgramInputs | None = None,
                     *, tmp_path: Path | None = None,
                     test_name: str = "case",
                     input_name: str = "input_0",
@@ -63,8 +63,7 @@ def run_native_case(source: str, inputs: ProgramInputs | dict | None = None,
         raw_log = Path("native.trace.raw.zst")
         return run_native(
             make_program(source),
-            inputs or {},
-            test_name,
+            inputs or ProgramInputs({}),
             input_name,
             raw_log_path=raw_log,
             no_trace=True,
@@ -84,7 +83,7 @@ def concolic_candidates(source: str, inputs: ProgramInputs,
     pytest.importorskip("swoosh_interp")
     with isolated_cwd(tmp_path):
         program = make_program(source)
-        evaluator = Evaluator(program, test_name, timeout=5, engine="native")
+        evaluator = Evaluator(program, test_name, timeout=5)
         return evaluator.concolic_suggest(
             inputs,
             input_name,
@@ -105,7 +104,7 @@ def symbolic_candidates(source: str, inputs: ProgramInputs,
     pytest.importorskip("swoosh_interp")
     with isolated_cwd(tmp_path):
         program = make_program(source)
-        evaluator = Evaluator(program, test_name, timeout=5, engine="native")
+        evaluator = Evaluator(program, test_name, timeout=5)
         return evaluator.symbolic_explore(
             inputs,
             input_name,

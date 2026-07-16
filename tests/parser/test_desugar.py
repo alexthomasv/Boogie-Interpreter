@@ -193,7 +193,7 @@ implementation foo() returns ()
     assert before == after
 
 
-def test_desugar_followed_by_run_native_executes_loop():
+def test_desugar_followed_by_run_native_executes_loop(tmp_path):
     """End-to-end sanity: a program with a structured ``while`` runs to
     completion under ``run_native`` after the desugar pass (which the
     runner applies automatically)."""
@@ -211,8 +211,8 @@ def test_desugar_followed_by_run_native_executes_loop():
     inputs = ProgramInputs({"n": Input(name="n", private=False, value=4)})
     raw = run_native(
         program, inputs,
-        test_name="t", input_name="t",
-        raw_log_path=None, no_trace=False, log_read=False,
+        input_name="t",
+        raw_log_path=tmp_path / "t.raw.zst", no_trace=False, log_read=False,
         return_status=True, return_scalar_summary=True,
         max_steps=20000,
     )

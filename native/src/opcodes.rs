@@ -150,10 +150,7 @@ pub enum Stmt {
     /// diffprod when corerel reify encounters a nested loop inside
     /// another structured construct. Body must NOT contain
     /// Goto/Return; lowering debug-asserts.
-    While {
-        cond: Expr,
-        body: Vec<Stmt>,
-    },
+    While { cond: Expr, body: Vec<Stmt> },
     /// x := expr (single assignment, most common)
     Assign1 { lhs: VarId, rhs: Expr },
     /// x, y := e1, e2 (multi-assignment)
@@ -280,13 +277,11 @@ pub struct MemMapInfo {
 ///
 /// Step 1 (mode plumbing) only CARRIES this tag; the VM still evaluates with
 /// wrapping semantics in both modes. Step 3 switches evaluation on it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SemanticsMode {
     /// SMACK unbounded-integer encoding (`type i32 = int`, plain `(i1+i2)` prelude).
     Int,
     /// SMACK bit-vector encoding — wrapping algebra is the correct model.
-    /// Default: every pre-mode artifact was built under BV assumptions.
-    #[default]
     Bv,
 }
 
@@ -298,17 +293,14 @@ impl SemanticsMode {
         }
     }
 
-    pub fn from_str_opt(s: Option<&str>) -> Result<Self, String> {
-        match s {
-            None => Ok(SemanticsMode::Bv),
-            Some(v) => match v {
-                "int" => Ok(SemanticsMode::Int),
-                "bv" => Ok(SemanticsMode::Bv),
-                other => Err(format!(
-                    "unknown semantics mode {:?} (expected \"int\" or \"bv\")",
-                    other
-                )),
-            },
+    pub fn from_str(value: &str) -> Result<Self, String> {
+        match value {
+            "int" => Ok(SemanticsMode::Int),
+            "bv" => Ok(SemanticsMode::Bv),
+            other => Err(format!(
+                "unknown semantics mode {:?} (expected \"int\" or \"bv\")",
+                other
+            )),
         }
     }
 }
@@ -358,13 +350,8 @@ pub struct CompiledProgram {
     /// init. Baked into the `.swcp` package so a concrete run is self-contained
     /// (no Python-AST-derived `native_meta.static_scalars` needed). Empty for the
     /// in-memory `lower()` path, which still takes static scalars via native_meta.
-    #[serde(default)]
     pub static_scalars: Vec<(VarId, i64)>,
     /// Integer semantics the program was compiled under (see `SemanticsMode`).
-    /// `#[serde(default)]` documents intent (Bv) for self-describing formats;
-    /// note the bincode `.swcp` format is positional, so a pre-mode `.swcp`
-    /// fails to deserialize LOUDLY rather than silently defaulting.
-    #[serde(default)]
     pub mode: SemanticsMode,
 }
 

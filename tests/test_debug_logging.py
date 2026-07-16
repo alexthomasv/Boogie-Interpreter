@@ -5,6 +5,7 @@ import pytest
 from interpreter.parser.boogie_parser import parse_boogie
 from interpreter.runner import run_native
 from interpreter.utils.debug_log import DebugLogger
+from interpreter.utils.inputs import ProgramInputs
 from interpreter.utils.support_matrix import support_matrix_summary
 
 
@@ -72,8 +73,7 @@ def test_run_native_result_reports_structured_assert(tmp_path, monkeypatch):
 
     result = run_native(
         program,
-        {},
-        "debug_prog",
+        ProgramInputs({}),
         "input_0",
         raw_log_path=tmp_path / "assert.raw.zst",
         no_trace=True,

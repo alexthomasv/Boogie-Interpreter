@@ -10,7 +10,7 @@ Example:
     python3 -m interpreter.utils.coverage_fuzz bearssl_test_pkcs1_i15 --target-pct 95.0
 
 Architecture:
-    1. Load the compiled program from test_packages/<name>_pkg/
+    1. Load the compiled program from the canonical target package
     2. Extract parameter metadata (types, sizes, privacy) from BPL annotations
     3. Build Hypothesis strategies for each parameter (scalars, buffers, structs)
     4. Run Hypothesis with target(block_coverage) to guide exploration
@@ -31,7 +31,7 @@ from interpreter.runner import prepare_native, run_native
 from interpreter.utils.inputs import Input, ProgramInputs, preprocess_external_inputs
 from interpreter.utils.input_parser import get_bpl_field_sizes
 from interpreter.utils.program import find_entry_point
-from swoosh_cli.layout import current_layout, first_existing, legacy_package_dir
+from swoosh_cli.workspace import Workspace
 
 DEFAULT_MAX_STEPS_PER_INPUT = int(
     os.environ.get("SWOOSH_COVERAGE_FUZZ_MAX_STEPS", "100000")
@@ -405,25 +405,20 @@ class CoverageFuzzer:
     """Coverage-guided input generator using Hypothesis target()."""
 
     def __init__(self, name, max_examples=200, target_pct=100.0,
-                 engine='native', max_steps_per_input=None):
-        if engine != "native":
-            raise ValueError("coverage_fuzz is Rust-only; use engine='native'")
+                 max_steps_per_input=None):
         self.name = name
         self.max_examples = max_examples
         self.target_pct = target_pct
-        self.engine = engine
         self.max_steps_per_input = (
             DEFAULT_MAX_STEPS_PER_INPUT
             if max_steps_per_input is None else int(max_steps_per_input)
         )
 
-        self.pkg_path = first_existing(
-            current_layout().package_dir(name),
-            legacy_package_dir(name),
-        )
+        paths = Workspace.from_env().target_paths(name)
+        self.pkg_path = paths.package
         assert self.pkg_path.is_dir(), f"Package not found: {self.pkg_path}"
 
-        self.output_dir = Path("test_input") / name
+        self.output_dir = paths.inputs
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
         # Load program
@@ -457,7 +452,6 @@ class CoverageFuzzer:
 
         # Pre-compile bytecode and static input metadata once.
         self._prepared = prepare_native(self.program)
-        self._compiled = self._prepared.compiled
 
         # Compute total block count
         entry = find_entry_point(self.program)
@@ -470,15 +464,13 @@ class CoverageFuzzer:
             input_name = f"fuzz_{self.run_count}"
             result = run_native(
                 self.program, program_inputs,
-                self.name, input_name,
+                input_name,
                 raw_log_path=self.output_dir / f"{input_name}.trace.raw.zst",
                 log_read=False,
-                compiled=self._compiled,
                 prepared=self._prepared,
                 no_trace=True,
                 return_status=True,
                 return_memory_summary=False,
-                validate_handoff=False,
                 quiet=True,
                 max_steps=self.max_steps_per_input,
             )
@@ -643,7 +635,7 @@ class CoverageFuzzer:
         # Load seed corpus for mutation-based strategies
         self.seed_corpus = self._load_seed_corpus()
 
-        print(f"[coverage-fuzz] Target: {self.name} (engine={self.engine})")
+        print(f"[coverage-fuzz] Target: {self.name}")
         print(f"[coverage-fuzz] Parameters: {len(self.param_info)}")
         print(f"[coverage-fuzz] Total blocks: {self.total_blocks}")
         print(f"[coverage-fuzz] Max examples: {self.max_examples}")

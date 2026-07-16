@@ -139,91 +139,6 @@ def get_serde_stats(*, reset: bool = False) -> dict[str, int | float | dict]:
     return stats
 
 
-_COMPAT_KIND_NUMS = {
-    "EQUAL": 0,
-    "DISTINCT": 1,
-    "AND": 2,
-    "OR": 3,
-    "NOT": 4,
-    "ADD": 5,
-    "MULT": 6,
-    "SUB": 7,
-    "DIVISION": 59,
-    "ITE": 9,
-    "LEQ": 10,
-    "GEQ": 11,
-    "LT": 12,
-    "GT": 13,
-    "IMPLIES": 14,
-    "SELECT": 15,
-    "STORE": 16,
-    "APPLY_UF": 17,
-    "BITVECTOR_ADD": 18,
-    "BITVECTOR_MULT": 19,
-    "INT_TO_BITVECTOR": 20,
-    "BITVECTOR_SIGN_EXTEND": 21,
-    "BITVECTOR_ULT": 22,
-    "BITVECTOR_EXTRACT": 23,
-    "BITVECTOR_ZERO_EXTEND": 24,
-    "BITVECTOR_AND": 25,
-    "BITVECTOR_LSHR": 26,
-    "BITVECTOR_OR": 27,
-    "BITVECTOR_SHL": 28,
-    "BITVECTOR_XOR": 29,
-    "BITVECTOR_SUB": 30,
-    "BITVECTOR_CONCAT": 31,
-    "BITVECTOR_NOT": 32,
-    "BITVECTOR_SLT": 33,
-    "BITVECTOR_SREM": 34,
-    "BITVECTOR_ULE": 35,
-    "BITVECTOR_SGE": 36,
-    "BITVECTOR_UGE": 37,
-    "BITVECTOR_NEG": 38,
-    "BITVECTOR_UDIV": 39,
-    "BITVECTOR_UGT": 40,
-    "BITVECTOR_SGT": 41,
-    "BITVECTOR_ASHR": 42,
-    "BITVECTOR_UREM": 43,
-    "BITVECTOR_SLE": 44,
-    "BITVECTOR_SDIV": 45,
-    "XOR": 46,
-    "CONST_BITVECTOR": 47,
-    "CONST_BOOLEAN": 48,
-    "CONSTANT": 49,
-    "SET_MEMBER": 50,
-    "SET_INSERT": 51,
-    "SET_EMPTY": 52,
-    "CONST_INTEGER": 53,
-    "INTS_MODULUS": 54,
-    "INTS_DIVISION": 55,
-    "NEG": 56,
-    "INTS_MODULUS_TOTAL": 57,
-    "INTS_DIVISION_TOTAL": 58,
-    "DIVISION_TOTAL": 60,
-    "TO_INTEGER": 61,
-    "IS_INTEGER": 62,
-    "BITVECTOR_UBV_TO_INT": 63,
-    "BITVECTOR_SBV_TO_INT": 64,
-    "FORALL": 65,
-    "VARIABLE_LIST": 66,
-    "VARIABLE": 67,
-    "CONST_RATIONAL": 68,
-    "CONST_STRING": 69,
-}
-
-_COMPAT_SORT_NUMS = {
-    "BITVECTOR_SORT": 0,
-    "BOOLEAN_SORT": 1,
-    "INTEGER_SORT": 2,
-    "ARRAY_SORT": 4,
-    "INTERNAL_SORT_KIND": 5,
-    "SET_SORT": 6,
-    "UNINTERPRETED_SORT": 7,
-    "FUNCTION_SORT": 8,
-    "REAL_SORT": 9,
-    "STRING_SORT": 10,
-}
-
 _COMMUTATIVE_KINDS = frozenset(
     {
         "EQUAL",
@@ -309,18 +224,6 @@ class SerializedCvc5TermV2:
         return self.nodes[self.root]
 
     @property
-    def op(self) -> int | None:
-        return _COMPAT_KIND_NUMS.get(self.node.kind)
-
-    @property
-    def type(self) -> int | None:
-        return _COMPAT_SORT_NUMS.get(self.node.sort.kind)
-
-    @property
-    def var_name(self) -> str:
-        return self.node.symbol if self.node.kind in {"CONSTANT", "VARIABLE"} else ""
-
-    @property
     def bitwidth(self) -> int:
         sort = self.node.sort
         if sort.kind == "BITVECTOR_SORT":
@@ -393,12 +296,9 @@ class SerializedCvc5TermV2:
 
     def __repr__(self) -> str:
         return (
-            f"HollowCvc5TermV2(root={self.root}, op={self.op}, "
-            f"children={list(self.node.children)}, var_name={self.var_name!r})"
+            f"SerializedCvc5TermV2(root={self.root}, kind={self.node.kind!r}, "
+            f"children={list(self.node.children)}, symbol={self.node.symbol!r})"
         )
-
-
-HollowCvc5Term = SerializedCvc5TermV2
 
 
 def _sort_signature(sort) -> SerializedSort:
@@ -478,10 +378,6 @@ def term_op_indices(term: Term) -> tuple[int, ...]:
     for i in range(op.getNumIndices()):
         indices.append(int(op[i].getIntegerValue()))
     return tuple(indices)
-
-
-# Private compatibility name for older imports.
-_term_op_indices = term_op_indices
 
 
 def _term_payload(term: Term, kind_name: str):
@@ -685,7 +581,19 @@ def _remember_bound_var(state_cache, name: str, term: Term):
         cache[name] = term
 
 
-def deserialize_cvc5_term(state_cache, root_term: SerializedCvc5TermV2 | Term) -> Term:
+def deserialize_cvc5_term(
+    state_cache,
+    root_term: SerializedCvc5TermV2 | Term,
+    *,
+    free_const_lookup_exclusions: frozenset[str] = frozenset(),
+) -> Term:
+    """Rebuild ``root_term`` in ``state_cache``'s solver.
+
+    ``free_const_lookup_exclusions`` is used when the lookup itself is the
+    source of the serialized term. In particular, a cold worker reading a
+    runtime-overlay constant must rebuild that constant instead of recursively
+    looking up the same overlay key.
+    """
     if isinstance(root_term, Term):
         return root_term
     if not isinstance(root_term, SerializedCvc5TermV2):
@@ -732,7 +640,9 @@ def deserialize_cvc5_term(state_cache, root_term: SerializedCvc5TermV2 | Term) -
             kind = Kind[node.kind]
 
             if node.kind == "CONSTANT":
-                res = _lookup_free_const(state_cache, node)
+                res = None
+                if node.symbol not in free_const_lookup_exclusions:
+                    res = _lookup_free_const(state_cache, node)
                 if res is None:
                     res = solver.mkConst(_sort_from_signature_cached(state_cache, node.sort), node.symbol)
                     _remember_free_const(state_cache, node.symbol, res)

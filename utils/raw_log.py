@@ -19,8 +19,9 @@ On-disk layout (little-endian throughout):
     iter_id(u32) 4 bytes   — context id, or depth for b'I'
   = 25 bytes/record
 
-The byte stream is wrapped in one or more zstd frames, all concatenated
-into a single .raw.zst file. Each frame is 25-byte-record-aligned (the
+The byte stream is wrapped in a header frame followed by zero or more record
+frames, all concatenated into a single .raw.zst file. Each record frame is
+25-byte-record-aligned (the
 writer only closes a frame on record boundaries), so the reader can
 decompress frames independently and concatenate the outputs without
 worrying about records straddling frame boundaries.
@@ -28,14 +29,10 @@ worrying about records straddling frame boundaries.
 Multi-frame output unlocks N-way parallel decompression on the reader
 side — the writer flushes a new frame every ``FRAME_FLUSH_BYTES``
 uncompressed bytes (default 64 MiB), which yields ~50 frames for a
-pkcs1-sized trace. Legacy single-frame files are backwards-compatible
-(the reader just sees 1 frame).
+pkcs1-sized trace. The first frame is always header-only; records begin in
+frame 1.
 
-SWRL is the only RAW trace format. The SWTR compact-binary v1 writer
-survives in ``interpreter.runner.write_trace_binary`` (the golden-trace
-on-disk contract), and ``src.state.trace_loader._iter_swtr`` still reads
-SWTR v1/2/3 — the v2/3 writers were removed but their artifacts remain
-readable. The compact pickle path was removed entirely.
+SWRL v2 is the only trace format accepted by the current toolchain.
 """
 
 from __future__ import annotations
@@ -85,6 +82,7 @@ class RawLogWriter:
         self._flush_threshold = 1 << 20  # 1 MiB
         self.count = 0
         self._header_written = False
+        self._finished = False
         # Uncompressed bytes written to the current zstd frame. When this
         # crosses ``FRAME_FLUSH_BYTES`` we close the frame and start a
         # new one so the reader can parallel-decompress.
@@ -102,7 +100,10 @@ class RawLogWriter:
         ~1 MB of table data vs the gigabytes of record data, so
         dedicating a frame to it is nearly free.
         """
-        assert not self._header_written
+        if self._finished:
+            raise RuntimeError("raw log writer is already finished")
+        if self._header_written:
+            raise RuntimeError("raw log header was already written")
         self._header_written = True
         self._writer.write(MAGIC)
         self._writer.write(bytes([VERSION]))
@@ -116,6 +117,10 @@ class RawLogWriter:
                value: int, iter_id: int) -> None:
         """Append one record.  Values outside signed-i64 range are wrapped
         modulo 2**64 to preserve C-like semantics."""
+        if not self._header_written:
+            raise RuntimeError("raw log header must be written before records")
+        if self._finished:
+            raise RuntimeError("raw log writer is already finished")
         INT64_MIN = -(1 << 63)
         INT64_MAX = (1 << 63) - 1
         if value < INT64_MIN or value > INT64_MAX:
@@ -148,6 +153,11 @@ class RawLogWriter:
         ``zstd.stream_writer.close()`` also closes the underlying file,
         so we only fsync it if still open.
         """
+        if not self._header_written:
+            raise RuntimeError("raw log header must be written before finish")
+        if self._finished:
+            raise RuntimeError("raw log writer is already finished")
+        self._finished = True
         self._flush()
         self._writer.flush(zstd.FLUSH_FRAME)
         self._writer.close()

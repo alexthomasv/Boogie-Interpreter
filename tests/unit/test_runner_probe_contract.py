@@ -66,12 +66,11 @@ def test_text_injection_remains_an_ordinary_predicate():
 @pytest.mark.parametrize(
     ("row", "expected_kind"),
     [
-        (lambda ast: (1, ast), "predicate"),
         (lambda ast: (1, ast, "predicate"), "predicate"),
         (lambda ast: (1, ast, "carrier_guard"), "carrier_guard"),
     ],
 )
-def test_ast_injection_rows_preserve_normalized_kind(row, expected_kind):
+def test_ast_injection_rows_preserve_exact_kind(row, expected_kind):
     program = _program()
     expression = parse_expr("x == 0")
 
@@ -92,13 +91,26 @@ def test_ast_injection_rows_preserve_normalized_kind(row, expected_kind):
     "row",
     [
         (1,),
+        (1, parse_expr("x == 0")),
         (1, object(), "block_probe"),
         (1, object(), ""),
     ],
 )
 def test_ast_injection_rows_reject_invalid_shape_or_kind(row):
     with pytest.raises(ValueError, match="inject-assert-ast: row 0"):
-        runner._normalize_inject_assert_ast_specs([row])
+        runner._validate_inject_assert_ast_specs([row])
+
+
+@pytest.mark.parametrize(
+    "rows",
+    [
+        ((1, parse_expr("x == 0"), "predicate"),),
+        [[1, parse_expr("x == 0"), "predicate"]],
+    ],
+)
+def test_ast_injection_rejects_alternate_container_shapes(rows):
+    with pytest.raises(ValueError, match="inject-assert-ast"):
+        runner.inject_asserts(_program(), [], [], ast_specs=rows)
 
 
 def _prepare_process_test(monkeypatch, tmp_path, *, explored=None,
@@ -107,11 +119,7 @@ def _prepare_process_test(monkeypatch, tmp_path, *, explored=None,
     input_file.write_text("")
     trace_root = tmp_path / "traces"
 
-    class _Layout:
-        def trace_dir(self, name):
-            return trace_root / name
-
-    monkeypatch.setattr(runner, "current_layout", lambda: _Layout())
+    monkeypatch.setenv("SWOOSH_OUT_DIR", str(tmp_path))
     monkeypatch.setattr(
         "interpreter.utils.input_parser.parse_input_file",
         lambda *_args, **_kwargs: SimpleNamespace(extra_data=None),
@@ -149,7 +157,6 @@ def test_successful_run_reports_all_passive_probes_and_typed_survival(
         input_file,
         test_name="sample_program",
         test_path=tmp_path / "sample_program.pkl",
-        force=True,
         program=object(),
         field_sizes={},
     )
@@ -187,7 +194,6 @@ def test_early_termination_emits_no_block_status_and_logs_injection_kind(
         input_file,
         test_name="sample_program",
         test_path=tmp_path / "sample_program.pkl",
-        force=True,
         program=object(),
         field_sizes={},
     )

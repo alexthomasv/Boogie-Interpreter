@@ -1755,7 +1755,11 @@ impl<'a> Engine<'a> {
                 let boundary = self.vm.get_scalar_silent(*dst) + self.vm.get_scalar_silent(*len);
                 self.copy_filtered(*m_ret, *m_src, |addr, boundary| addr >= boundary, boundary);
             }
-            Stmt::If { cond, then_body, else_body } => {
+            Stmt::If {
+                cond,
+                then_body,
+                else_body,
+            } => {
                 // Concolic execution of structured if: pick the branch based
                 // on the concrete value, recurse. Path constraint over
                 // ``cond`` is recorded so the solver can flip branches in a
@@ -1948,10 +1952,9 @@ impl<'a> Engine<'a> {
     fn set_eval_result(&mut self, var_id: VarId, ev: CEval) {
         match ev.value {
             EvalResult::Scalar(v) => self.vm.set_scalar(var_id, v, false),
-            EvalResult::Big(b) => unreachable!(
-                "concolic is BV-gated; Big value {} cannot occur",
-                b
-            ),
+            EvalResult::Big(b) => {
+                unreachable!("concolic is BV-gated; Big value {} cannot occur", b)
+            }
             EvalResult::Bool(b) => self.vm.set_scalar(var_id, b as i64, false),
             EvalResult::MapRef(map_idx) => {
                 let vid = var_id as usize;
@@ -2010,10 +2013,9 @@ impl<'a> Engine<'a> {
                 CEval {
                     value: match value {
                         Value::Scalar(v) => EvalResult::Scalar(v),
-                        Value::Big(b) => unreachable!(
-                            "concolic is BV-gated; Big value {} cannot occur",
-                            b
-                        ),
+                        Value::Big(b) => {
+                            unreachable!("concolic is BV-gated; Big value {} cannot occur", b)
+                        }
                         Value::Map(idx) => EvalResult::MapRef(idx),
                     },
                     sym: self.sym_vars[vid].clone(),
@@ -2023,10 +2025,9 @@ impl<'a> Engine<'a> {
                 value: EvalResult::Scalar(*v),
                 sym: None,
             },
-            Expr::ConstBig(b) => unreachable!(
-                "concolic is BV-gated; ConstBig literal {} cannot occur",
-                b
-            ),
+            Expr::ConstBig(b) => {
+                unreachable!("concolic is BV-gated; ConstBig literal {} cannot occur", b)
+            }
             Expr::Bool(b) => CEval {
                 value: EvalResult::Bool(*b),
                 sym: None,
@@ -2104,7 +2105,7 @@ impl<'a> Engine<'a> {
         if builtins::num_args(fn_id) == 1 {
             let x = self.eval_i64(&args[0]);
             let xv = eval_to_i64(&x.value);
-            let value = builtins::exec_unary(fn_id, xv);
+            let value = builtins::bv::exec_unary(fn_id, xv);
             let sym = x.sym.map(|s| sym_unary_builtin(fn_id, s));
             CEval {
                 value: EvalResult::Scalar(value),
@@ -2115,7 +2116,7 @@ impl<'a> Engine<'a> {
             let b = self.eval_i64(&args[1]);
             let av = eval_to_i64(&a.value);
             let bv = eval_to_i64(&b.value);
-            let (result, is_bool) = builtins::exec_binary(fn_id, av, bv);
+            let (result, is_bool) = builtins::bv::exec_binary(fn_id, av, bv);
             let a_profile_sym = a.sym.clone();
             let b_profile_sym = b.sym.clone();
             self.record_builtin_value_profile(fn_id, &a_profile_sym, av, &b_profile_sym, bv);
@@ -3223,10 +3224,7 @@ fn eval_to_i64(value: &EvalResult) -> i64 {
     match value {
         EvalResult::Scalar(v) => *v,
         EvalResult::Bool(b) => *b as i64,
-        EvalResult::Big(b) => unreachable!(
-            "concolic is BV-gated; Big value {} cannot occur",
-            b
-        ),
+        EvalResult::Big(b) => unreachable!("concolic is BV-gated; Big value {} cannot occur", b),
         EvalResult::MapRef(_) => 0,
     }
 }

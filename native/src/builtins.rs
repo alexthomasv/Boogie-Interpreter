@@ -13,12 +13,6 @@
 pub mod bv;
 pub mod int;
 
-// Legacy surface: unqualified `builtins::exec_*` / `mask` / `to_signed` are the
-// BV semantics (pre-mode default). Concolic (BV-gated) and the kani proofs use
-// these re-exports (`mask`/`to_signed` only under `cfg(kani)`).
-#[allow(unused_imports)]
-pub use bv::{exec_binary, exec_unary, mask, to_signed};
-
 use crate::opcodes::BuiltinFn;
 
 /// Return the number of arguments for a builtin function (mode-independent).

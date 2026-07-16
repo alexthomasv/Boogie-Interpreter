@@ -1,5 +1,5 @@
 use crate::builtins;
-use crate::builtins::int::{Z, ZResult};
+use crate::builtins::int::{ZResult, Z};
 use crate::memory_map::MemoryMap;
 use crate::opcodes::*;
 use crate::trace::{TraceAccumulator, OP_READ, OP_WRITE};
@@ -416,11 +416,6 @@ impl VM {
             };
             self.memory_maps[map_idx].move_range(src_base, dst_base, len);
         }
-    }
-
-    /// Execute the program starting from the entry block.
-    pub fn execute(&mut self, program: &CompiledProgram) -> ExecutionStatus {
-        self.execute_with_limit(program, 0)
     }
 
     /// Execute with an optional instruction/block-entry budget.
@@ -847,7 +842,11 @@ impl VM {
                     dst_map.merge_from(src_map, boundary);
                 }
             }
-            Stmt::If { cond, then_body, else_body } => {
+            Stmt::If {
+                cond,
+                then_body,
+                else_body,
+            } => {
                 // Evaluate condition; pick branch; recursively execute its body.
                 // Both bodies are guaranteed (by lowering) to contain no
                 // terminator stmts, so recursion stays inside this block.
@@ -1156,11 +1155,11 @@ impl VM {
                 if program.mode == SemanticsMode::Bv {
                     if builtins::num_args(*fn_id) == 1 {
                         let x = self.eval_i64(&args[0], program);
-                        EvalResult::Scalar(builtins::exec_unary(*fn_id, x))
+                        EvalResult::Scalar(builtins::bv::exec_unary(*fn_id, x))
                     } else {
                         let a = self.eval_i64(&args[0], program);
                         let b = self.eval_i64(&args[1], program);
-                        let (result, is_bool) = builtins::exec_binary(*fn_id, a, b);
+                        let (result, is_bool) = builtins::bv::exec_binary(*fn_id, a, b);
                         if is_bool {
                             EvalResult::Bool(result != 0)
                         } else {
@@ -1212,12 +1211,8 @@ impl VM {
                             BuiltinFn::Sge { .. } | BuiltinFn::Uge { .. } => {
                                 return EvalResult::Scalar((a >= b) as i64)
                             }
-                            BuiltinFn::BvEq { .. } => {
-                                return EvalResult::Scalar((a == b) as i64)
-                            }
-                            BuiltinFn::BvNe { .. } => {
-                                return EvalResult::Scalar((a != b) as i64)
-                            }
+                            BuiltinFn::BvEq { .. } => return EvalResult::Scalar((a == b) as i64),
+                            BuiltinFn::BvNe { .. } => return EvalResult::Scalar((a != b) as i64),
                             BuiltinFn::SltBool { .. } => return EvalResult::Bool(a < b),
                             BuiltinFn::SleBool { .. } => return EvalResult::Bool(a <= b),
                             BuiltinFn::SgtBool { .. } => return EvalResult::Bool(a > b),
@@ -1251,7 +1246,11 @@ impl VM {
                     // Single cell. bw == ew is the common byte store; bw < ew is a
                     // sub-element store (e.g. $store.i1 of a bool into a byte-addressed
                     // map) — keep it one cell, masking the value to bw bits.
-                    let v = if bw < ew { val & ((1i64 << bw) - 1) } else { val };
+                    let v = if bw < ew {
+                        val & ((1i64 << bw) - 1)
+                    } else {
+                        val
+                    };
                     self.memory_maps[map_idx].set(idx_val, v);
                 } else {
                     let count = (bw / ew) as u32;
@@ -1274,15 +1273,17 @@ impl VM {
                 if bw <= ew {
                     // Single cell; mask to bw bits for a sub-element load ($load.i1).
                     let raw = self.memory_maps[map_idx].get(idx_val);
-                    let v = if bw < ew { raw & ((1i64 << bw) - 1) } else { raw };
+                    let v = if bw < ew {
+                        raw & ((1i64 << bw) - 1)
+                    } else {
+                        raw
+                    };
                     EvalResult::Scalar(v)
                 } else {
                     let count = (bw / ew) as u32;
-                    EvalResult::Scalar(self.memory_maps[map_idx].load_wide(
-                        idx_val,
-                        count,
-                        ew as u32,
-                    ))
+                    EvalResult::Scalar(
+                        self.memory_maps[map_idx].load_wide(idx_val, count, ew as u32),
+                    )
                 }
             }
             Expr::IfThenElse { cond, then_, else_ } => {
@@ -1330,12 +1331,6 @@ impl VM {
             }
             EvalResult::MapRef(_) => panic!("Expected scalar, got map"),
         }
-    }
-
-    /// Evaluate an expression as an exact integer (Int mode).
-    #[inline]
-    fn eval_z(&mut self, expr: &Expr, program: &CompiledProgram) -> Z {
-        eval_result_to_z(self.eval(expr, program))
     }
 
     /// Read a null-terminated C string from a memory map.
@@ -1646,4 +1641,3 @@ fn eval_result_to_z(e: EvalResult) -> Z {
         EvalResult::MapRef(_) => panic!("Expected scalar, got map"),
     }
 }
-

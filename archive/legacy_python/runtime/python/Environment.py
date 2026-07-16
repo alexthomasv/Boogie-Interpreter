@@ -1,8 +1,8 @@
-from interpreter.python.Context import Context
-from interpreter.python.MemoryMap import MemoryMap
+from .Context import Context
+from .MemoryMap import MemoryMap
 from interpreter.parser.declaration import StorageDeclaration, ConstantDeclaration
 from interpreter.parser.expression import QuantifiedExpression, BinaryExpression
-from interpreter.utils.utils import extract_boogie_variables
+from interpreter.utils.program import extract_boogie_variables
 from interpreter.utils.raw_log import RawLogWriter
 from interpreter.utils.debug_log import DebugLogger
 from collections import defaultdict

@@ -5,13 +5,17 @@ from interpreter.parser.statement import AssertStatement, AssumeStatement, Assig
 from interpreter.parser.declaration import StorageDeclaration, ImplementationDeclaration, ProcedureDeclaration
 from interpreter.parser.type import BooleanType, IntegerType, CustomType, MapType
 from interpreter.utils.cvc5_helper import pretty_print_term, sign_extend, zero_extend
+from interpreter.utils.cvc5_serde import (
+    SerializedCvc5TermV2 as _SerializedCvc5TermV2,
+    deserialize_cvc5_term as _deserialize_cvc5_term,
+)
 
-from interpreter.utils.utils import boogie_type_bitwidth
+from interpreter.utils.program import boogie_type_bitwidth
 from collections import deque
 import pickle
 from functools import lru_cache
 from cachetools import LRUCache
-from interpreter.utils.utils import IndentLogger, indent_log
+from interpreter.utils.indent_log import IndentLogger, indent_log
 
 # (cvc5_op, op, num_args, op_bit_width, op_out_width)
 fn_to_cvc5_op = {
@@ -206,7 +210,7 @@ for _name, (_kind, _nargs, _width, _out) in fn_to_cvc5_op.items():
             _CVC5_KIND_TO_BOOGIE[_kind] = _name
 
 
-def cvc5_to_boogie(term, depth=0) -> str:
+def cvc5_to_boogie(term) -> str:
     """Render a cvc5 term as Boogie/SMACK syntax the parser can read back
     (e.g. ``$mul.i32($i6, $sub.i32($i6, 1))``).
 
@@ -215,16 +219,12 @@ def cvc5_to_boogie(term, depth=0) -> str:
     AST ``repr`` is fully parenthesized, so a biconditional ``(A==>B)&&(B==>A)``
     keeps its grouping; the previous hand-written string emitter dropped those
     parens and the relation collapsed under ``&&`` precedence (the bug that made
-    obligations like the pc2881 sign-guard un-parseable). Falls back to
-    ``pretty_print_term`` only for a Kind the lowering cannot express. ``depth`` is
-    accepted for backward signature compatibility and ignored.
+    obligations like the pc2881 sign-guard un-parseable). Unsupported terms
+    fail at the structural lowering boundary.
     """
     if term is None:
-        return "EMPTY"
-    try:
-        return repr(cvc5_to_boogie_ast(term))
-    except Exception:
-        return pretty_print_term(term)
+        raise ValueError("cvc5_to_boogie: term is None")
+    return repr(cvc5_to_boogie_ast(term))
 
 
 def cvc5_to_boogie_ast(term, depth: int = 0):
@@ -245,8 +245,7 @@ def cvc5_to_boogie_ast(term, depth: int = 0):
     deserialized and lowered here straight into the ``assert`` AST the native
     interpreter evaluates — no printed-text parse in the loop.
 
-    Raises ``ValueError`` on a ``Kind`` it cannot lower so the caller can fall
-    back (logged) rather than silently inject a divergent predicate.
+    Raises ``ValueError`` on a ``Kind`` it cannot lower.
     """
     from interpreter.parser.expression import (
         BinaryExpression, LogicalNegation, ArithmeticNegation,
@@ -792,8 +791,6 @@ def set_integer_encoding(enabled: bool):
 # import cvc5, and therefore not this module) can share the ONE detector.
 # Re-exported here for the existing CPython consumers
 # (tools/common.py, tools/drivers/driver.py, src/state/state_cache.py).
-from interpreter.utils.integer_encoding import detect_integer_encoding
-
 def convert_type_to_cvc5(solver, type_, mono_mem = True) -> Sort:
     if isinstance(type_, BooleanType):
         return solver.getBooleanSort()
@@ -1156,8 +1153,9 @@ def convert_expr_cvc5(cvc5_fn_map, state_cache, solver, expr, mono_mem: bool) ->
 
 
 def deserialize_predicate_helper(state_cache, predicate):
-    if isinstance(predicate.predicate, HollowCvc5Term):
-        predicate.predicate = deserialize_cvc5_term(state_cache, predicate.predicate)
+    if isinstance(predicate.predicate, _SerializedCvc5TermV2):
+        predicate.predicate = _deserialize_cvc5_term(
+            state_cache, predicate.predicate)
         # Clear cached hash AND cached string so they recompute from
         # the new live cvc5 Term — otherwise ``str(predicate)`` keeps
         # returning the hollow form even after rehydration, which
@@ -1166,10 +1164,8 @@ def deserialize_predicate_helper(state_cache, predicate):
         predicate._cached_str = None
         predicate._cached_variable_terms = None
 
-# The legacy in-module HollowCvc5Term implementation (numeric-op scheme,
-# its own serializer/deserializer and display maps) was DELETED: it was
-# dead-shadowed by the cvc5_serde re-exports below, so edits to it were
-# silently inert. cvc5_serde is THE term wire.
+# The old in-module term wire was deleted. ``cvc5_serde`` is the sole wire
+# owner; this module only consumes its private hydration primitives.
 
 def make_to_cvc5(fn_map, state_cache):
     """
@@ -1188,10 +1184,15 @@ def make_to_cvc5(fn_map, state_cache):
     return to_cvc5
 
 def deserialize_state_key(state_cache, state_key):
+    from src.state.persistence import deserialize_obligation
     from src.state.proof_obligation import ProofObligation
-    pc, predicate = pickle.loads(state_key)
-    predicate.predicate = deserialize_cvc5_term(state_cache, predicate.predicate)
-    return ProofObligation(pc, predicate)
+
+    obligation = deserialize_obligation(state_key)
+    predicate = obligation.predicate
+    predicate.predicate = _deserialize_cvc5_term(
+        state_cache, predicate.predicate)
+    return ProofObligation.from_predicate(
+        obligation.pc, predicate, solver=state_cache.solver)
 
 
 def deserialize_predicate_pickle(state_cache, raw: bytes):
@@ -1204,26 +1205,9 @@ def deserialize_predicate_pickle(state_cache, raw: bytes):
     the gate from the live engine.
     """
     predicate = pickle.loads(raw)
-    predicate.predicate = deserialize_cvc5_term(
+    predicate.predicate = _deserialize_cvc5_term(
         state_cache, predicate.predicate)
     return predicate
-
-
-# HollowCvc5Term v2: keep the legacy public names while delegating the
-# persistence representation to the versioned flat DAG serializer.
-from interpreter.utils.cvc5_serde import (  # noqa: E402
-    Cvc5SerdeError,
-    HollowCvc5Term,
-    SerializedCvc5TermV2,
-    canonical_term_bytes,
-    canonical_term_fingerprint,
-    classify_hollow,
-    deserialize_cvc5_term,
-    get_serde_stats,
-    hollow_to_str,
-    reset_serde_stats,
-    serialize_cvc5_term,
-)
 
 
 def to_boogie(cvc5_term: Term, *, signed_context: bool = False):
@@ -1360,18 +1344,6 @@ def to_boogie(cvc5_term: Term, *, signed_context: bool = False):
         zero_extend_expr = to_boogie(cvc5_term[0])
         return zero_extend_expr
     elif cvc5_term.getKind() == Kind.ITE:
-        # In integer encoding, ITE(cond, 1, 0) is how comparisons return int.
-        # For Boogie output, simplify back to the condition (bool in Boogie).
-        t, f = cvc5_term[1], cvc5_term[2]
-        if _INTEGER_ENCODING:
-            t_is_1 = (t.getKind() == Kind.CONST_INTEGER and int(t.getIntegerValue()) == 1)
-            f_is_0 = (f.getKind() == Kind.CONST_INTEGER and int(f.getIntegerValue()) == 0)
-            t_is_0 = (t.getKind() == Kind.CONST_INTEGER and int(t.getIntegerValue()) == 0)
-            f_is_1 = (f.getKind() == Kind.CONST_INTEGER and int(f.getIntegerValue()) == 1)
-            if t_is_1 and f_is_0:
-                return to_boogie(cvc5_term[0])  # ITE(cond, 1, 0) → cond
-            if t_is_0 and f_is_1:
-                return LogicalNegation(expression=to_boogie(cvc5_term[0]))  # ITE(cond, 0, 1) → !cond
         condition = to_boogie(cvc5_term[0])
         then_expr = to_boogie(cvc5_term[1])
         else_expr = to_boogie(cvc5_term[2])
@@ -1757,12 +1729,6 @@ def _parse_infix_expr(s, state_cache):
         assert t[0] == typ, f"Expected {typ}, got {t} at pos {pos[0]-1}"
         return t
 
-    def _bool_to_bv1(term):
-        """Convert Bool term to bv1: ITE(term, 1, 0)."""
-        return solver.mkTerm(Kind.ITE, term,
-                             solver.mkBitVector(1, 1),
-                             solver.mkBitVector(1, 0))
-
     # Integer-sort fallback map: when both operands are Int (not BV) the
     # cvc5 BITVECTOR_* operators reject the term with "expecting a
     # bit-vector term".  Swap to the integer-theory equivalents.
@@ -1772,30 +1738,6 @@ def _parse_infix_expr(s, state_cache):
         '<': Kind.LT, '>': Kind.GT, '<=': Kind.LEQ, '>=': Kind.GEQ,
         '==': Kind.EQUAL, '!=': Kind.DISTINCT,
     }
-
-    def _unwrap_bool_or_bv1(t):
-        """If ``t`` is Bool, return it.  If it's the ``_bool_to_bv1``
-        ITE wrapper (``(ite cmp #b1 #b0)``), pull the Bool cmp out.
-        Otherwise return None — caller decides how to handle it.
-
-        The bv1 ITE wrapping was introduced so comparison results
-        could participate in BV bitwise expressions.  For logical
-        connectives (``||``, ``&&``, ``==>``) we need the Bool back.
-        """
-        try:
-            if t.getSort().isBoolean():
-                return t
-            if (t.getKind() == Kind.ITE
-                    and t.getNumChildren() == 3
-                    and t[1].isBitVectorValue()
-                    and int(t[1].getBitVectorValue(10)) == 1
-                    and t[2].isBitVectorValue()
-                    and int(t[2].getBitVectorValue(10)) == 0
-                    and t[0].getSort().isBoolean()):
-                return t[0]
-        except Exception:
-            pass
-        return None
 
     def _both_int(a, b):
         try:
@@ -1977,9 +1919,11 @@ def _parse_infix_expr(s, state_cache):
         return then_term, else_term
 
     def _mk_ite(cond_term, then_term, else_term):
-        cond = _unwrap_bool_or_bv1(cond_term)
-        if cond is None:
-            cond = cvc5_cast_to_bool(solver, cond_term)
+        cond = (
+            cond_term
+            if cond_term.getSort().isBoolean()
+            else cvc5_cast_to_bool(solver, cond_term)
+        )
         then_term, else_term = _coerce_ite_branches(then_term, else_term)
         return solver.mkTerm(Kind.ITE, cond, then_term, else_term)
 
@@ -1991,32 +1935,15 @@ def _parse_infix_expr(s, state_cache):
                 break
             advance()
             right = parse_expr(_PREC[val] + 1)
-            # Logical connective — dispatch to Kind.OR / Kind.AND /
-            # Kind.IMPLIES instead of the BV bitwise operators.  Agent-
-            # authored disjunctive invariants (``$i0 < $u0 || $u0 <= 0``)
-            # land here.  Both operands are already Bool when they came
-            # from the int-sort path, but bv-sort comparisons were
-            # wrapped as bv1 ITE for backward compat — unwrap those
-            # before applying the logical op so the result is a proper
-            # Bool predicate.
+            # Logical connectives operate only on Bool terms.
             if val in _BOOL_OPS:
-                try:
-                    l_b = _unwrap_bool_or_bv1(left)
-                    r_b = _unwrap_bool_or_bv1(right)
-                    if (l_b is not None and r_b is not None
-                            and l_b.getSort().isBoolean()
-                            and r_b.getSort().isBoolean()):
-                        result = solver.mkTerm(_BOOL_OPS[val], l_b, r_b)
-                        left = result
-                        continue
-                except Exception:
-                    pass
-                # Can't coerce to Bool — raise a specific error
-                # rather than falling through to the BV bitwise path
-                # (which would silently produce a wrong term).
-                raise RuntimeError(
-                    f"logical operator {val!r} requires Bool operands "
-                    f"(got sorts {left.getSort()} and {right.getSort()})")
+                if not (left.getSort().isBoolean()
+                        and right.getSort().isBoolean()):
+                    raise RuntimeError(
+                        f"logical operator {val!r} requires Bool operands "
+                        f"(got sorts {left.getSort()} and {right.getSort()})")
+                left = solver.mkTerm(_BOOL_OPS[val], left, right)
+                continue
 
             if _either_int(left, right) and val in _INT_OPS:
                 # Integer-theory path — skip BV matching, use the
@@ -2033,10 +1960,6 @@ def _parse_infix_expr(s, state_cache):
                 kind = _BIN_OPS[val]
                 left, right = _match_bv_sorts(solver, left, right)
                 result = solver.mkTerm(kind, left, right)
-                # Comparisons return Bool; wrap as bv1 for use in BV
-                # expressions.
-                if val in ('<', '>', '<=', '>=') and result.getSort().isBoolean():
-                    result = _bool_to_bv1(result)
             left = result
         if min_prec <= 0 and peek()[0] == '?':
             advance()
@@ -2105,23 +2028,12 @@ def _parse_infix_expr(s, state_cache):
             # mismatch when the other operand is BV64 etc.
             return solver.mkBitVector(32, int(val))
         elif typ == 'OP' and val in ('~', '!'):
-            # Boogie-style negation: ``~(expr)`` or ``!(expr)``.
-            # The operand's sort
-            # decides whether to emit a Bool NOT or a BV NOT.
-            # Predicates like ``~($i1 >= 0)`` land here with a Bool
-            # operand (after fix #3 unwrapped the top-level
-            # comparison); integer terms would use Kind.NEG but we
-            # don't expect those in Swoosh-emitted invariants.
+            # Boogie-style negation: ``~(expr)`` or ``!(expr)``. The
+            # operand's sort decides whether to emit Bool NOT or BV NOT.
             advance()
             operand = parse_primary()
-            try:
-                unwrapped = _unwrap_bool_or_bv1(operand)
-                if unwrapped is not None and unwrapped.getSort().isBoolean():
-                    return solver.mkTerm(Kind.NOT, unwrapped)
-                if operand.getSort().isBoolean():
-                    return solver.mkTerm(Kind.NOT, operand)
-            except Exception:
-                pass
+            if operand.getSort().isBoolean():
+                return solver.mkTerm(Kind.NOT, operand)
             return solver.mkTerm(Kind.BITVECTOR_NOT, operand)
         elif typ == 'OP' and val == '-':
             # Unary minus.  ``-1`` tokenizes as OP=- followed by
@@ -2206,24 +2118,7 @@ def _parse_infix_expr(s, state_cache):
         op = raw.mkOp(Kind.BITVECTOR_ZERO_EXTEND, aw - bw)
         return a, raw.mkTerm(op, b)
 
-    result = parse_expr(0)
-    # Top-level unwrap: if the whole expression is a comparison, it's
-    # been wrapped as ``(ite cmp #b1 #b0)`` by ``_bool_to_bv1`` for
-    # use in nested BV arithmetic.  At the top level we want the
-    # Bool predicate itself so ``Predicate(cvc5_term)`` builds a
-    # valid assertable term.  Detect the shape and unwrap.
-    try:
-        if (result.getKind() == Kind.ITE
-                and result.getNumChildren() == 3
-                and result[1].isBitVectorValue()
-                and int(result[1].getBitVectorValue(10)) == 1
-                and result[2].isBitVectorValue()
-                and int(result[2].getBitVectorValue(10)) == 0
-                and result[0].getSort().isBoolean()):
-            result = result[0]
-    except Exception:
-        pass
-    return result
+    return parse_expr(0)
 
 
 def _parse_smt_term(s, ae, state_cache):
@@ -2451,17 +2346,15 @@ def str_to_key(str_key, ae, state_cache):
             if has_shadow and has_non_shadow:
                 # eq predicate (shadow equality)
                 ret_term = Predicate(cvc5_term)
-                ret_term.eq_predicate = True
             elif rhs.isBitVectorValue() or lhs.isBitVectorValue():
                 # eq_const predicate
                 ret_term = Predicate(cvc5_term)
-                ret_term.eq_const_predicate = True
             else:
                 ret_term = Predicate(cvc5_term)
-                ret_term.eq_predicate = True
         else:
             ret_term = Predicate(cvc5_term)
-        return ProofObligation(pc, ret_term)
+        return ProofObligation.from_predicate(
+            pc, ret_term, solver=state_cache.solver)
 
     x = parse_constraint_tuple(str_key)
     pc = x["id"]
@@ -2484,7 +2377,6 @@ def str_to_key(str_key, ae, state_cache):
             lhs_var, rhs_var = _coerce_bv_sorts(state_cache.solver, lhs_var, rhs_var)
             eq_term = state_cache.solver.mkTerm(Kind.EQUAL, lhs_var, rhs_var)
             ret_term = Predicate(eq_term)
-            ret_term.eq_predicate = True
         
     elif x["type"] == "constant_comparison":
         var = state_cache.cvc5_var(x["variable"])
@@ -2522,7 +2414,6 @@ def str_to_key(str_key, ae, state_cache):
         eq_term = state_cache.solver.mkTerm(Kind.EQUAL, lhs_array_var, store_term)
         
         ret_term = Predicate(eq_term)
-        ret_term.eq_predicate = True
 
     elif x["type"] == "disjunction_of_constants":
         var = state_cache.cvc5_var(x["variable"])
@@ -2563,13 +2454,10 @@ def str_to_key(str_key, ae, state_cache):
         # Fallback: parse the full infix body with the general parser
         body = x.get("raw_body", "")
         cvc5_term = _parse_infix_expr(body, state_cache)
-        if cvc5_term.getKind() == Kind.EQUAL:
-            ret_term = Predicate(cvc5_term)
-            ret_term.eq_predicate = True
-        else:
-            ret_term = Predicate(cvc5_term)
+        ret_term = Predicate(cvc5_term)
 
     else:
         raise ValueError(f"Unsupported constraint type '{x['type']}' for: {str_key}")
 
-    return ProofObligation(pc, ret_term)
+    return ProofObligation.from_predicate(
+        pc, ret_term, solver=state_cache.solver)

@@ -64,16 +64,13 @@ def main() -> int:
                 result = run_native(
                     program,
                     program_inputs,
-                    name,
                     input_file.stem,
                     raw_log_path=raw_log_path,
-                    extra_data=program_inputs.extra_data,
                     log_read=False,
                     prepared=prepared,
                     no_trace=True,
                     return_status=True,
                     return_memory_summary=True,
-                    validate_handoff=False,
                     quiet=True,
                     max_steps=args.max_steps,
                 )

@@ -11,9 +11,12 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJECT_ROOT)
 os.chdir(PROJECT_ROOT)
 
-from interpreter.utils.utils import parse_inputs
-from interpreter.python.Environment import Environment
-from interpreter.python.interpreter import BoogieInterpreter, find_entry_point
+from interpreter.utils.inputs import parse_inputs
+from interpreter.archive.legacy_python.runtime.python.Environment import Environment
+from interpreter.archive.legacy_python.runtime.python.interpreter import (
+    BoogieInterpreter,
+    find_entry_point,
+)
 
 # --- Configuration ---
 PKG_PATH = os.path.join(PROJECT_ROOT, "test_packages", "bearssl_test_pkcs1_i15_pkg", "bearssl_test_pkcs1_i15.pkl")
@@ -37,7 +40,7 @@ program_inputs = parse_inputs(INPUT_PATH)
 _orig_env_init = Environment.__init__
 
 def _patched_env_init(self, test_name, input_name):
-    from interpreter.python.Context import Context
+    from interpreter.archive.legacy_python.runtime.python.Context import Context
     from pathlib import Path
     self.input_name = input_name
     self.stackFrames = [Context()]

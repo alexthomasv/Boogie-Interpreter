@@ -266,7 +266,7 @@ def _serialized_target_pattern(root: Any) -> dict[str, Any]:
     """Derive the executable pattern directly from a serialized cvc5 term.
 
     ``Predicate.__getstate__`` replaces its live ``Term`` with a
-    ``HollowCvc5Term``.  Walking that representation lets every publication and
+    ``SerializedCvc5TermV2``. Walking that representation lets every publication and
     intake boundary bind the advertised pattern fingerprint to the native bytes
     without needing a program-specific solver/state cache.  Keep this traversal
     deliberately isomorphic to :func:`term_to_pattern`.
@@ -278,7 +278,7 @@ def _serialized_target_pattern(root: Any) -> dict[str, Any]:
     captures: dict[tuple[Any, str], str] = {}
 
     def capture_name(node: Any, kind_name: str) -> str:
-        symbol = str(getattr(node, "var_name", "") or "")
+        symbol = str(node.node.symbol or "")
         key: tuple[Any, str] = (
             symbol if symbol else node,
             kind_name,
@@ -383,6 +383,46 @@ def validate_proposer_native_target_b64(
     return serialized
 
 
+def build_proposer_target_frame_from_native_b64(
+        serialized_transformed_b64: str, *, proof_obligation_id: str,
+        run_id: str, pc: int | str, surface: str = "",
+        source: str = "native") -> dict[str, Any]:
+    """Build the canonical target frame directly from its native carrier.
+
+    This is the publication boundary for code that retained the exact
+    serialized transformed predicate but not a live solver term. The match
+    pattern and optional display surface come from that same native AST; no
+    predicate text is parsed or independently reconstructed.
+    """
+    serialized = validate_proposer_native_target_b64(
+        serialized_transformed_b64)
+    predicate = pickle.loads(base64.b64decode(serialized, validate=True))
+    native_term = getattr(predicate, "predicate", None)
+    if native_term is None:
+        raise ValueError(
+            "proposer target frame native carrier has no predicate term")
+    pattern = _serialized_target_pattern(native_term)
+    surface_text = str(surface or "").strip()
+    if not surface_text:
+        try:
+            from interpreter.utils.cvc5_serde import hollow_to_str
+
+            surface_text = str(
+                hollow_to_str(native_term, max_depth=256) or "").strip()
+        except Exception as exc:
+            raise ValueError(
+                "proposer target frame native surface is unavailable") from exc
+    return build_proposer_target_frame_from_pattern(
+        pattern,
+        proof_obligation_id=proof_obligation_id,
+        run_id=run_id,
+        pc=pc,
+        surface=surface_text,
+        serialized_transformed_b64=serialized,
+        source=source,
+    )
+
+
 def build_proposer_target_frame_from_pattern(
         pattern: dict[str, Any], *, proof_obligation_id: str, run_id: str,
         pc: int | str, surface: str, serialized_transformed_b64: str,
@@ -446,7 +486,7 @@ def build_proposer_target_frame(
 def term_to_emit(term, captures: dict[str, str]) -> dict[str, Any]:
     """cvc5 ``Term`` → *emit* expression, reusing the capture names assigned by
     :func:`term_to_pattern`. Raises :class:`UnsupportedShape` for a Kind with no
-    emit op (caller decides the fallback)."""
+    emit op."""
     c = _const_value(term)
     if c is not None:
         return {"const": c}
@@ -485,7 +525,7 @@ def _materialized_guard(term):
 
 
 def derive_structural_template(term, *, rule_id: str,
-                               candidate_term=None) -> dict[str, Any]:
+                               candidate_term) -> dict[str, Any]:
     """Build a ``structural_template`` rule dict — ``pattern`` from the obligation
     ``term`` (so it matches real obligations), ``emit`` the **proved candidate**
     (the invariant the verifier actually found closes it). This is uniform across
@@ -494,13 +534,12 @@ def derive_structural_template(term, *, rule_id: str,
     (`a>=b` / `i3>=i4`), captured from the obligation pattern. There is no
     per-shape branch.
 
-    When no ``candidate_term`` is available yet (e.g. freeze time, before
-    synthesis), ``emit`` falls back to reconstructing the obligation — a hint,
-    not the final template; the proposer re-derives with the candidate.
-
     Returns the rule dict, or ``{"unsupported": "<reason>"}`` (typed, never silent
     ``None``) when the shape can't be emitted.
     """
+    if candidate_term is None:
+        raise ValueError(
+            "derive_structural_template requires the proved candidate term")
     captures: dict[str, str] = {}
     try:
         pattern = term_to_pattern(term, captures, max_depth=64)
@@ -508,21 +547,25 @@ def derive_structural_template(term, *, rule_id: str,
         return {"unsupported": f"pattern_error:{type(exc).__name__}"}
     # Emit the proved candidate, reusing the obligation pattern's captures (the
     # candidate's operands are the same symbols, so they bind to the same
-    # captures). No candidate yet → reconstruct the obligation as a fallback hint.
-    emit_src = candidate_term if candidate_term is not None else term
-    note = ("emit the proved candidate" if candidate_term is not None
-            else "reconstruct the obligation (no candidate yet)")
+    # captures).
     try:
-        emit = term_to_emit(emit_src, captures)
+        emit = term_to_emit(candidate_term, captures)
     except UnsupportedShape as exc:
         return {"unsupported": exc.reason}
     return {
         "id": rule_id,
         "kind": "structural_template",
-        "source": "p_target_transformed",
-        "pattern": pattern,
-        "emit": [emit],
-        "rationale": f"auto-derived from obligation AST ({note})",
+        "match": {
+            "source": "p_target_transformed",
+            "pattern": pattern,
+        },
+        "action": {"emit": [emit]},
+        "rationale": {
+            "summary": (
+                "Auto-derived from the obligation AST and emits the proved "
+                "candidate."
+            ),
+        },
     }
 
 
@@ -595,10 +638,11 @@ def build_obligation_ast_view(term, *, surface: str | None = None,
             }
     except Exception:
         pass
-    try:
-        view["structural_template"] = derive_structural_template(
-            term, rule_id=rule_id, candidate_term=candidate_term)
-    except Exception as exc:  # pragma: no cover - defensive
-        view["structural_template"] = {
-            "unsupported": f"view_error:{type(exc).__name__}"}
+    if candidate_term is not None:
+        try:
+            view["structural_template"] = derive_structural_template(
+                term, rule_id=rule_id, candidate_term=candidate_term)
+        except Exception as exc:  # pragma: no cover - defensive
+            view["structural_template"] = {
+                "unsupported": f"view_error:{type(exc).__name__}"}
     return view

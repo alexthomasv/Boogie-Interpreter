@@ -29,10 +29,6 @@ pub struct InternTable {
 }
 
 impl InternTable {
-    pub fn new() -> Self {
-        Self::new_with_mode(SemanticsMode::default())
-    }
-
     pub fn new_with_mode(mode: SemanticsMode) -> Self {
         Self {
             map: FxHashMap::default(),
@@ -103,24 +99,11 @@ impl InternTable {
     }
 }
 
-/// Lower a Python AST program into a CompiledProgram.
+/// Lower a Python AST program with explicit loop metadata and semantics.
 ///
-/// `loop_metadata`, when provided, is a dict with three keys mapping
-/// block NAMES to the loop structure produced by the compile pipeline
-/// (see `interpreter/runner.py::_build_loop_metadata`):
-///   * `is_loop_header`: list of block names that are loop headers
-///   * `block_innermost_header`: dict block_name -> innermost header name
-///   * `loop_parent_header`: dict inner_header name -> parent header name
-pub fn lower_program(
-    py: Python<'_>,
-    program: &Bound<'_, PyAny>,
-    loop_header_live: Option<&Bound<'_, PyDict>>,
-) -> PyResult<CompiledProgram> {
-    lower_program_full(py, program, loop_header_live, None, SemanticsMode::default())
-}
-
-/// Extended form that also carries loop metadata and the semantics mode.
-/// `lower_program` is a back-compat wrapper (None metadata, Bv mode).
+/// `loop_metadata`, when provided, maps block names to the loop structure
+/// produced by the compile pipeline (see
+/// `interpreter/runner.py::_build_loop_metadata`).
 /// The mode must be known DURING lowering (not stamped after): big-literal
 /// handling, `$idiv`/`$smod` resolution and const-folding are mode-sensitive.
 pub fn lower_program_full(
@@ -395,7 +378,7 @@ pub fn lower_program_full(
                         0
                     };
 
-                    let utils = py.import_bound("interpreter.utils.utils")?;
+                    let utils = py.import_bound("interpreter.utils.program")?;
                     let mut size_var_id: Option<VarId> = None;
 
                     // Scan forward for AssumeStatements referencing this havoc var
@@ -751,7 +734,6 @@ fn lower_stmt(
     }
 }
 
-
 /// Lower a Python ``WhileStatement`` to ``Stmt::While``.
 ///
 /// Used for nested while-statements that survive desugar (top-level
@@ -780,13 +762,13 @@ fn lower_while(
     }
 
     debug_assert!(
-        body.iter().all(|s| !matches!(s, Stmt::Goto { .. } | Stmt::Return)),
+        body.iter()
+            .all(|s| !matches!(s, Stmt::Goto { .. } | Stmt::Return)),
         "Stmt::While body must not contain Goto/Return"
     );
 
     Ok(Stmt::While { cond, body })
 }
-
 
 /// Lower one then/else body item. The diffprod-reified `IfStatement` shape has
 /// `.blocks` = a flat list of Statements; the shadowing-constructed shape (e.g.
@@ -859,15 +841,23 @@ fn lower_if(
     };
 
     debug_assert!(
-        then_body.iter().all(|s| !matches!(s, Stmt::Goto { .. } | Stmt::Return)),
+        then_body
+            .iter()
+            .all(|s| !matches!(s, Stmt::Goto { .. } | Stmt::Return)),
         "Stmt::If then_body must not contain Goto/Return"
     );
     debug_assert!(
-        else_body.iter().all(|s| !matches!(s, Stmt::Goto { .. } | Stmt::Return)),
+        else_body
+            .iter()
+            .all(|s| !matches!(s, Stmt::Goto { .. } | Stmt::Return)),
         "Stmt::If else_body must not contain Goto/Return"
     );
 
-    Ok(Stmt::If { cond, then_body, else_body })
+    Ok(Stmt::If {
+        cond,
+        then_body,
+        else_body,
+    })
 }
 
 /// Lower a call statement.
@@ -1060,7 +1050,7 @@ fn lower_quantified_assume(
     let op: String = expression.getattr("op")?.extract()?;
 
     // Get all boogie variables in the expression
-    let utils = py.import_bound("interpreter.utils.utils")?;
+    let utils = py.import_bound("interpreter.utils.program")?;
     let boogie_vars_set = utils.call_method1("extract_boogie_variables", (&expression,))?;
     let boogie_vars: Vec<Bound<'_, PyAny>> =
         boogie_vars_set.iter()?.collect::<PyResult<Vec<_>>>()?;
@@ -1077,24 +1067,24 @@ fn lower_quantified_assume(
     // quantifier vars (M.ret/dst/len) don't carry "memset"/"memcpy" — only the
     // enclosing proc name does (e.g. inline$$memcpy.i8.cross_product$N$).
     let frame_pfx: String = intern.frame_prefix().unwrap_or("").to_string();
-    let is_memset = frame_pfx.contains("memset") || var_names.iter().any(|(n, _)| n.contains("memset"));
-    let is_memcpy = frame_pfx.contains("memcpy") || var_names.iter().any(|(n, _)| n.contains("memcpy"));
+    let is_memset =
+        frame_pfx.contains("memset") || var_names.iter().any(|(n, _)| n.contains("memset"));
+    let is_memcpy =
+        frame_pfx.contains("memcpy") || var_names.iter().any(|(n, _)| n.contains("memcpy"));
 
     if is_memset {
-        lower_memset_assume(py, &expression, &op, &var_names, intern, q_expr)
+        lower_memset_assume(&expression, &op, &var_names, q_expr)
     } else if is_memcpy {
-        lower_memcpy_assume(py, &expression, &op, &var_names, intern, q_expr)
+        lower_memcpy_assume(&expression, &op, &var_names)
     } else {
         panic!("Unknown quantified assume pattern");
     }
 }
 
 fn lower_memset_assume(
-    _py: Python<'_>,
     expression: &Bound<'_, PyAny>,
     op: &str,
     var_names: &[(String, VarId)],
-    intern: &mut InternTable,
     q_expr: &Bound<'_, PyAny>,
 ) -> PyResult<Stmt> {
     // Get free variables (not in quantifier variable list)
@@ -1188,12 +1178,9 @@ fn lower_memset_assume(
 }
 
 fn lower_memcpy_assume(
-    _py: Python<'_>,
     expression: &Bound<'_, PyAny>,
     op: &str,
     var_names: &[(String, VarId)],
-    intern: &mut InternTable,
-    _q_expr: &Bound<'_, PyAny>,
 ) -> PyResult<Stmt> {
     match op {
         "&&" => {
@@ -1424,7 +1411,13 @@ fn lower_expr_impl(
             // Load functions
             if matches!(
                 f_name.as_str(),
-                "$load.i1" | "$load.i8" | "$load.i16" | "$load.i32" | "$load.i64" | "$load.i128" | "$load.ref"
+                "$load.i1"
+                    | "$load.i8"
+                    | "$load.i16"
+                    | "$load.i32"
+                    | "$load.i64"
+                    | "$load.i128"
+                    | "$load.ref"
             ) {
                 let bw = store_load_bitwidth(&f_name);
                 let map = lower_expr_impl(py, &args_list.get_item(0)?, intern)?;
@@ -1543,8 +1536,7 @@ fn store_load_bitwidth(name: &str) -> u8 {
 /// prelude's residual division intrinsics ({:builtin "div"/"mod"}) and only
 /// resolve under `SemanticsMode::Int`. Every other name resolves in both
 /// modes; `vm::eval` dispatches the SEMANTICS per mode (`builtins::bv` vs
-/// `builtins::int`), so a pre-function-inline int package still evaluates
-/// its `$add.i32`-style intrinsics with exact-ℤ semantics.
+/// `builtins::int`).
 fn resolve_builtin(name: &str, mode: SemanticsMode) -> Option<BuiltinFn> {
     if mode == SemanticsMode::Int {
         if let Some(bits) = parse_intrinsic_width(name, "$idiv.") {

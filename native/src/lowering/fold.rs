@@ -14,7 +14,7 @@
 //! Shared by the inline lowering path (interleaved per-block via
 //! `flush_block`) and the direct `lower_program_full` path (post-hoc pass).
 
-use crate::builtins::int::{Z, ZResult};
+use crate::builtins::int::{ZResult, Z};
 use crate::opcodes::{BinOp, BuiltinFn, Expr, SemanticsMode, Stmt};
 
 pub(crate) fn fold_expr(e: Expr, mode: SemanticsMode) -> Expr {
@@ -80,10 +80,10 @@ pub(crate) fn fold_expr(e: Expr, mode: SemanticsMode) -> Expr {
                     let consts: Option<Vec<i64>> = args.iter().map(as_i64).collect();
                     match consts {
                         Some(c) if crate::builtins::num_args(fn_id) == 1 => {
-                            Expr::Const(crate::builtins::exec_unary(fn_id, c[0]))
+                            Expr::Const(crate::builtins::bv::exec_unary(fn_id, c[0]))
                         }
                         Some(c) => {
-                            let (r, is_bool) = crate::builtins::exec_binary(fn_id, c[0], c[1]);
+                            let (r, is_bool) = crate::builtins::bv::exec_binary(fn_id, c[0], c[1]);
                             if is_bool {
                                 Expr::Bool(r != 0)
                             } else {

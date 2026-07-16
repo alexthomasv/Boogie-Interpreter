@@ -48,12 +48,13 @@ pub fn initialize_vm_from_inputs(
     }
 
     let variables = input_variables(program_inputs)?;
-    load_scalar_inputs(program, vm, &variables)?;
-    load_havoc_sequences(program, vm, &variables)?;
-
     let arr_inputs = parse_array_meta(native_meta)?;
     let field_inputs = parse_field_meta(native_meta)?;
     let ptr_aliases = parse_string_map(native_meta, "ptr_aliases")?;
+    validate_shadow_inputs(program, &variables, &arr_inputs, &field_inputs)?;
+
+    load_scalar_inputs(program, vm, &variables)?;
+    load_havoc_sequences(program, vm, &variables)?;
 
     let ptr_assignments = allocate_addresses(&variables, &arr_inputs, &ptr_aliases)?;
     validate_no_aliasing(&variables, &arr_inputs, &ptr_aliases, &ptr_assignments)?;
@@ -491,9 +492,9 @@ fn load_static_scalars(
     vm: &mut VM,
     native_meta: &Bound<'_, PyDict>,
 ) -> PyResult<()> {
-    let Some(static_scalars) = native_meta.get_item("static_scalars")? else {
-        return Ok(());
-    };
+    let static_scalars = native_meta
+        .get_item("static_scalars")?
+        .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("static_scalars"))?;
     let scalars: &Bound<'_, PyDict> = static_scalars.downcast()?;
     for (key, val) in scalars.iter() {
         let name: String = key.extract()?;
@@ -506,20 +507,144 @@ fn load_static_scalars(
 }
 
 fn input_variables<'py>(program_inputs: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyDict>> {
-    if let Ok(vars) = program_inputs.getattr("variables") {
-        return Ok(vars.downcast_into::<PyDict>()?);
-    }
-    Ok(program_inputs.clone().downcast_into::<PyDict>()?)
+    Ok(program_inputs
+        .getattr("variables")?
+        .downcast_into::<PyDict>()?)
 }
 
 fn extract_extra_data(program_inputs: &Bound<'_, PyAny>) -> PyResult<Option<Vec<u8>>> {
-    let Ok(extra) = program_inputs.getattr("extra_data") else {
-        return Ok(None);
-    };
+    let extra = program_inputs.getattr("extra_data")?;
     if extra.is_none() {
         return Ok(None);
     }
     extra.extract::<Vec<u8>>().map(Some)
+}
+
+fn validate_shadow_inputs(
+    program: &CompiledProgram,
+    variables: &Bound<'_, PyDict>,
+    arr_inputs: &FxHashMap<String, Vec<ArrayMeta>>,
+    field_inputs: &FxHashMap<String, Vec<FieldMeta>>,
+) -> PyResult<()> {
+    for (key, inp) in variables.iter() {
+        let name: String = key.extract()?;
+        if name.ends_with(".shadow") {
+            continue;
+        }
+
+        let shadow_name = format!("{name}.shadow");
+        let has_scalar = input_value(&inp)?.is_some();
+        let has_havoc = input_havoc_attr(&inp)?.is_some();
+        let buffers = input_list_attr(&inp, "buffers")?;
+        let fields = input_list_attr(&inp, "struct")?;
+        let scalar_shadow = program.name_to_var.contains_key(&shadow_name);
+        let shadow_array_count = shadow_array_count(arr_inputs, &shadow_name);
+        let shadow_field_count = shadow_field_count(field_inputs, &shadow_name);
+
+        let needs_scalar = scalar_shadow && has_scalar;
+        let needs_havoc = scalar_shadow && has_havoc;
+        let needs_buffers = buffers.is_some() && shadow_array_count > 0;
+        let needs_struct = fields.is_some() && (shadow_array_count > 0 || shadow_field_count > 0);
+        if !(needs_scalar || needs_havoc || needs_buffers || needs_struct) {
+            continue;
+        }
+
+        let shadow = require_shadow_input(variables, &name, &shadow_name)?;
+        if needs_scalar && input_value(&shadow)?.is_none() {
+            return Err(missing_shadow_payload(&name, &shadow_name, "value"));
+        }
+        if needs_havoc && input_havoc_attr(&shadow)?.is_none() {
+            return Err(missing_shadow_payload(&name, &shadow_name, "havoc_seq"));
+        }
+        if needs_buffers {
+            let shadow_buffers = require_input_list_attr(&shadow, &name, &shadow_name, "buffers")?;
+            validate_payload_count(
+                &name,
+                &shadow_name,
+                "buffers",
+                shadow_buffers.len(),
+                shadow_array_count,
+            )?;
+        }
+        if needs_struct {
+            let shadow_struct = require_input_list_attr(&shadow, &name, &shadow_name, "struct")?;
+            let base_struct = fields.as_ref().expect("needs_struct requires fields");
+            validate_payload_count(
+                &name,
+                &shadow_name,
+                "struct fields",
+                shadow_struct.len(),
+                base_struct.len(),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn require_shadow_input<'py>(
+    variables: &Bound<'py, PyDict>,
+    base_name: &str,
+    shadow_name: &str,
+) -> PyResult<Bound<'py, PyAny>> {
+    variables.get_item(shadow_name)?.ok_or_else(|| {
+        pyo3::exceptions::PyValueError::new_err(format!(
+            "input {base_name:?} requires explicit shadow input {shadow_name:?}"
+        ))
+    })
+}
+
+fn require_input_list_attr<'py>(
+    inp: &Bound<'py, PyAny>,
+    base_name: &str,
+    shadow_name: &str,
+    attr: &str,
+) -> PyResult<Bound<'py, PyList>> {
+    input_list_attr(inp, attr)?.ok_or_else(|| missing_shadow_payload(base_name, shadow_name, attr))
+}
+
+fn missing_shadow_payload(base_name: &str, shadow_name: &str, attr: &str) -> PyErr {
+    pyo3::exceptions::PyValueError::new_err(format!(
+        "input {base_name:?} requires {attr} on explicit shadow input {shadow_name:?}"
+    ))
+}
+
+fn validate_payload_count(
+    base_name: &str,
+    shadow_name: &str,
+    payload: &str,
+    actual: usize,
+    expected: usize,
+) -> PyResult<()> {
+    if actual == expected {
+        return Ok(());
+    }
+    Err(pyo3::exceptions::PyValueError::new_err(format!(
+        "input {base_name:?} shadow {payload} count mismatch for {shadow_name:?}: expected {expected}, got {actual}"
+    )))
+}
+
+fn shadow_array_count(arr_inputs: &FxHashMap<String, Vec<ArrayMeta>>, name: &str) -> usize {
+    arr_inputs
+        .get(name)
+        .map(|items| {
+            items
+                .iter()
+                .filter(|meta| meta.mem_map.contains(".shadow"))
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+fn shadow_field_count(field_inputs: &FxHashMap<String, Vec<FieldMeta>>, name: &str) -> usize {
+    field_inputs
+        .get(name)
+        .map(|items| {
+            items
+                .iter()
+                .filter(|meta| meta.mem_map.contains(".shadow"))
+                .count()
+        })
+        .unwrap_or(0)
 }
 
 fn load_scalar_inputs(
@@ -551,7 +676,7 @@ fn load_havoc_sequences(
                 .get(&name)
                 .and_then(|root| program.name_to_var.get(root).copied())
                 .unwrap_or(vid);
-            let Ok(seq_obj) = inp.getattr("havoc_seq") else {
+            let Some(seq_list) = input_havoc_attr(&inp)? else {
                 if havoc_outputs.contains_key(&name) {
                     if let Some(value) = input_value(&inp)? {
                         vm.set_havoc_sequence(root_vid, vec![value]);
@@ -559,15 +684,6 @@ fn load_havoc_sequences(
                 }
                 continue;
             };
-            if seq_obj.is_none() {
-                if havoc_outputs.contains_key(&name) {
-                    if let Some(value) = input_value(&inp)? {
-                        vm.set_havoc_sequence(root_vid, vec![value]);
-                    }
-                }
-                continue;
-            }
-            let seq_list: &Bound<'_, PyList> = seq_obj.downcast()?;
             let mut seq = Vec::with_capacity(seq_list.len());
             for item in seq_list.iter() {
                 seq.push(extract_i64(&item)?);
@@ -624,9 +740,9 @@ fn parse_array_meta(
     native_meta: &Bound<'_, PyDict>,
 ) -> PyResult<FxHashMap<String, Vec<ArrayMeta>>> {
     let mut out = FxHashMap::default();
-    let Some(obj) = native_meta.get_item("arr_inputs")? else {
-        return Ok(out);
-    };
+    let obj = native_meta
+        .get_item("arr_inputs")?
+        .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("arr_inputs"))?;
     let dict: &Bound<'_, PyDict> = obj.downcast()?;
     for (key, value) in dict.iter() {
         let key: String = key.extract()?;
@@ -649,9 +765,9 @@ fn parse_field_meta(
     native_meta: &Bound<'_, PyDict>,
 ) -> PyResult<FxHashMap<String, Vec<FieldMeta>>> {
     let mut out = FxHashMap::default();
-    let Some(obj) = native_meta.get_item("field_inputs")? else {
-        return Ok(out);
-    };
+    let obj = native_meta
+        .get_item("field_inputs")?
+        .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("field_inputs"))?;
     let dict: &Bound<'_, PyDict> = obj.downcast()?;
     for (key, value) in dict.iter() {
         let key: String = key.extract()?;
@@ -676,9 +792,9 @@ fn parse_string_map(
     key: &str,
 ) -> PyResult<FxHashMap<String, String>> {
     let mut out = FxHashMap::default();
-    let Some(obj) = native_meta.get_item(key)? else {
-        return Ok(out);
-    };
+    let obj = native_meta
+        .get_item(key)?
+        .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err(key.to_string()))?;
     let dict: &Bound<'_, PyDict> = obj.downcast()?;
     for (k, v) in dict.iter() {
         out.insert(k.extract()?, v.extract()?);
@@ -773,7 +889,6 @@ fn collect_alloc_requests(
             continue;
         }
         let shadow_key = format!("{}.shadow", var_name);
-        let shadow_inp = variables.get_item(&shadow_key)?;
 
         if let Some(buffers) = input_list_attr(&inp, "buffers")? {
             if let Some(arr_infos) = arr_inputs.get(&var_name) {
@@ -790,20 +905,21 @@ fn collect_alloc_requests(
                 }
             }
             if let Some(shadow_infos) = arr_inputs.get(&shadow_key) {
-                let shadow_buffers = shadow_inp
-                    .as_ref()
-                    .and_then(|s| input_list_attr(s, "buffers").ok().flatten())
-                    .unwrap_or_else(|| buffers.clone());
                 let shadow: Vec<&ArrayMeta> = shadow_infos
                     .iter()
                     .filter(|m| m.mem_map.contains(".shadow"))
                     .collect();
-                for (buf, meta) in shadow_buffers.iter().zip(shadow.iter()) {
-                    requests.push(AllocRequest {
-                        mem_map: meta.mem_map.clone(),
-                        base_ptr: meta.base_ptr.clone(),
-                        size: dict_i64(&buf, "size")?,
-                    });
+                if !shadow.is_empty() {
+                    let shadow_inp = require_shadow_input(variables, &var_name, &shadow_key)?;
+                    let shadow_buffers =
+                        require_input_list_attr(&shadow_inp, &var_name, &shadow_key, "buffers")?;
+                    for (buf, meta) in shadow_buffers.iter().zip(shadow.iter()) {
+                        requests.push(AllocRequest {
+                            mem_map: meta.mem_map.clone(),
+                            base_ptr: meta.base_ptr.clone(),
+                            size: dict_i64(&buf, "size")?,
+                        });
+                    }
                 }
             }
         }
@@ -814,10 +930,6 @@ fn collect_alloc_requests(
                     .iter()
                     .filter(|m| !m.mem_map.contains(".shadow"))
                     .collect();
-                let shadow_struct = shadow_inp
-                    .as_ref()
-                    .and_then(|s| input_list_attr(s, "struct").ok().flatten())
-                    .unwrap_or_else(|| fields.clone());
                 let arr_shadow: Vec<&ArrayMeta> = arr_inputs
                     .get(&shadow_key)
                     .map(|items| {
@@ -827,6 +939,17 @@ fn collect_alloc_requests(
                             .collect()
                     })
                     .unwrap_or_default();
+                let shadow_struct = if arr_shadow.is_empty() {
+                    None
+                } else {
+                    let shadow_inp = require_shadow_input(variables, &var_name, &shadow_key)?;
+                    Some(require_input_list_attr(
+                        &shadow_inp,
+                        &var_name,
+                        &shadow_key,
+                        "struct",
+                    )?)
+                };
                 let mut buf_idx = 0usize;
                 for (field_idx, field) in fields.iter().enumerate() {
                     if dict_get(&field, "buffer")?.is_some() {
@@ -840,11 +963,12 @@ fn collect_alloc_requests(
                         }
                         if let Some(meta) = arr_shadow.get(buf_idx) {
                             let shadow_field = shadow_struct
-                                .get_item(field_idx)
-                                .unwrap_or_else(|_| field.clone());
-                            let buf = dict_get(&shadow_field, "buffer")?
-                                .or_else(|| dict_get(&field, "buffer").ok().flatten())
-                                .unwrap();
+                                .as_ref()
+                                .expect("shadow struct validated above")
+                                .get_item(field_idx)?;
+                            let buf = dict_get(&shadow_field, "buffer")?.ok_or_else(|| {
+                                missing_shadow_payload(&var_name, &shadow_key, "struct buffer")
+                            })?;
                             requests.push(AllocRequest {
                                 mem_map: meta.mem_map.clone(),
                                 base_ptr: meta.base_ptr.clone(),
@@ -912,11 +1036,6 @@ fn write_input_buffers(
         write_buffer(program, vm, &buf, meta)?;
     }
 
-    let shadow_buffers = variables
-        .get_item(&shadow_key)?
-        .as_ref()
-        .and_then(|s| input_list_attr(s, "buffers").ok().flatten())
-        .unwrap_or_else(|| buffers.clone());
     let shadow: Vec<&ArrayMeta> = arr_inputs
         .get(&shadow_key)
         .map(|items| {
@@ -926,6 +1045,11 @@ fn write_input_buffers(
                 .collect()
         })
         .unwrap_or_default();
+    if shadow.is_empty() {
+        return Ok(());
+    }
+    let shadow_inp = require_shadow_input(variables, var_name, &shadow_key)?;
+    let shadow_buffers = require_input_list_attr(&shadow_inp, var_name, &shadow_key, "buffers")?;
     for (buf, meta) in shadow_buffers.iter().zip(shadow.iter()) {
         write_buffer(program, vm, &buf, meta)?;
     }
@@ -986,25 +1110,39 @@ fn write_input_struct(
                 .collect()
         })
         .unwrap_or_default();
-    let shadow_struct = variables
-        .get_item(&shadow_key)?
-        .as_ref()
-        .and_then(|s| input_list_attr(s, "struct").ok().flatten())
-        .unwrap_or_else(|| fields.clone());
+    let shadow_struct = if field_infos_shadow.is_empty() && arr_shadow.is_empty() {
+        None
+    } else {
+        let shadow_inp = require_shadow_input(variables, var_name, &shadow_key)?;
+        Some(require_input_list_attr(
+            &shadow_inp,
+            var_name,
+            &shadow_key,
+            "struct",
+        )?)
+    };
 
     let mut field_idx = 0usize;
     let mut buffer_idx = 0usize;
     for struct_idx in 0..fields.len() {
         let field = fields.get_item(struct_idx)?;
-        let shadow_field = shadow_struct
-            .get_item(struct_idx)
-            .unwrap_or_else(|_| field.clone());
+        let shadow_field = match shadow_struct.as_ref() {
+            Some(items) => Some(items.get_item(struct_idx)?),
+            None => None,
+        };
         if dict_get(&field, "value")?.is_some() {
             if let Some(meta) = field_infos.get(field_idx) {
                 write_field(program, vm, &field, meta)?;
             }
             if let Some(meta) = field_infos_shadow.get(field_idx) {
-                write_field(program, vm, &shadow_field, meta)?;
+                write_field(
+                    program,
+                    vm,
+                    shadow_field
+                        .as_ref()
+                        .expect("shadow field metadata requires shadow struct"),
+                    meta,
+                )?;
             }
             field_idx += 1;
         } else if let Some(buf) = dict_get(&field, "buffer")? {
@@ -1021,7 +1159,13 @@ fn write_input_struct(
                 write_buffer(program, vm, &buf, meta)?;
             }
             if let Some(meta) = arr_shadow.get(buffer_idx) {
-                let shadow_buf = dict_get(&shadow_field, "buffer")?.unwrap_or(buf.clone());
+                let shadow_buf = dict_get(
+                    shadow_field
+                        .as_ref()
+                        .expect("shadow array metadata requires shadow struct"),
+                    "buffer",
+                )?
+                .ok_or_else(|| missing_shadow_payload(var_name, &shadow_key, "struct buffer"))?;
                 write_buffer(program, vm, &shadow_buf, meta)?;
             }
             field_idx += 1;
@@ -1121,9 +1265,7 @@ fn canon(name: &str, aliases: &FxHashMap<String, String>) -> String {
 }
 
 fn input_value(inp: &Bound<'_, PyAny>) -> PyResult<Option<i64>> {
-    let Ok(value) = inp.getattr("value") else {
-        return Ok(None);
-    };
+    let value = inp.getattr("value")?;
     if value.is_none() {
         return Ok(None);
     }
@@ -1134,9 +1276,7 @@ fn input_list_attr<'py>(
     inp: &Bound<'py, PyAny>,
     attr: &str,
 ) -> PyResult<Option<Bound<'py, PyList>>> {
-    let Ok(value) = inp.getattr(attr) else {
-        return Ok(None);
-    };
+    let value = inp.getattr(attr)?;
     if value.is_none() {
         return Ok(None);
     }
@@ -1148,9 +1288,7 @@ fn input_list_attr<'py>(
 }
 
 fn input_havoc_attr<'py>(inp: &Bound<'py, PyAny>) -> PyResult<Option<Bound<'py, PyList>>> {
-    let Ok(value) = inp.getattr("havoc_seq") else {
-        return Ok(None);
-    };
+    let value = inp.getattr("havoc_seq")?;
     if value.is_none() {
         return Ok(None);
     }

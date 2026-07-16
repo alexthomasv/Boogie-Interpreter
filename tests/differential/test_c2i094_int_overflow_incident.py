@@ -84,7 +84,6 @@ def _run_incident(tmp_path):
     return run_native(
         program,
         inputs,
-        "c2i_094_incident",
         "n65535_k0",
         tmp_path / "incident.raw.zst",
         no_trace=True,

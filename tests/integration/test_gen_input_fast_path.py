@@ -80,8 +80,6 @@ def test_gen_input_fast_search_then_replay_kept_inputs_with_raw_traces(tmp_path)
         progress_interval=1000,
     )
 
-    assert report["engine_used"] == "native"
-    assert report["native_fallback"] is False
     assert report["step_limits"] == 0
     assert report["candidates_evaluated"] >= 2
     assert report["total_new_inputs"] >= 1
@@ -101,16 +99,13 @@ def test_gen_input_fast_search_then_replay_kept_inputs_with_raw_traces(tmp_path)
         result = run_native(
             program,
             program_inputs,
-            "fast_gen_case",
             input_path.stem,
             raw_log_path=raw_log,
-            extra_data=program_inputs.extra_data,
             prepared=prepared,
             no_trace=False,
             log_read=True,
             return_status=True,
             return_memory_summary=False,
-            validate_handoff=False,
             quiet=True,
             max_steps=10_000,
         )

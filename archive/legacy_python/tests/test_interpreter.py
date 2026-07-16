@@ -18,7 +18,7 @@ import tempfile
 import shutil
 
 # This repo IS the `interpreter` package.
-# Add parent-of-repo-root for `import interpreter.python.*`
+# Add parent-of-repo-root for archived runtime imports.
 # Add repo root for `import parser.*` and `import utils.*`
 _repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _parent = os.path.dirname(_repo_root)
@@ -37,19 +37,21 @@ from interpreter.parser.statement import (
     CallStatement, GotoStatement, HavocStatement, ReturnStatement,
 )
 from interpreter.parser.declaration import StorageDeclaration, ImplementationDeclaration, ProcedureDeclaration
-from interpreter.python.Buffer import ReadBuffer
-from interpreter.python.Environment import Environment
-from interpreter.python.MemoryMap import MemoryMap
-from interpreter.python.Context import Context
-from interpreter.python.interpreter import (
+from interpreter.archive.legacy_python.runtime.python.Buffer import ReadBuffer
+from interpreter.archive.legacy_python.runtime.python.Environment import Environment
+from interpreter.archive.legacy_python.runtime.python.MemoryMap import MemoryMap
+from interpreter.archive.legacy_python.runtime.python.Context import Context
+from interpreter.archive.legacy_python.runtime.python.interpreter import (
     AssumeViolation,
     BoogieInterpreter,
     find_entry_point,
     hex_to_bytes,
 )
-from interpreter.utils.utils import (
-    Input, parse_inputs, mask_bits, generate_function_map,
-    generate_label_to_block, initialize_code_metadata,
+from interpreter.utils.bitops import mask_bits, generate_function_map
+from interpreter.utils.inputs import Input, parse_inputs
+from interpreter.utils.program import (
+    generate_label_to_block,
+    initialize_code_metadata,
 )
 from pathlib import Path
 

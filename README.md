@@ -66,7 +66,7 @@ future divergences get pinned in its `INT_LANE_DRIFT` as strict xfails).
 ## Usage
 
 ```bash
-python -m interpreter.runner test_packages/<name>_pkg/ --engine=native
+python -m interpreter.runner test_packages/<name>_pkg/
 ```
 
 `--engine=python` and `--engine=both` intentionally fail with a deprecation
