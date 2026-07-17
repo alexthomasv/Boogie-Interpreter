@@ -4,14 +4,14 @@ On-disk layout (little-endian throughout):
 
   Header (in frame 0):
     magic         = b"SWRL"           4 bytes
-    version       = 2                 1 byte
+    version       = 3                 1 byte
     var_table_len (u32)               4 bytes
     var_table = [len:u16, bytes]*     variable
     block_table_len (u32)             4 bytes
     block_table = [len:u16, bytes]*   variable
 
   Record (repeated across all frames):
-    kind (u8)    1 byte    — b'W' write / b'R' read / b'I' iter context
+    kind (u8)    1 byte    — event kind (W/R/I plus v3 S/P/U; see below)
     var_id (u32) 4 bytes   — var-table index, or context id for b'I'
     pc (u32)     4 bytes   — pc, or parent context id for b'I'
     block_id(u32)4 bytes   — block-table index, or header block id for b'I'
@@ -32,7 +32,15 @@ uncompressed bytes (default 64 MiB), which yields ~50 frames for a
 pkcs1-sized trace. The first frame is always header-only; records begin in
 frame 1.
 
-SWRL v2 is the only trace format accepted by the current toolchain.
+SWRL v3 preserves the legacy W/R/I records and adds:
+
+* S: authoritative initial scalar value at virtual pc 0,
+* P: exact statement PRE visit (`var_id == NO_VAR_ID`),
+* U: scalar write invalidation (`value` is an UNKNOWN_REASON_* code).
+
+Physical decompressed record order is the authoritative event order. There is
+deliberately no sequence field: each execution owns one append-only writer and
+all zstd frame boundaries are record-aligned.
 """
 
 from __future__ import annotations
@@ -46,8 +54,17 @@ import zstandard as zstd
 
 
 MAGIC = b"SWRL"
-VERSION = 2
+VERSION = 3
 RECORD_SIZE = 1 + 4 + 4 + 4 + 8 + 4
+
+OP_WRITE = ord("W")
+OP_READ = ord("R")
+OP_ITER_CONTEXT = ord("I")
+OP_INITIAL_SCALAR = ord("S")
+OP_PRE_PC = ord("P")
+OP_UNKNOWN_WRITE = ord("U")
+NO_VAR_ID = 0xFFFFFFFF
+UNKNOWN_REASON_BIG_INT = 1
 
 # Uncompressed-bytes threshold at which we close the current zstd frame
 # and start a new one. ~64 MiB gives ~50 frames for a pkcs1 trace, which
@@ -115,17 +132,31 @@ class RawLogWriter:
 
     def record(self, kind: int, var_id: int, pc: int, block_id: int,
                value: int, iter_id: int) -> None:
-        """Append one record.  Values outside signed-i64 range are wrapped
-        modulo 2**64 to preserve C-like semantics."""
+        """Append one fixed-width record.
+
+        ``S`` and ``W`` are authoritative exact scalar-state events.  Their
+        values must therefore already fit the raw format's signed-i64 field;
+        silently wrapping an unbounded Boogie integer would manufacture a
+        concrete value that was never executed.  Callers must emit ``U`` when
+        an exact value is unavailable.  Legacy diagnostic/mining records keep
+        their historical modulo-2**64 encoding.
+        """
         if not self._header_written:
             raise RuntimeError("raw log header must be written before records")
         if self._finished:
             raise RuntimeError("raw log writer is already finished")
         INT64_MIN = -(1 << 63)
         INT64_MAX = (1 << 63) - 1
+        kind_byte = kind & 0xFF
         if value < INT64_MIN or value > INT64_MAX:
+            if kind_byte in (
+                    OP_INITIAL_SCALAR, OP_WRITE, OP_UNKNOWN_WRITE):
+                raise OverflowError(
+                    "exact raw scalar event does not fit signed i64; "
+                    "emit OP_UNKNOWN_WRITE instead"
+                )
             value = ((value + (1 << 63)) % (1 << 64)) - (1 << 63)
-        self._buf.extend(struct.pack('<BIIIqI', kind & 0xFF, var_id, pc,
+        self._buf.extend(struct.pack('<BIIIqI', kind_byte, var_id, pc,
                                      block_id, value, iter_id))
         self.count += 1
         if len(self._buf) >= self._flush_threshold:

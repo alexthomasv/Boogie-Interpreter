@@ -1,16 +1,12 @@
 use crate::opcodes::{BlockId, VarId};
-use crate::raw_log::RawLogWriter;
-
-/// op_type constants matching Python: 'W' = write, 'R' = read.
-/// 'I' defines an exact loop-iteration context used by subsequent
-/// value records.
-pub const OP_WRITE: u8 = b'W';
-pub const OP_READ: u8 = b'R';
-pub const OP_ITER_CONTEXT: u8 = b'I';
+use crate::raw_log::{
+    RawLogWriter, NO_VAR_ID, OP_INITIAL_SCALAR, OP_ITER_CONTEXT, OP_PRE_PC, OP_UNKNOWN_WRITE,
+};
+pub use crate::raw_log::{OP_READ, OP_WRITE, UNKNOWN_REASON_BIG_INT};
 
 /// Streaming-only trace sink.
 ///
-/// Each trace value record carries an opaque `iter_id: u32`:
+/// Each trace value/state record carries an opaque `iter_id: u32`:
 ///
 ///   ```
 ///   iter_id = exact active loop-context id
@@ -24,6 +20,9 @@ pub const OP_ITER_CONTEXT: u8 = b'I';
 ///
 /// The parent chain reconstructs the full nested stack, so a value in
 /// `(outer=3, inner=5)` receives a distinct id from `(outer=4, inner=5)`.
+/// Iteration ids are correlation metadata, not temporal order.  Physical raw
+/// record order is authoritative, and a `P` record precedes every operation
+/// performed by its statement.
 pub struct TraceAccumulator {
     /// Total number of trace entries (reads + writes, counting all
     /// per-loop-level records).
@@ -195,6 +194,50 @@ impl TraceAccumulator {
         let context_id = self.stack.last().map(|frame| frame.context_id).unwrap_or(0);
         if let Err(e) = w.record(op_type, var_id, pc, block_id, value, context_id) {
             panic!("raw trace log write failed: {}", e);
+        }
+    }
+
+    /// Record one authoritative scalar value after concrete input
+    /// initialization and before execution.  PC 0 is the verifier's virtual
+    /// entry state; initial records are outside every loop context.
+    #[inline]
+    pub fn record_initial_scalar(&mut self, var_id: VarId, value: i64, entry_block_id: BlockId) {
+        let w = match self.raw_log.as_mut() {
+            Some(w) => w,
+            None => return,
+        };
+        if let Err(e) = w.record(OP_INITIAL_SCALAR, var_id, 0, entry_block_id, value, 0) {
+            panic!("raw initial-state trace write failed: {}", e);
+        }
+    }
+
+    /// Record the concrete state boundary immediately before the statement at
+    /// `pc`.  Callers must invoke this before evaluating any part of the
+    /// statement.  `NO_VAR_ID` makes the event independent of variable rows.
+    #[inline]
+    pub fn record_pre_pc(&mut self, pc: u32, block_id: BlockId) {
+        let context_id = self.stack.last().map(|frame| frame.context_id).unwrap_or(0);
+        let w = match self.raw_log.as_mut() {
+            Some(w) => w,
+            None => return,
+        };
+        if let Err(e) = w.record(OP_PRE_PC, NO_VAR_ID, pc, block_id, 0, context_id) {
+            panic!("raw PRE-pc trace write failed: {}", e);
+        }
+    }
+
+    /// Invalidate a scalar after a write whose mathematical value cannot be
+    /// represented by the raw log.  A consumer must disregard older exact
+    /// values until a later `S` or `W` restores a known state.
+    #[inline]
+    pub fn record_unknown_write(&mut self, var_id: VarId, pc: u32, block_id: BlockId, reason: i64) {
+        let context_id = self.stack.last().map(|frame| frame.context_id).unwrap_or(0);
+        let w = match self.raw_log.as_mut() {
+            Some(w) => w,
+            None => return,
+        };
+        if let Err(e) = w.record(OP_UNKNOWN_WRITE, var_id, pc, block_id, reason, context_id) {
+            panic!("raw unknown-write trace failed: {}", e);
         }
     }
 

@@ -44,9 +44,9 @@ integer_encoding.py`; never a flag):
   exact-ℤ core evaluates (`builtins/int.rs` + checked/BigInt arithmetic in
   `vm.rs`), matching the verifier's cvc5 model (`utils_cvc5` under
   `set_integer_encoding(True)`). Values outside i64 are carried exactly
-  (`Value::Big`); their trace records are skipped and counted
-  (`trace_big_skips` in the result dict) because the raw-log value field is
-  i64 and a wrapped stand-in could manufacture false trace-refutations.
+  (`Value::Big`); the raw trace emits a `U` (unknown-value invalidation) and
+  increments `trace_big_skips` because its fixed i64 value field cannot encode
+  the integer and a wrapped stand-in could manufacture false refutations.
   At the MEMORY interface (load/store addresses+values, memcpy/memset/read
   handlers) out-of-i64 values fold mod 2^64 (counted as `mem_big_folds`) —
   SMACK spells negative pointer offsets as u64 two's-complement literals, and

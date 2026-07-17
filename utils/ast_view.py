@@ -341,6 +341,22 @@ def _serialized_target_pattern(root: Any) -> dict[str, Any]:
     return walk(root, 0)
 
 
+def native_predicate_pattern(value: Any) -> dict[str, Any]:
+    """Return the exact structural pattern of a native predicate carrier.
+
+    Accepts either a live cvc5 term/``Predicate`` or the serialized predicate
+    retained inside a canonical ``ProofObligation``.  This is the common
+    post-checker pattern boundary: consumers derive structure from the native
+    carrier and never render/reparse its diagnostic surface.
+    """
+    term = getattr(value, "predicate", value)
+    from interpreter.utils.cvc5_serde import SerializedCvc5TermV2
+
+    if isinstance(term, SerializedCvc5TermV2):
+        return _serialized_target_pattern(term)
+    return canonical_target_pattern(term)
+
+
 def validate_proposer_native_target_b64(
         value: Any, *, expected_pattern_sha256: str = "") -> str:
     """Return a native payload whose bytes agree with its advertised pattern."""

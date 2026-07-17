@@ -34,7 +34,10 @@
 //! Registry members are pickle protocol-5 bytes so `pickle.loads()` in
 //! downstream Python readers round-trips correctly.
 
-use crate::raw_log::{MAGIC, RECORD_SIZE, VERSION};
+use crate::raw_log::{
+    MAGIC, OP_INITIAL_SCALAR, OP_ITER_CONTEXT, OP_PRE_PC, OP_READ, OP_UNKNOWN_WRITE, OP_WRITE,
+    RECORD_SIZE, VERSION,
+};
 use crossbeam_channel::{bounded, Receiver, Sender};
 use memmap2::Mmap;
 use redis::Pipeline;
@@ -568,8 +571,16 @@ fn parser_loop(
             off += RECORD_SIZE;
             parsed_this_chunk += 1;
 
-            if kind == b'I' {
-                continue;
+            match kind {
+                // The legacy Redis schema is an aggregate W/R value index. S
+                // belongs to the ordered entry-state projection, P carries no
+                // value, and U.value is a reason code rather than a concrete
+                // scalar. None may be relabeled as positive-example evidence.
+                OP_WRITE | OP_READ => {}
+                OP_ITER_CONTEXT | OP_INITIAL_SCALAR | OP_PRE_PC | OP_UNKNOWN_WRITE => continue,
+                // Fail closed for future event kinds until their aggregate
+                // semantics are explicitly defined.
+                _ => continue,
             }
             if var_id as usize >= n_vars || blk_id as usize >= block_names.len() {
                 continue;
@@ -797,6 +808,105 @@ fn flush_all(
 
 fn redis_to_io(e: redis::RedisError) -> io::Error {
     io::Error::new(io::ErrorKind::Other, format!("redis: {}", e))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::raw_log::{NO_VAR_ID, UNKNOWN_REASON_BIG_INT};
+    use std::collections::BTreeSet;
+
+    fn push_record(
+        out: &mut Vec<u8>,
+        kind: u8,
+        var_id: u32,
+        pc: u32,
+        block_id: u32,
+        value: i64,
+        iter_id: u32,
+    ) {
+        out.push(kind);
+        out.extend_from_slice(&var_id.to_le_bytes());
+        out.extend_from_slice(&pc.to_le_bytes());
+        out.extend_from_slice(&block_id.to_le_bytes());
+        out.extend_from_slice(&value.to_le_bytes());
+        out.extend_from_slice(&iter_id.to_le_bytes());
+    }
+
+    #[test]
+    fn redis_aggregate_parser_indexes_only_read_and_write_events() {
+        let mut chunk = Vec::new();
+        push_record(&mut chunk, OP_INITIAL_SCALAR, 0, 0, 0, 7, 0);
+        push_record(&mut chunk, OP_PRE_PC, NO_VAR_ID, 10, 0, 0, 2);
+        push_record(
+            &mut chunk,
+            OP_UNKNOWN_WRITE,
+            0,
+            10,
+            0,
+            UNKNOWN_REASON_BIG_INT,
+            2,
+        );
+        push_record(&mut chunk, OP_WRITE, 0, 10, 0, 9, 2);
+        push_record(&mut chunk, OP_READ, 0, 11, 0, 9, 2);
+        push_record(&mut chunk, OP_ITER_CONTEXT, 2, 0, 0, 0, 1);
+        assert_eq!(chunk.len(), 6 * RECORD_SIZE);
+
+        let (chunk_tx, chunk_rx) = bounded(1);
+        let (flush_tx, flush_rx) = bounded(32);
+        chunk_tx.send(chunk).unwrap();
+        drop(chunk_tx);
+        let counters = Arc::new(Counters::default());
+        parser_loop(
+            chunk_rx,
+            flush_tx,
+            Arc::new(vec!["$x".to_string()]),
+            Arc::new(vec!["entry".to_string()]),
+            1,
+            100,
+            Arc::clone(&counters),
+        );
+
+        assert_eq!(counters.records_parsed.load(Ordering::Relaxed), 6);
+        let mut value_keys = BTreeSet::new();
+        let mut registry_keys = BTreeSet::new();
+        for command in flush_rx.try_iter() {
+            match command {
+                FlushCmd::Sadd12 { key, members } => {
+                    value_keys.insert(key);
+                    assert!(!members.is_empty());
+                    for member in members {
+                        let value = i64::from_le_bytes(member[..8].try_into().unwrap());
+                        let iter_id = u32::from_le_bytes(member[8..].try_into().unwrap());
+                        assert_eq!(value, 9, "S/U payload leaked into aggregate evidence");
+                        assert_eq!(iter_id, 102);
+                    }
+                }
+                FlushCmd::SaddBytes { key, members } => {
+                    registry_keys.insert(key);
+                    assert!(!members.is_empty());
+                }
+            }
+        }
+
+        assert_eq!(
+            value_keys,
+            BTreeSet::from([
+                "positive_examples_$x_10".to_string(),
+                "positive_examples_$x_11".to_string(),
+                "positive_examples_$x_entry".to_string(),
+                "positive_examples_to_op_type_$x_10_W".to_string(),
+                "positive_examples_to_op_type_$x_11_R".to_string(),
+            ])
+        );
+        assert_eq!(
+            registry_keys,
+            BTreeSet::from([
+                "positive_examples_to_block_$x".to_string(),
+                "positive_examples_to_pc_$x".to_string(),
+            ])
+        );
+    }
 }
 
 /// Encode a u32 PC as a pickle-protocol-5 bytestring equivalent to

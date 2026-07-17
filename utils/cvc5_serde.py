@@ -207,6 +207,54 @@ def _sort_from_obj(obj) -> SerializedSort:
     return SerializedSort(kind, tuple(converted))
 
 
+def term_from_obj(value) -> "SerializedCvc5TermV2":
+    """Decode the canonical object emitted by ``SerializedCvc5TermV2.to_obj``.
+
+    Proof receipts store this JSON-safe object form directly.  Keeping its
+    decoder beside the byte codec gives every consumer one structural parser
+    and the same validation rules.
+    """
+    if (
+        not isinstance(value, (list, tuple))
+        or len(value) != 3
+        or type(value[0]) is not int
+        or type(value[1]) is not int
+        or not isinstance(value[2], (list, tuple))
+    ):
+        raise Cvc5SerdeError("malformed serialized cvc5 term object")
+    nodes = []
+    for row in value[2]:
+        if (
+            not isinstance(row, (list, tuple))
+            or len(row) != 6
+            or not isinstance(row[0], str)
+            or not isinstance(row[2], (list, tuple))
+            or not isinstance(row[4], str)
+            or not isinstance(row[5], (list, tuple))
+            or any(type(child) is not int for child in row[5])
+        ):
+            raise Cvc5SerdeError("malformed serialized cvc5 node object")
+        try:
+            nodes.append(
+                SerializedNode(
+                    kind=row[0],
+                    sort=_sort_from_obj(row[1]),
+                    op_indices=tuple(row[2]),
+                    value=row[3],
+                    symbol=row[4],
+                    children=tuple(row[5]),
+                )
+            )
+        except Exception as exc:
+            raise Cvc5SerdeError(
+                "invalid serialized cvc5 node object"
+            ) from exc
+    try:
+        return SerializedCvc5TermV2(value[0], value[1], tuple(nodes))
+    except Exception as exc:
+        raise Cvc5SerdeError("invalid serialized cvc5 term object") from exc
+
+
 @dataclass(frozen=True, slots=True)
 class SerializedCvc5TermV2:
     version: int
@@ -944,20 +992,8 @@ def classify_hollow(predicate) -> str:
 
 
 def term_from_bytes(data: bytes) -> SerializedCvc5TermV2:
-    version, root, raw_nodes = _unpack_msgpack_obj(
+    value = _unpack_msgpack_obj(
         data,
         context="serialized cvc5 term bytes",
     )
-    nodes = []
-    for kind, sort_obj, op_indices, value, symbol, children in raw_nodes:
-        nodes.append(
-            SerializedNode(
-                kind,
-                _sort_from_obj(sort_obj),
-                tuple(op_indices),
-                value,
-                symbol,
-                tuple(children),
-            )
-        )
-    return SerializedCvc5TermV2(int(version), int(root), tuple(nodes))
+    return term_from_obj(value)

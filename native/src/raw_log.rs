@@ -9,19 +9,32 @@
 //! On-disk format:
 //!   header (in frame 0):
 //!     magic = b"SWRL"                4 bytes
-//!     version = 2                    1 byte
+//!     version = 3                    1 byte
 //!     var_table_len (u32 LE)         4 bytes
 //!     var_table = [len:u16, bytes]*  variable
 //!     block_table_len (u32 LE)       4 bytes
 //!     block_table = [len:u16, bytes]*variable
 //!   records (repeated across frames 1..N):
-//!     kind (u8)    1 byte  — `b'W'` write / `b'R'` read / `b'I'` iter context
+//!     kind (u8)    1 byte  — event kind (see below)
 //!     var_id (u32) 4 bytes — variable id, or context id for `b'I'`
 //!     pc (u32)     4 bytes — pc, or parent context id for `b'I'`
 //!     block_id(u32)4 bytes — block id, or loop header block id for `b'I'`
 //!     value(i64)   8 bytes
 //!     iter_id(u32) 4 bytes — context id, or depth for `b'I'`
 //!   = 25 bytes/record
+//!
+//! SWRL v3 retains the v2 `W`/`R`/`I` events and adds the ordered state
+//! events needed to reconstruct an exact concrete pre-state:
+//!
+//! * `S` — authoritative initial scalar value (virtual pc 0),
+//! * `P` — statement PRE visit, emitted before any operation in that statement,
+//! * `U` — scalar write whose exact value is unavailable (state invalidation).
+//!
+//! A `P` record has no variable, so its `var_id` is [`NO_VAR_ID`].  A `U`
+//! record stores an [`UNKNOWN_REASON_*`] code in `value`.  Record position in
+//! the decompressed, concatenated frame stream is the authoritative event
+//! order.  There is deliberately no redundant sequence field: writers append
+//! from one execution thread, and frame boundaries are record-aligned.
 //!
 //! All fields are little-endian. The byte stream is wrapped in one or
 //! more zstd frames concatenated into a single file. Each frame is
@@ -36,8 +49,24 @@ use std::io::{BufWriter, Write};
 use std::path::Path;
 
 pub const MAGIC: &[u8; 4] = b"SWRL";
-pub const VERSION: u8 = 2;
+pub const VERSION: u8 = 3;
 pub const RECORD_SIZE: usize = 1 + 4 + 4 + 4 + 8 + 4;
+
+pub const OP_WRITE: u8 = b'W';
+pub const OP_READ: u8 = b'R';
+pub const OP_ITER_CONTEXT: u8 = b'I';
+pub const OP_INITIAL_SCALAR: u8 = b'S';
+pub const OP_PRE_PC: u8 = b'P';
+pub const OP_UNKNOWN_WRITE: u8 = b'U';
+
+/// Sentinel in the `var_id` field for events (currently `P`) that are tied to
+/// a program point rather than a variable.
+pub const NO_VAR_ID: u32 = u32::MAX;
+
+/// `U.value`: an exact mathematical integer did not fit the raw log's i64
+/// value field.  The consumer must treat the variable as unknown until a later
+/// `S` or `W`, never wrap or clamp this value.
+pub const UNKNOWN_REASON_BIG_INT: i64 = 1;
 
 /// Number of zstd encoder worker threads. Multi-worker encoding within
 /// a SINGLE frame uses worker threads internally but still produces

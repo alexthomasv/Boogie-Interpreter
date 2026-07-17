@@ -2,7 +2,7 @@ use crate::builtins;
 use crate::builtins::int::{ZResult, Z};
 use crate::memory_map::MemoryMap;
 use crate::opcodes::*;
-use crate::trace::{TraceAccumulator, OP_READ, OP_WRITE};
+use crate::trace::{TraceAccumulator, OP_READ, OP_WRITE, UNKNOWN_REASON_BIG_INT};
 use num_bigint::BigInt;
 
 const MASK_64: i64 = -1i64; // all bits set = u64::MAX as i64
@@ -97,6 +97,10 @@ pub struct VM {
     pub block_entries: u64,
     /// Compact trace accumulator
     pub trace: TraceAccumulator,
+    /// Whether the authoritative scalar entry state has already been emitted.
+    /// A VM may be executed only after all concrete input initialization, so
+    /// the first `execute_with_limit` call owns this one-time snapshot.
+    initial_trace_seeded: bool,
     /// Whether to log reads
     pub log_read: bool,
     /// Whether to skip all tracing (for benchmarking)
@@ -186,6 +190,7 @@ impl VM {
             record_block_trace: true,
             block_entries: 0,
             trace,
+            initial_trace_seeded: false,
             log_read: true,
             alloc_addr: 0,
             alloc_addr_shadow: 0,
@@ -282,6 +287,32 @@ impl VM {
         self.vars[var_id as usize] = Value::Map(idx);
     }
 
+    /// Emit the complete concrete scalar entry state exactly once, after all
+    /// input/static initialization and before the first statement PRE event.
+    /// Maps have no scalar value.  An out-of-i64 initial integer is represented
+    /// by `U`, so consumers never revive a stale or wrapped stand-in.
+    fn seed_initial_trace(&mut self, entry_block_id: BlockId) {
+        if self.no_trace || self.initial_trace_seeded {
+            return;
+        }
+        self.initial_trace_seeded = true;
+        for (vid, value) in self.vars.iter().enumerate() {
+            match value {
+                Value::Scalar(value) => {
+                    self.trace
+                        .record_initial_scalar(vid as VarId, *value, entry_block_id)
+                }
+                Value::Big(_) => self.trace.record_unknown_write(
+                    vid as VarId,
+                    0,
+                    entry_block_id,
+                    UNKNOWN_REASON_BIG_INT,
+                ),
+                Value::Map(_) => {}
+            }
+        }
+    }
+
     /// Set a scalar variable.
     #[inline]
     pub fn set_scalar(&mut self, var_id: VarId, value: i64, silent: bool) {
@@ -292,15 +323,19 @@ impl VM {
         } else if Some(var_id) == self.curr_addr_shadow_id {
             self.alloc_addr_shadow = value;
         }
-        if !self.no_trace && !silent {
+        // `silent` is an initialization-only escape hatch. Once the entry
+        // snapshot has been emitted, every scalar mutation must remain visible
+        // even if a caller accidentally retains the initialization flag.
+        if !self.no_trace && (!silent || self.initial_trace_seeded) {
             self.trace
                 .record(var_id, value, self.pc, self.curr_block_id, OP_WRITE);
         }
         self.vars[vid] = Value::Scalar(value);
     }
 
-    /// Store an out-of-i64 exact integer (Int mode). No trace record is
-    /// emitted — see `big_trace_skips` for why the escape is a counted skip.
+    /// Store an out-of-i64 exact integer (Int mode). The fixed-width trace
+    /// cannot carry its value, so emit an explicit `U` invalidation and count
+    /// the escape in `big_trace_skips`.
     #[inline]
     pub fn set_big(&mut self, var_id: VarId, value: Box<BigInt>) {
         if Some(var_id) == self.curr_addr_id || Some(var_id) == self.curr_addr_shadow_id {
@@ -311,6 +346,12 @@ impl VM {
         }
         if !self.no_trace {
             self.big_trace_skips += 1;
+            self.trace.record_unknown_write(
+                var_id,
+                self.pc,
+                self.curr_block_id,
+                UNKNOWN_REASON_BIG_INT,
+            );
         }
         self.vars[var_id as usize] = Value::Big(value);
     }
@@ -389,6 +430,14 @@ impl VM {
         if let Some(map_idx) = self.var_to_map[vid] {
             self.memory_maps[map_idx].clear();
         } else {
+            // Do not route this through set_scalar: clearing $CurrAddr's
+            // materialized slot must not reset the separate allocation cursor.
+            // It is nevertheless a real scalar mutation and therefore a known
+            // W in the ordered witness stream.
+            if !self.no_trace {
+                self.trace
+                    .record(var_id, 0, self.pc, self.curr_block_id, OP_WRITE);
+            }
             self.vars[vid] = Value::Scalar(0);
         }
     }
@@ -430,6 +479,10 @@ impl VM {
     ) -> ExecutionStatus {
         let mut block_id = program.entry_block;
         let mut steps = 0usize;
+        // Concrete inputs/static state are fully installed before execution
+        // enters here.  Seed them before preconditions and, critically, before
+        // the first statement PRE marker.
+        self.seed_initial_trace(program.entry_block);
         if let Some(status) = self.check_entry_preconditions(program) {
             return status;
         }
@@ -452,18 +505,34 @@ impl VM {
                 return status;
             }
 
-            // Execute body statements
-            for stmt in &block.body {
+            // Execute verifier-addressable (top-level) body statements. Nested
+            // structured If/While bodies are part of their enclosing statement
+            // and do not own PCs in static metadata, so there is exactly one P
+            // per top-level dispatch. Re-establishing pc from the top-level
+            // index also prevents nested execution from shifting a later real
+            // statement onto a fake verifier PC.
+            for (stmt_index, stmt) in block.body.iter().enumerate() {
+                self.pc = block.start_pc + stmt_index as u32;
                 if let Some(status) = self.consume_step(&mut steps, max_steps, program) {
                     return status;
+                }
+                if !self.no_trace {
+                    self.trace.record_pre_pc(self.pc, self.curr_block_id);
                 }
                 if let Err(status) = self.execute_stmt(stmt, program) {
                     return status;
                 }
-                self.pc += 1;
+            }
+            self.pc = block.start_pc + block.body.len() as u32;
+
+            // The terminator is also a verifier-addressable statement. Its P
+            // must precede branch-resolution reads, and a def-free Return still
+            // needs exact visit authority.
+            if !self.no_trace {
+                self.trace.record_pre_pc(self.pc, self.curr_block_id);
             }
 
-            // Handle terminator
+            // Handle terminator.
             match &block.terminator {
                 Stmt::Return => return ExecutionStatus::Completed,
                 Stmt::Goto { targets } => {
@@ -627,8 +696,18 @@ impl VM {
                                 self.trace
                                     .record(vid, val, self.pc, self.curr_block_id, OP_WRITE);
                             }
-                            // Out-of-i64 exact value: counted trace skip.
-                            Value::Big(_) => self.big_trace_skips += 1,
+                            // The snapshot is a logical write in the trace. An
+                            // out-of-i64 value must invalidate older exact
+                            // values instead of silently leaving one live.
+                            Value::Big(_) => {
+                                self.big_trace_skips += 1;
+                                self.trace.record_unknown_write(
+                                    vid,
+                                    self.pc,
+                                    self.curr_block_id,
+                                    UNKNOWN_REASON_BIG_INT,
+                                );
+                            }
                             Value::Map(_) => {}
                         }
                     }
@@ -854,7 +933,6 @@ impl VM {
                 let body: &Vec<Stmt> = if take_then { then_body } else { else_body };
                 for inner in body {
                     self.execute_stmt(inner, program)?;
-                    self.pc += 1;
                 }
             }
             Stmt::While { cond, body } => {
@@ -864,7 +942,6 @@ impl VM {
                 while self.eval_bool(cond, program) {
                     for inner in body {
                         self.execute_stmt(inner, program)?;
-                        self.pc += 1;
                     }
                 }
             }
@@ -1639,5 +1716,185 @@ fn eval_result_to_z(e: EvalResult) -> Z {
         EvalResult::Bool(b) => Z::S(b as i64),
         EvalResult::Big(b) => Z::B(b),
         EvalResult::MapRef(_) => panic!("Expected scalar, got map"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::raw_log::RawLogWriter;
+    use crate::raw_log::{
+        NO_VAR_ID, OP_INITIAL_SCALAR, OP_PRE_PC, OP_UNKNOWN_WRITE, RECORD_SIZE,
+        UNKNOWN_REASON_BIG_INT, VERSION,
+    };
+    use rustc_hash::FxHashMap;
+    use std::fs::File;
+    use std::io::Read;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct RawRecord {
+        kind: u8,
+        var_id: u32,
+        pc: u32,
+        block_id: u32,
+        value: i64,
+        iter_id: u32,
+    }
+
+    fn test_program() -> CompiledProgram {
+        let mut program = CompiledProgram {
+            blocks: vec![Block {
+                name: "entry".to_string(),
+                id: 0,
+                body: vec![
+                    Stmt::Assign1 {
+                        lhs: 0,
+                        rhs: Expr::Const(7),
+                    },
+                    Stmt::If {
+                        cond: Expr::Bool(true),
+                        then_body: vec![Stmt::Assign1 {
+                            lhs: 1,
+                            rhs: Expr::Var(0),
+                        }],
+                        else_body: vec![],
+                    },
+                    Stmt::Assign1 {
+                        lhs: 0,
+                        rhs: Expr::ConstBig(Box::new(BigInt::from(i64::MAX) + BigInt::from(1u8))),
+                    },
+                    Stmt::Havoc { vars: vec![0] },
+                ],
+                terminator: Stmt::Return,
+                start_pc: 10,
+                assume_cond: None,
+            }],
+            label_to_block: FxHashMap::default(),
+            var_names: vec!["$x".to_string(), "$y".to_string()],
+            name_to_var: FxHashMap::default(),
+            entry_block: 0,
+            entry_preconditions: vec![],
+            mem_maps: vec![],
+            num_vars: 2,
+            curr_addr_id: None,
+            curr_addr_shadow_id: None,
+            m0_id: None,
+            m0_shadow_id: None,
+            loop_header_live_vars: FxHashMap::default(),
+            is_loop_header: vec![false],
+            block_innermost_header: vec![None],
+            loop_parent_header: vec![None],
+            static_scalars: vec![],
+            mode: SemanticsMode::Int,
+        };
+        program.rebuild_lookup_maps();
+        program
+    }
+
+    fn read_raw_records(path: &std::path::Path) -> (u8, Vec<RawRecord>) {
+        let file = File::open(path).unwrap();
+        let mut decoder = zstd::stream::read::Decoder::new(file).unwrap();
+        let mut data = Vec::new();
+        decoder.read_to_end(&mut data).unwrap();
+        assert_eq!(&data[..4], b"SWRL");
+        let version = data[4];
+        let mut offset = 5usize;
+        for _ in 0..2 {
+            let count = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
+            offset += 4;
+            for _ in 0..count {
+                let size =
+                    u16::from_le_bytes(data[offset..offset + 2].try_into().unwrap()) as usize;
+                offset += 2 + size;
+            }
+        }
+        assert_eq!((data.len() - offset) % RECORD_SIZE, 0);
+        let records = data[offset..]
+            .chunks_exact(RECORD_SIZE)
+            .map(|record| RawRecord {
+                kind: record[0],
+                var_id: u32::from_le_bytes(record[1..5].try_into().unwrap()),
+                pc: u32::from_le_bytes(record[5..9].try_into().unwrap()),
+                block_id: u32::from_le_bytes(record[9..13].try_into().unwrap()),
+                value: i64::from_le_bytes(record[13..21].try_into().unwrap()),
+                iter_id: u32::from_le_bytes(record[21..25].try_into().unwrap()),
+            })
+            .collect();
+        (version, records)
+    }
+
+    #[test]
+    fn ordered_trace_has_entry_state_real_pre_pcs_and_unknown_invalidation() {
+        let program = test_program();
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "swoosh_vm_trace_v3_{}_{}.raw.zst",
+            std::process::id(),
+            unique,
+        ));
+        let mut writer = RawLogWriter::create(&path).unwrap();
+        writer
+            .write_header(&program.var_names, &["entry".to_string()])
+            .unwrap();
+
+        let mut vm = VM::new(&program);
+        vm.trace.raw_log = Some(writer);
+        let status = vm.execute_with_limit(&program, 100);
+        assert!(matches!(status, ExecutionStatus::Completed));
+        let record_count = vm.trace.raw_log.take().unwrap().finish().unwrap();
+
+        let (version, records) = read_raw_records(&path);
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(version, VERSION);
+        assert_eq!(record_count as usize, records.len());
+
+        // Both scalar entry values precede every statement visit.
+        assert_eq!(records[0].kind, OP_INITIAL_SCALAR);
+        assert_eq!(records[0].var_id, 0);
+        assert_eq!(records[0].value, 0);
+        assert_eq!(records[1].kind, OP_INITIAL_SCALAR);
+        assert_eq!(records[1].var_id, 1);
+        assert_eq!(records[1].value, 0);
+
+        // Structured bodies are not verifier-addressable PCs. The enclosing
+        // If owns exactly one P at 11, its nested R/W stay at 11, and the next
+        // real top-level statement gets P at 12 rather than a shifted fake PC.
+        let pre_pcs: Vec<u32> = records
+            .iter()
+            .filter(|record| record.kind == OP_PRE_PC)
+            .map(|record| {
+                assert_eq!(record.var_id, NO_VAR_ID);
+                record.pc
+            })
+            .collect();
+        assert_eq!(pre_pcs, vec![10, 11, 12, 13, 14]);
+
+        let if_events: Vec<(u8, u32)> = records
+            .iter()
+            .filter(|record| record.pc == 11)
+            .map(|record| (record.kind, record.var_id))
+            .collect();
+        assert_eq!(
+            if_events,
+            vec![(OP_PRE_PC, NO_VAR_ID), (OP_READ, 0), (OP_WRITE, 1)]
+        );
+
+        let unknown = records
+            .iter()
+            .find(|record| record.kind == OP_UNKNOWN_WRITE)
+            .expect("BigInt assignment must invalidate the prior scalar value");
+        assert_eq!(unknown.var_id, 0);
+        assert_eq!(unknown.pc, 12);
+        assert_eq!(unknown.value, UNKNOWN_REASON_BIG_INT);
+
+        let clear = records
+            .iter()
+            .find(|record| record.kind == OP_WRITE && record.pc == 13 && record.var_id == 0)
+            .expect("havoc clear must restore an exact scalar write");
+        assert_eq!(clear.value, 0);
     }
 }

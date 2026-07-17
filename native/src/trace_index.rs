@@ -5,7 +5,10 @@
 //! one SQLite insert per final evidence key. This avoids the expensive
 //! SQLite read/modify/write loop that dominated large traces.
 
-use crate::raw_log::{MAGIC, RECORD_SIZE, VERSION};
+use crate::raw_log::{
+    MAGIC, OP_INITIAL_SCALAR, OP_ITER_CONTEXT, OP_PRE_PC, OP_READ, OP_UNKNOWN_WRITE, OP_WRITE,
+    RECORD_SIZE, VERSION,
+};
 use crossbeam_channel::{bounded, Receiver, Sender};
 use memmap2::Mmap;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -22,10 +25,13 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-// v3: straight-line (iter_id==0) records get a per-execution unique id instead
-// of the shared 0 bucket, so a co-occurrence tuple can never pair variables from
-// two different input executions (the cross-trace fabrication bug).
-const TRACE_INDEX_VERSION: &str = "3";
+// v4 retains the v3 aggregate evidence and adds exact, physically ordered PRE
+// visits and scalar S/W/U timelines.  Sequence numbers are reconstructed from
+// frame/record position; the raw record stays compact and unchanged.
+// SWRL v2 inputs are intentionally rejected: publishing a v4 SQLite index from
+// an aggregate-only raw stream could mislabel missing PRE visits as authority.
+const TRACE_INDEX_VERSION: &str = "4";
+const ORDERED_TRACE_VERSION: &str = "1";
 
 const NUM_DECODERS: usize = 8;
 const NUM_PARSERS: usize = 4;
@@ -41,7 +47,8 @@ const RUN_KEY_SIZE: usize = 10;
 const KIND_PC: u8 = 0;
 const KIND_BLOCK: u8 = 1;
 const KIND_OP: u8 = 2;
-const OP_ITER_CONTEXT: u8 = b'I';
+const ORDERED_VISIT_MEMBER_SIZE: usize = 8;
+const ORDERED_SCALAR_MEMBER_SIZE: usize = 8 + 1 + 4 + 8;
 
 #[derive(Debug)]
 pub struct BuildResult {
@@ -128,6 +135,40 @@ struct ParsedBatch {
     contexts: Vec<LocalContextDef>,
 }
 
+enum ParserOutput {
+    Aggregate(ParsedBatch),
+    Ordered(OrderedBatch),
+}
+
+struct DecodedChunk {
+    frame_ordinal: u32,
+    first_record_ordinal: u32,
+    bytes: Vec<u8>,
+}
+
+struct OrderedBatch {
+    execution_id: u32,
+    var_names: Arc<Vec<String>>,
+    visits: Vec<OrderedVisitChunk>,
+    scalar_timelines: Vec<OrderedScalarChunk>,
+}
+
+struct OrderedVisitChunk {
+    pc: u32,
+    first_event_seq: u64,
+    last_event_seq: u64,
+    event_count: u32,
+    events: Vec<u8>,
+}
+
+struct OrderedScalarChunk {
+    var_id: u32,
+    first_event_seq: u64,
+    last_event_seq: u64,
+    event_count: u32,
+    events: Vec<u8>,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct LocalContextDef {
     iter_id: u32,
@@ -188,6 +229,7 @@ pub fn build_trace_index_sqlite(
 
     let started = Instant::now();
     let mut run_writer = RunFileWriter::create(sqlite_path)?;
+    let mut sqlite = SqliteTraceIndexWriter::create(sqlite_path, bench)?;
     eprintln!(
         "[trace-index] building {} from {} raw trace file(s) via sorted runs",
         sqlite_path.display(),
@@ -207,7 +249,13 @@ pub fn build_trace_index_sqlite(
         // single shared bucket, so a tuple at a non-loop pc could pair var X from
         // one input run with var Y from another.
         let mut next_used: u32 = 0;
-        for path in raw_paths {
+        for (path_index, path) in raw_paths.iter().enumerate() {
+            let execution_id = u32::try_from(path_index + 1).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "trace execution id space exhausted",
+                )
+            })?;
             let iter_base = next_used.checked_add(1).ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -216,10 +264,12 @@ pub fn build_trace_index_sqlite(
             })?;
             let max_raw_iter = process_raw_file(
                 path,
+                execution_id,
                 iter_base,
                 kinds,
                 flush_members,
                 &mut run_writer,
+                &mut sqlite,
                 Arc::clone(&counters),
             )?;
             next_used = iter_base.checked_add(max_raw_iter).ok_or_else(|| {
@@ -235,7 +285,6 @@ pub fn build_trace_index_sqlite(
             "[trace-index] merging {} sorted run file(s)",
             format_commas(run_writer.run_paths.len() as u64)
         );
-        let mut sqlite = SqliteTraceIndexWriter::create(sqlite_path, bench)?;
         sqlite.set_meta("source", "raw_log")?;
         sqlite.set_meta("builder", "native_sqlite_sorted_runs")?;
         sqlite.set_meta("raw_files", raw_paths.len().to_string().as_str())?;
@@ -331,10 +380,12 @@ fn keep_run_files() -> bool {
 
 fn process_raw_file(
     path: &Path,
+    execution_id: u32,
     iter_base: u32,
     kinds: IndexKinds,
     flush_members: u64,
     run_writer: &mut RunFileWriter,
+    sqlite: &mut SqliteTraceIndexWriter,
     counters: Arc<Counters>,
 ) -> io::Result<u32> {
     let file = File::open(path)?;
@@ -357,7 +408,20 @@ fn process_raw_file(
     let var_names = Arc::new(var_names);
     let block_names = Arc::new(block_names);
 
-    let record_frames = frame_ranges[1..].to_vec();
+    let record_frames: Vec<FrameJob> = frame_ranges
+        .into_iter()
+        .enumerate()
+        .skip(1)
+        .map(|(frame_ordinal, range)| {
+            let frame_ordinal = u32::try_from(frame_ordinal).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "too many raw trace frames")
+            })?;
+            Ok(FrameJob {
+                frame_ordinal,
+                range,
+            })
+        })
+        .collect::<io::Result<_>>()?;
 
     eprintln!(
         "[trace-index] reading {} ({:.2} GB compressed, {} frames, iter_base={})",
@@ -367,8 +431,8 @@ fn process_raw_file(
         iter_base
     );
 
-    let (chunk_tx, chunk_rx) = bounded::<Vec<u8>>(256);
-    let (batch_tx, batch_rx) = bounded::<ParsedBatch>(64);
+    let (chunk_tx, chunk_rx) = bounded::<DecodedChunk>(256);
+    let (batch_tx, batch_rx) = bounded::<ParserOutput>(64);
     let max_raw_iter = Arc::new(AtomicU32::new(0));
 
     let mut parser_handles = Vec::with_capacity(NUM_PARSERS);
@@ -385,6 +449,7 @@ fn process_raw_file(
                 tx,
                 var_names,
                 block_names,
+                execution_id,
                 iter_base,
                 kinds,
                 flush_members,
@@ -397,9 +462,9 @@ fn process_raw_file(
     drop(batch_tx);
 
     let (frame_tx, frame_rx) = bounded::<FrameJob>(record_frames.len().max(1));
-    for range in record_frames.iter().cloned() {
+    for job in record_frames.iter().cloned() {
         frame_tx
-            .send(FrameJob { range })
+            .send(job)
             .expect("frame channel capacity matches job count");
     }
     drop(frame_tx);
@@ -416,14 +481,20 @@ fn process_raw_file(
     drop(frame_rx);
     drop(chunk_tx);
 
-    while let Ok(batch) = batch_rx.recv() {
-        run_writer.write_batch(batch)?;
-        counters
-            .runs_written
-            .store(run_writer.run_paths.len() as u64, Ordering::Relaxed);
-        counters
-            .run_groups_written
-            .store(run_writer.groups_written, Ordering::Relaxed);
+    sqlite.begin()?;
+    while let Ok(output) = batch_rx.recv() {
+        match output {
+            ParserOutput::Aggregate(batch) => {
+                run_writer.write_batch(batch)?;
+                counters
+                    .runs_written
+                    .store(run_writer.run_paths.len() as u64, Ordering::Relaxed);
+                counters
+                    .run_groups_written
+                    .store(run_writer.groups_written, Ordering::Relaxed);
+            }
+            ParserOutput::Ordered(batch) => sqlite.insert_ordered_batch(batch)?,
+        }
     }
 
     for handle in decoder_handles {
@@ -446,10 +517,13 @@ fn process_raw_file(
             ));
         }
     }
+    sqlite.commit()?;
     Ok(max_raw_iter.load(Ordering::Relaxed))
 }
 
+#[derive(Clone)]
 struct FrameJob {
+    frame_ordinal: u32,
     range: std::ops::Range<usize>,
 }
 
@@ -528,7 +602,7 @@ fn read_name_table<R: Read>(reader: &mut R) -> io::Result<Vec<String>> {
 
 fn decoder_loop(
     frame_rx: Receiver<FrameJob>,
-    chunk_tx: Sender<Vec<u8>>,
+    chunk_tx: Sender<DecodedChunk>,
     mmap: Arc<Mmap>,
     counters: Arc<Counters>,
 ) -> io::Result<()> {
@@ -536,6 +610,7 @@ fn decoder_loop(
     let mut out_buf = vec![0u8; MAX_FRAME_OUTPUT];
 
     while let Ok(job) = frame_rx.recv() {
+        let frame_ordinal = job.frame_ordinal;
         let out_len = dctx
             .decompress_to_buffer(&mmap[job.range], &mut out_buf)
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))?;
@@ -556,7 +631,20 @@ fn decoder_loop(
             counters
                 .bytes_decoded
                 .fetch_add(take_aligned as u64, Ordering::Relaxed);
-            if chunk_tx.send(out_buf[offset..end].to_vec()).is_err() {
+            let first_record_ordinal = u32::try_from(offset / RECORD_SIZE).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "raw trace frame has too many records",
+                )
+            })?;
+            if chunk_tx
+                .send(DecodedChunk {
+                    frame_ordinal,
+                    first_record_ordinal,
+                    bytes: out_buf[offset..end].to_vec(),
+                })
+                .is_err()
+            {
                 return Ok(());
             }
             offset = end;
@@ -567,10 +655,11 @@ fn decoder_loop(
 
 #[allow(clippy::too_many_arguments)]
 fn parser_loop(
-    chunk_rx: Receiver<Vec<u8>>,
-    batch_tx: Sender<ParsedBatch>,
+    chunk_rx: Receiver<DecodedChunk>,
+    batch_tx: Sender<ParserOutput>,
     var_names: Arc<Vec<String>>,
     block_names: Arc<Vec<String>>,
+    execution_id: u32,
     iter_base: u32,
     kinds: IndexKinds,
     flush_members: u64,
@@ -589,42 +678,49 @@ fn parser_loop(
         let mut indexed_this_chunk = 0u64;
         let mut skipped_shadow_this_chunk = 0u64;
         let mut contexts_this_chunk = 0u64;
+        let mut ordered_visits: FxHashMap<u32, OrderedVisitChunk> = FxHashMap::default();
+        let mut ordered_scalars: FxHashMap<u32, OrderedScalarChunk> = FxHashMap::default();
         let mut off = 0usize;
-        while off + RECORD_SIZE <= chunk.len() {
-            let kind = chunk[off];
+        while off + RECORD_SIZE <= chunk.bytes.len() {
+            let record_ordinal = chunk
+                .first_record_ordinal
+                .checked_add((off / RECORD_SIZE) as u32)
+                .expect("decoded trace chunk record ordinal overflow");
+            let event_seq = ((chunk.frame_ordinal as u64) << 32) | record_ordinal as u64;
+            let kind = chunk.bytes[off];
             let var_id = u32::from_le_bytes([
-                chunk[off + 1],
-                chunk[off + 2],
-                chunk[off + 3],
-                chunk[off + 4],
+                chunk.bytes[off + 1],
+                chunk.bytes[off + 2],
+                chunk.bytes[off + 3],
+                chunk.bytes[off + 4],
             ]);
             let pc = u32::from_le_bytes([
-                chunk[off + 5],
-                chunk[off + 6],
-                chunk[off + 7],
-                chunk[off + 8],
+                chunk.bytes[off + 5],
+                chunk.bytes[off + 6],
+                chunk.bytes[off + 7],
+                chunk.bytes[off + 8],
             ]);
             let block_id = u32::from_le_bytes([
-                chunk[off + 9],
-                chunk[off + 10],
-                chunk[off + 11],
-                chunk[off + 12],
+                chunk.bytes[off + 9],
+                chunk.bytes[off + 10],
+                chunk.bytes[off + 11],
+                chunk.bytes[off + 12],
             ]);
             let value = i64::from_le_bytes([
-                chunk[off + 13],
-                chunk[off + 14],
-                chunk[off + 15],
-                chunk[off + 16],
-                chunk[off + 17],
-                chunk[off + 18],
-                chunk[off + 19],
-                chunk[off + 20],
+                chunk.bytes[off + 13],
+                chunk.bytes[off + 14],
+                chunk.bytes[off + 15],
+                chunk.bytes[off + 16],
+                chunk.bytes[off + 17],
+                chunk.bytes[off + 18],
+                chunk.bytes[off + 19],
+                chunk.bytes[off + 20],
             ]);
             let iter_id = u32::from_le_bytes([
-                chunk[off + 21],
-                chunk[off + 22],
-                chunk[off + 23],
-                chunk[off + 24],
+                chunk.bytes[off + 21],
+                chunk.bytes[off + 22],
+                chunk.bytes[off + 23],
+                chunk.bytes[off + 24],
             ]);
             off += RECORD_SIZE;
             parsed_this_chunk += 1;
@@ -656,10 +752,33 @@ fn parser_loop(
                 continue;
             }
 
+            if kind == OP_PRE_PC {
+                push_ordered_visit(&mut ordered_visits, pc, event_seq);
+                continue;
+            }
+
+            let scalar_event = matches!(kind, OP_INITIAL_SCALAR | OP_WRITE | OP_UNKNOWN_WRITE);
+            if scalar_event {
+                if var_id as usize >= n_vars {
+                    continue;
+                }
+                if var_names[var_id as usize].ends_with(".shadow") {
+                    skipped_shadow_this_chunk += 1;
+                    continue;
+                }
+                push_ordered_scalar(&mut ordered_scalars, var_id, event_seq, kind, pc, value);
+                if kind != OP_WRITE {
+                    continue;
+                }
+            } else if kind != OP_READ {
+                // Unknown event kinds never acquire aggregate-value semantics.
+                continue;
+            }
+
             if var_id as usize >= n_vars || block_id as usize >= n_blocks {
                 continue;
             }
-            if var_names[var_id as usize].ends_with(".shadow") {
+            if !scalar_event && var_names[var_id as usize].ends_with(".shadow") {
                 skipped_shadow_this_chunk += 1;
                 continue;
             }
@@ -728,6 +847,19 @@ fn parser_loop(
             }
         }
 
+        if !ordered_visits.is_empty() || !ordered_scalars.is_empty() {
+            let mut visits: Vec<_> = ordered_visits.into_values().collect();
+            visits.sort_unstable_by_key(|chunk| chunk.pc);
+            let mut scalar_timelines: Vec<_> = ordered_scalars.into_values().collect();
+            scalar_timelines.sort_unstable_by_key(|chunk| chunk.var_id);
+            let _ = batch_tx.send(ParserOutput::Ordered(OrderedBatch {
+                execution_id,
+                var_names: Arc::clone(&var_names),
+                visits,
+                scalar_timelines,
+            }));
+        }
+
         counters
             .records_parsed
             .fetch_add(parsed_this_chunk, Ordering::Relaxed);
@@ -770,8 +902,48 @@ fn push_member(
     values.entry(key).or_default().insert(member);
 }
 
+#[inline]
+fn push_ordered_visit(visits: &mut FxHashMap<u32, OrderedVisitChunk>, pc: u32, event_seq: u64) {
+    let chunk = visits.entry(pc).or_insert_with(|| OrderedVisitChunk {
+        pc,
+        first_event_seq: event_seq,
+        last_event_seq: event_seq,
+        event_count: 0,
+        events: Vec::new(),
+    });
+    chunk.last_event_seq = event_seq;
+    chunk.event_count += 1;
+    chunk.events.extend_from_slice(&event_seq.to_le_bytes());
+}
+
+#[inline]
+fn push_ordered_scalar(
+    timelines: &mut FxHashMap<u32, OrderedScalarChunk>,
+    var_id: u32,
+    event_seq: u64,
+    kind: u8,
+    pc: u32,
+    value: i64,
+) {
+    let chunk = timelines
+        .entry(var_id)
+        .or_insert_with(|| OrderedScalarChunk {
+            var_id,
+            first_event_seq: event_seq,
+            last_event_seq: event_seq,
+            event_count: 0,
+            events: Vec::new(),
+        });
+    chunk.last_event_seq = event_seq;
+    chunk.event_count += 1;
+    chunk.events.extend_from_slice(&event_seq.to_le_bytes());
+    chunk.events.push(kind);
+    chunk.events.extend_from_slice(&pc.to_le_bytes());
+    chunk.events.extend_from_slice(&value.to_le_bytes());
+}
+
 fn send_batch(
-    batch_tx: &Sender<ParsedBatch>,
+    batch_tx: &Sender<ParserOutput>,
     var_names: &Arc<Vec<String>>,
     block_names: &Arc<Vec<String>>,
     values: &mut FxHashMap<IndexKey, FxHashSet<[u8; 12]>>,
@@ -784,12 +956,12 @@ fn send_batch(
     std::mem::swap(values, &mut batch_values);
     let mut batch_contexts = Vec::new();
     std::mem::swap(contexts, &mut batch_contexts);
-    let _ = batch_tx.send(ParsedBatch {
+    let _ = batch_tx.send(ParserOutput::Aggregate(ParsedBatch {
         var_names: Arc::clone(var_names),
         block_names: Arc::clone(block_names),
         values: batch_values,
         contexts: batch_contexts,
-    });
+    }));
 }
 
 #[derive(Default)]
@@ -1202,6 +1374,8 @@ struct SqliteTraceIndexWriter {
     db: *mut sqlite3,
     insert_stmt: *mut sqlite3_stmt,
     context_stmt: *mut sqlite3_stmt,
+    pre_visit_stmt: *mut sqlite3_stmt,
+    scalar_timeline_stmt: *mut sqlite3_stmt,
     meta_stmt: *mut sqlite3_stmt,
 }
 
@@ -1225,6 +1399,8 @@ impl SqliteTraceIndexWriter {
             db,
             insert_stmt: ptr::null_mut(),
             context_stmt: ptr::null_mut(),
+            pre_visit_stmt: ptr::null_mut(),
+            scalar_timeline_stmt: ptr::null_mut(),
             meta_stmt: ptr::null_mut(),
         };
         writer.exec(
@@ -1247,6 +1423,24 @@ impl SqliteTraceIndexWriter {
                 header TEXT NOT NULL,
                 iter_count INTEGER NOT NULL
             ) WITHOUT ROWID;
+            CREATE TABLE IF NOT EXISTS trace_pre_visits (
+                pc INTEGER NOT NULL,
+                execution_id INTEGER NOT NULL,
+                first_event_seq INTEGER NOT NULL,
+                last_event_seq INTEGER NOT NULL,
+                event_count INTEGER NOT NULL,
+                events BLOB NOT NULL,
+                PRIMARY KEY (pc, execution_id, first_event_seq)
+            ) WITHOUT ROWID;
+            CREATE TABLE IF NOT EXISTS trace_scalar_timelines (
+                var TEXT NOT NULL,
+                execution_id INTEGER NOT NULL,
+                first_event_seq INTEGER NOT NULL,
+                last_event_seq INTEGER NOT NULL,
+                event_count INTEGER NOT NULL,
+                events BLOB NOT NULL,
+                PRIMARY KEY (var, execution_id, first_event_seq)
+            ) WITHOUT ROWID;
             CREATE TABLE IF NOT EXISTS trace_index_meta (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
@@ -1262,9 +1456,30 @@ impl SqliteTraceIndexWriter {
              (iter_id, parent_iter_id, depth, header, iter_count) \
              VALUES(?, ?, ?, ?, ?)",
         )?;
+        writer.pre_visit_stmt = writer.prepare(
+            "INSERT INTO trace_pre_visits\
+             (pc, execution_id, first_event_seq, last_event_seq, event_count, events) \
+             VALUES(?, ?, ?, ?, ?, ?)",
+        )?;
+        writer.scalar_timeline_stmt = writer.prepare(
+            "INSERT INTO trace_scalar_timelines\
+             (var, execution_id, first_event_seq, last_event_seq, event_count, events) \
+             VALUES(?, ?, ?, ?, ?, ?)",
+        )?;
         writer.meta_stmt =
             writer.prepare("INSERT OR REPLACE INTO trace_index_meta(key, value) VALUES(?, ?)")?;
         writer.set_meta("schema_version", TRACE_INDEX_VERSION)?;
+        writer.set_meta("ordered_trace_version", ORDERED_TRACE_VERSION)?;
+        writer.set_meta("ordered_trace_authority", "awaiting_completion_manifest")?;
+        writer.set_meta(
+            "ordered_sequence_encoding",
+            "u64:(physical_frame_ordinal<<32)|record_ordinal",
+        )?;
+        writer.set_meta("ordered_visit_encoding", "le:u64-event-seq")?;
+        writer.set_meta(
+            "ordered_scalar_encoding",
+            "le:u64-seq,u8-kind,u32-pc,i64-value",
+        )?;
         if let Some(bench) = bench {
             writer.set_meta("benchmark", bench)?;
         }
@@ -1321,6 +1536,68 @@ impl SqliteTraceIndexWriter {
             }
         }
         self.commit()
+    }
+
+    fn insert_ordered_batch(&mut self, batch: OrderedBatch) -> io::Result<()> {
+        for visit in batch.visits {
+            if visit.events.len() != visit.event_count as usize * ORDERED_VISIT_MEMBER_SIZE {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "packed PRE-visit chunk has an invalid size",
+                ));
+            }
+            unsafe {
+                bind_i64(self.pre_visit_stmt, 1, visit.pc as i64)?;
+                bind_i64(self.pre_visit_stmt, 2, batch.execution_id as i64)?;
+                bind_i64(
+                    self.pre_visit_stmt,
+                    3,
+                    ordered_seq_as_i64(visit.first_event_seq)?,
+                )?;
+                bind_i64(
+                    self.pre_visit_stmt,
+                    4,
+                    ordered_seq_as_i64(visit.last_event_seq)?,
+                )?;
+                bind_i64(self.pre_visit_stmt, 5, visit.event_count as i64)?;
+                bind_blob(self.pre_visit_stmt, 6, &visit.events)?;
+                step_done(self.db, self.pre_visit_stmt)?;
+                reset_and_clear(self.db, self.pre_visit_stmt)?;
+            }
+        }
+        for timeline in batch.scalar_timelines {
+            if timeline.events.len() != timeline.event_count as usize * ORDERED_SCALAR_MEMBER_SIZE {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "packed scalar-timeline chunk has an invalid size",
+                ));
+            }
+            let var = batch
+                .var_names
+                .get(timeline.var_id as usize)
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "bad ordered scalar var id")
+                })?;
+            unsafe {
+                bind_text(self.scalar_timeline_stmt, 1, var)?;
+                bind_i64(self.scalar_timeline_stmt, 2, batch.execution_id as i64)?;
+                bind_i64(
+                    self.scalar_timeline_stmt,
+                    3,
+                    ordered_seq_as_i64(timeline.first_event_seq)?,
+                )?;
+                bind_i64(
+                    self.scalar_timeline_stmt,
+                    4,
+                    ordered_seq_as_i64(timeline.last_event_seq)?,
+                )?;
+                bind_i64(self.scalar_timeline_stmt, 5, timeline.event_count as i64)?;
+                bind_blob(self.scalar_timeline_stmt, 6, &timeline.events)?;
+                step_done(self.db, self.scalar_timeline_stmt)?;
+                reset_and_clear(self.db, self.scalar_timeline_stmt)?;
+            }
+        }
+        Ok(())
     }
 
     fn prepare(&self, sql: &str) -> io::Result<*mut sqlite3_stmt> {
@@ -1398,9 +1675,13 @@ impl SqliteTraceIndexWriter {
         unsafe {
             sqlite3_finalize(self.insert_stmt);
             sqlite3_finalize(self.context_stmt);
+            sqlite3_finalize(self.pre_visit_stmt);
+            sqlite3_finalize(self.scalar_timeline_stmt);
             sqlite3_finalize(self.meta_stmt);
             self.insert_stmt = ptr::null_mut();
             self.context_stmt = ptr::null_mut();
+            self.pre_visit_stmt = ptr::null_mut();
+            self.scalar_timeline_stmt = ptr::null_mut();
             self.meta_stmt = ptr::null_mut();
             if sqlite3_close(self.db) != SQLITE_OK {
                 return Err(sqlite_error(self.db, "sqlite3_close"));
@@ -1420,6 +1701,12 @@ impl Drop for SqliteTraceIndexWriter {
             if !self.context_stmt.is_null() {
                 sqlite3_finalize(self.context_stmt);
             }
+            if !self.pre_visit_stmt.is_null() {
+                sqlite3_finalize(self.pre_visit_stmt);
+            }
+            if !self.scalar_timeline_stmt.is_null() {
+                sqlite3_finalize(self.scalar_timeline_stmt);
+            }
             if !self.meta_stmt.is_null() {
                 sqlite3_finalize(self.meta_stmt);
             }
@@ -1428,6 +1715,15 @@ impl Drop for SqliteTraceIndexWriter {
             }
         }
     }
+}
+
+fn ordered_seq_as_i64(seq: u64) -> io::Result<i64> {
+    i64::try_from(seq).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "ordered trace sequence exceeds SQLite INTEGER range",
+        )
+    })
 }
 
 fn sqlite_kind(kind: u8) -> &'static str {
