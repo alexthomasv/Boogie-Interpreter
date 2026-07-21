@@ -2,7 +2,7 @@
 
 The native interpreter's lowering pass (``interpreter/native/src/lowering.rs``)
 only understands goto-form blocks — there is no opcode for ``WhileStatement``.
-Programs synthesised by ``diffprod.corerel.reify`` carry structured ``while``
+Programs synthesized by ``deltarel.product_v2`` carry structured ``while``
 loops because the verifier wants the inductive ``invariant`` annotations.
 This module rewrites those loops into the equivalent goto cycle so the
 native interpreter can execute the program for trace-driven cost evaluation.

@@ -165,30 +165,17 @@ def _init_worker():
 
 
 def _run_eval(evaluator, program_inputs, input_name):
-    if hasattr(evaluator, "run_result"):
-        result = evaluator.run_result(program_inputs, input_name)
-        return {
-            "covered": set(result.covered or []),
-            "status": result.status,
-            "block_sequence": tuple(result.block_sequence or ()),
-            "violation_pc": result.violation_pc,
-            "violation_block": result.violation_block,
-            "message": result.message,
-            "invalid_input": result.invalid_input,
-            "invalid_reason": result.invalid_reason,
-        }
-
-    covered = evaluator.run(program_inputs, input_name)
-    last = getattr(evaluator, "last_result", None)
+    result = evaluator.run_result(program_inputs, input_name)
     return {
-        "covered": set(covered or []),
-        "status": getattr(last, "status", "ok"),
-        "block_sequence": tuple(getattr(last, "block_sequence", ()) or ()),
-        "violation_pc": getattr(last, "violation_pc", None),
-        "violation_block": getattr(last, "violation_block", None),
-        "message": getattr(last, "message", None),
-        "invalid_input": getattr(last, "invalid_input", False),
-        "invalid_reason": getattr(last, "invalid_reason", None),
+        "covered": set(result.covered or []),
+        "status": result.status,
+        "covered_edges": tuple(getattr(result, "covered_edges", ()) or ()),
+        "block_sequence": tuple(result.block_sequence or ()),
+        "violation_pc": result.violation_pc,
+        "violation_block": result.violation_block,
+        "message": result.message,
+        "invalid_input": result.invalid_input,
+        "invalid_reason": result.invalid_reason,
     }
 
 
@@ -265,7 +252,7 @@ class CoverageExecutor:
     """Evaluator facade with optional fork-backed parallel candidate execution."""
 
     def __init__(self, program, test_name: str, *, timeout: int,
-                 engine: str, jobs: int | None,
+                 jobs: int | None,
                  max_steps_per_input: int = DEFAULT_MAX_STEPS_PER_INPUT,
                  debug_logger=None):
         from interpreter.coverage_gen.evaluator import Evaluator
@@ -275,7 +262,6 @@ class CoverageExecutor:
         self.jobs, self.cpu_count = _resolve_jobs(jobs)
         self.parallel_enabled = self.jobs > 1 and hasattr(os, "fork")
         self.evaluator = Evaluator(program, test_name, timeout=timeout,
-                                   engine=engine,
                                    max_steps_per_input=max_steps_per_input,
                                    debug_logger=self.debug)
         self.runs = 0
@@ -304,18 +290,6 @@ class CoverageExecutor:
             except Exception:
                 self.parallel_enabled = False
                 self._executor = None
-
-    @property
-    def engine_requested(self):
-        return self.evaluator.engine_requested
-
-    @property
-    def engine(self):
-        return self.evaluator.engine
-
-    @property
-    def native_fallback_reason(self):
-        return self.evaluator.native_fallback_reason
 
     def close(self):
         if self._executor is not None:
@@ -397,16 +371,6 @@ class CoverageExecutor:
             return []
         self.debug.event("solver", "concolic_many_start",
                          count=len(tasks), parallel=self.parallel_enabled)
-        if not hasattr(self.evaluator, "concolic_suggest"):
-            return [
-                {
-                    "index": task["index"],
-                    "candidates": [],
-                    "stats": {"skipped": "evaluator-does-not-support-concolic"},
-                    "errors": 0,
-                }
-                for task in tasks
-            ]
         if not self.parallel_enabled or self._executor is None:
             results = []
             total = len(tasks)
@@ -458,16 +422,6 @@ class CoverageExecutor:
             return []
         self.debug.event("solver", "symbolic_many_start",
                          count=len(tasks), parallel=self.parallel_enabled)
-        if not hasattr(self.evaluator, "symbolic_explore"):
-            return [
-                {
-                    "index": task["index"],
-                    "candidates": [],
-                    "stats": {"skipped": "evaluator-does-not-support-symbolic"},
-                    "errors": 0,
-                }
-                for task in tasks
-            ]
         if not self.parallel_enabled or self._executor is None:
             results = []
             total = len(tasks)
@@ -565,9 +519,15 @@ def _sample_blocks(blocks: set, limit: int = 4) -> str:
 
 def _result_path_features(result: dict, covered: set | None = None) -> dict:
     sequence = tuple(result.get("block_sequence") or ())
-    if not sequence and covered:
+    compact_edges = result.get("covered_edges")
+    if not sequence and covered and compact_edges is None:
         sequence = tuple(sorted(covered))
-    return path_features_from_sequence(sequence)
+    features = path_features_from_sequence(sequence)
+    if compact_edges is not None:
+        features["edges"] = tuple(sorted(
+            set(features["edges"]) | set(compact_edges)
+        ))
+    return features
 
 
 def _record_candidate_result(corpus, out_dir: Path, candidate, covered: set,
@@ -1516,6 +1476,7 @@ def _load_seeds(seed_dir: Path, corpus, executor: CoverageExecutor,
                 *, debug_candidates: bool = False, debug_logger=None) -> int:
     from interpreter.coverage_gen.corpus import _extract_params_line
     from interpreter.utils.input_parser import parse_input_file
+    from interpreter.utils.inputs import complete_declared_shadow_inputs
 
     debug = debug_logger or DebugLogger.disabled()
     seed_dir = Path(seed_dir)
@@ -1527,7 +1488,12 @@ def _load_seeds(seed_dir: Path, corpus, executor: CoverageExecutor,
     parsed = []
     for p in sorted(seed_dir.glob("*.input")):
         try:
-            parsed.append((p, parse_input_file(p), _extract_params_line(p)))
+            inputs = parse_input_file(p)
+            inputs = complete_declared_shadow_inputs(
+                executor.evaluator.program,
+                inputs,
+            )
+            parsed.append((p, inputs, _extract_params_line(p)))
         except Exception as exc:
             corpus.invalid_inputs += 1
             print(f"[corpus] Warning: could not load seed {p.name}: {exc}")
@@ -1659,7 +1625,7 @@ def _deterministic_candidates(inputs):
                 )
 
 
-def run_deterministic_probes(corpus, evaluator, out_dir: Path,
+def run_deterministic_probes(corpus, executor: CoverageExecutor, out_dir: Path,
                              max_candidates: int = 200,
                              *, debug_candidates: bool = False,
                              debug_logger=None) -> int:
@@ -1679,26 +1645,14 @@ def run_deterministic_probes(corpus, evaluator, out_dir: Path,
         if len(candidates) >= max_candidates:
             break
 
-    if hasattr(evaluator, "evaluate_many"):
-        new_count, _trace_new, _gen_idx, _trace_idx = _evaluate_candidate_batch(
-            corpus, evaluator, out_dir, candidates, gen_idx=gen_idx,
-            trace_idx=trace_idx, debug_candidates=debug_candidates,
-            debug_logger=debug_logger)
-        return new_count
-
-    new_count = 0
-    for candidate, params_line, label in candidates:
-        kind, gen_idx, trace_idx = _write_candidate(
-            corpus, evaluator, out_dir, candidate, params_line,
-            gen_idx, trace_idx, label,
-            debug_logger=debug_logger,
-        )
-        if kind == "coverage":
-            new_count += 1
+    new_count, _trace_new, _gen_idx, _trace_idx = _evaluate_candidate_batch(
+        corpus, executor, out_dir, candidates, gen_idx=gen_idx,
+        trace_idx=trace_idx, debug_candidates=debug_candidates,
+        debug_logger=debug_logger)
     return new_count
 
 
-def run_greybox(corpus, evaluator, out_dir: Path, iters: int,
+def run_greybox(corpus, executor: CoverageExecutor, out_dir: Path, iters: int,
                 *, batch_size: int = 1, progress_interval: int = 200,
                 rare_branch_schedule: str = "auto",
                 debug_candidates: bool = False,
@@ -1740,21 +1694,10 @@ def run_greybox(corpus, evaluator, out_dir: Path, iters: int,
         if not batch:
             break
 
-        if hasattr(evaluator, "evaluate_many"):
-            batch_new, _trace_new, gen_idx, trace_idx = _evaluate_candidate_batch(
-                corpus, evaluator, out_dir, batch, gen_idx=gen_idx,
-                trace_idx=trace_idx, debug_candidates=debug_candidates,
-                debug_logger=debug_logger)
-        else:
-            batch_new = 0
-            for candidate, params_line, label in batch:
-                kind, gen_idx, trace_idx = _write_candidate(
-                    corpus, evaluator, out_dir, candidate, params_line,
-                    gen_idx, trace_idx, label,
-                    debug_logger=debug_logger,
-                )
-                if kind == "coverage":
-                    batch_new += 1
+        batch_new, _trace_new, gen_idx, trace_idx = _evaluate_candidate_batch(
+            corpus, executor, out_dir, batch, gen_idx=gen_idx,
+            trace_idx=trace_idx, debug_candidates=debug_candidates,
+            debug_logger=debug_logger)
 
         evaluated += len(batch)
         if batch_new:
@@ -1807,12 +1750,6 @@ def _resolve_mode_profile(mode: str | None, profile: str | None) -> tuple[str, s
     if mode not in _MODE_TO_PROFILE:
         raise ValueError(f"unknown coverage generation mode: {mode}")
     return mode, _MODE_TO_PROFILE[mode]
-
-
-def _engine_detail(executor: CoverageExecutor) -> str:
-    if executor.engine == "native":
-        return "native-rust"
-    return executor.engine
 
 
 def _auto_path_seed_limit(profile: str, requested_limit: int | None,
@@ -1978,7 +1915,7 @@ def _build_recommendations(*, executor: CoverageExecutor, stall_reason: str | No
     return recommendations
 
 
-def run_symbolic(corpus, evaluator, out_dir: Path, *,
+def run_symbolic(corpus, executor: CoverageExecutor, out_dir: Path, *,
                  loop_bound: int = 8,
                  max_path_depth: int = 512,
                  max_solver_queries: int = 10000,
@@ -1995,13 +1932,6 @@ def run_symbolic(corpus, evaluator, out_dir: Path, *,
                  debug_logger=None) -> tuple[int, dict]:
     """Run bounded native symbolic path exploration over current seeds."""
     debug = debug_logger or DebugLogger.disabled()
-    supports_symbolic = (
-        hasattr(evaluator, "symbolic_many")
-        or hasattr(evaluator, "symbolic_explore")
-    )
-    if not supports_symbolic:
-        return 0, {"skipped": "evaluator-does-not-support-symbolic"}
-
     gen_idx = _next_gen_idx(out_dir)
     trace_idx = _next_trace_idx(out_dir)
     new_count = 0
@@ -2030,110 +1960,61 @@ def run_symbolic(corpus, evaluator, out_dir: Path, *,
                 selected=len(selected), available=len(entries),
                 seed_limit=effective_seed_limit, jobs=jobs)
 
-    if hasattr(evaluator, "symbolic_many"):
-        tasks = []
-        remaining_queries = max_solver_queries
-        remaining_states = max_states
-        weights = [score for _entry_idx, _entry, score in selected]
-        for selected_idx, (entry_idx, entry, _score) in enumerate(selected):
-            if remaining_queries <= 0:
-                stats_total["solver_query_bounded"] = True
-                stats_total["complete_within_bounds"] = False
-                break
-            if remaining_states <= 0:
-                stats_total["states_bounded"] = (
-                    int(stats_total.get("states_bounded", 0))
-                    + (len(selected) - selected_idx)
-                )
-                stats_total["complete_within_bounds"] = False
-                break
-            query_budget = _budget_slice(
-                remaining_queries, weights, selected_idx)
-            state_budget = _budget_slice(
-                remaining_states, weights, selected_idx)
-            remaining_queries -= query_budget
-            remaining_states -= state_budget
-            tasks.append({
-                "index": entry_idx,
-                "kwargs": {
-                    "program_inputs": entry.inputs,
-                    "input_name": f"symbolic_seed_{entry_idx}",
-                    "covered_blocks": set(corpus.covered),
-                    "loop_bound": loop_bound,
-                    "max_path_depth": max_path_depth,
-                    "max_solver_queries": query_budget,
-                    "solver_timeout_ms": solver_timeout_ms,
-                    "havoc_bound": havoc_bound,
-                    "max_states": state_budget,
-                    "path_priority": path_priority,
-                    "value_profile_policy": value_profile_policy,
-                    "branch_distance_policy": branch_distance_policy,
-                },
-            })
-
-        candidate_batch = []
-        for result in evaluator.symbolic_many(tasks):
-            _merge_stats(stats_total, result.get("stats", {}))
-            entry = entries[result["index"]]
-            for candidate in result.get("candidates", []):
-                candidate_batch.append((
-                    candidate,
-                    entry.params_line or corpus.params_line,
-                    "symbolic",
-                ))
-        batch_new, _trace_new, gen_idx, trace_idx = _evaluate_candidate_batch(
-            corpus, evaluator, out_dir, candidate_batch, gen_idx=gen_idx,
-            trace_idx=trace_idx, debug_candidates=debug_candidates,
-            debug_logger=debug_logger, diagnostics=replay_diagnostics)
-        new_count += batch_new
-    else:
-        for selected_idx, (entry_idx, entry, _score) in enumerate(selected):
-            remaining_queries = max_solver_queries - int(stats_total.get("solver_queries", 0))
-            remaining_states = max_states - int(stats_total.get("states_explored", 0))
-            if remaining_queries <= 0:
-                stats_total["solver_query_bounded"] = True
-                stats_total["complete_within_bounds"] = False
-                break
-            if remaining_states <= 0:
-                stats_total["states_bounded"] = (
-                    int(stats_total.get("states_bounded", 0))
-                    + (len(selected) - selected_idx)
-                )
-                stats_total["complete_within_bounds"] = False
-                break
-            candidates, stats = evaluator.symbolic_explore(
-                entry.inputs,
-                f"symbolic_seed_{entry_idx}",
-                corpus.covered,
-                loop_bound=loop_bound,
-                max_path_depth=max_path_depth,
-                max_solver_queries=remaining_queries,
-                solver_timeout_ms=solver_timeout_ms,
-                havoc_bound=havoc_bound,
-                max_states=remaining_states,
-                path_priority=path_priority,
-                value_profile_policy=value_profile_policy,
-                branch_distance_policy=branch_distance_policy,
+    tasks = []
+    remaining_queries = max_solver_queries
+    remaining_states = max_states
+    weights = [score for _entry_idx, _entry, score in selected]
+    for selected_idx, (entry_idx, entry, _score) in enumerate(selected):
+        if remaining_queries <= 0:
+            stats_total["solver_query_bounded"] = True
+            stats_total["complete_within_bounds"] = False
+            break
+        if remaining_states <= 0:
+            stats_total["states_bounded"] = (
+                int(stats_total.get("states_bounded", 0))
+                + (len(selected) - selected_idx)
             )
-            _merge_stats(stats_total, stats)
-            for candidate in candidates:
-                result = _run_eval(evaluator, candidate, f"gen_{gen_idx}")
-                covered = set(result.get("covered") or [])
-                _record_path_diagnostic(
-                    replay_diagnostics, candidate, result,
-                    covered - corpus.covered,
-                )
-                kind, gen_idx, trace_idx = _record_candidate_result(
-                    corpus, out_dir, candidate, covered,
-                    entry.params_line or corpus.params_line,
-                    gen_idx, trace_idx, "symbolic",
-                    status=result.get("status", "ok"),
-                    violation_pc=result.get("violation_pc"),
-                    violation_block=result.get("violation_block"),
-                    debug_logger=debug_logger,
-                )
-                if kind == "coverage":
-                    new_count += 1
+            stats_total["complete_within_bounds"] = False
+            break
+        query_budget = _budget_slice(
+            remaining_queries, weights, selected_idx)
+        state_budget = _budget_slice(
+            remaining_states, weights, selected_idx)
+        remaining_queries -= query_budget
+        remaining_states -= state_budget
+        tasks.append({
+            "index": entry_idx,
+            "kwargs": {
+                "program_inputs": entry.inputs,
+                "input_name": f"symbolic_seed_{entry_idx}",
+                "covered_blocks": set(corpus.covered),
+                "loop_bound": loop_bound,
+                "max_path_depth": max_path_depth,
+                "max_solver_queries": query_budget,
+                "solver_timeout_ms": solver_timeout_ms,
+                "havoc_bound": havoc_bound,
+                "max_states": state_budget,
+                "path_priority": path_priority,
+                "value_profile_policy": value_profile_policy,
+                "branch_distance_policy": branch_distance_policy,
+            },
+        })
+
+    candidate_batch = []
+    for result in executor.symbolic_many(tasks):
+        _merge_stats(stats_total, result.get("stats", {}))
+        entry = entries[result["index"]]
+        for candidate in result.get("candidates", []):
+            candidate_batch.append((
+                candidate,
+                entry.params_line or corpus.params_line,
+                "symbolic",
+            ))
+    batch_new, _trace_new, gen_idx, trace_idx = _evaluate_candidate_batch(
+        corpus, executor, out_dir, candidate_batch, gen_idx=gen_idx,
+        trace_idx=trace_idx, debug_candidates=debug_candidates,
+        debug_logger=debug_logger, diagnostics=replay_diagnostics)
+    new_count += batch_new
 
     _merge_stats(stats_total, replay_diagnostics)
     stats_total["path_priority"] = path_priority
@@ -2142,7 +2023,7 @@ def run_symbolic(corpus, evaluator, out_dir: Path, *,
     return new_count, stats_total
 
 
-def run_concolic(corpus, evaluator, out_dir: Path, *,
+def run_concolic(corpus, executor: CoverageExecutor, out_dir: Path, *,
                  loop_bound: int = 8,
                  max_path_depth: int = 512,
                  max_solver_queries: int = 10000,
@@ -2156,13 +2037,6 @@ def run_concolic(corpus, evaluator, out_dir: Path, *,
                  debug_logger=None) -> tuple[int, dict]:
     """Run native branch-negation concolic search over current corpus."""
     debug = debug_logger or DebugLogger.disabled()
-    supports_concolic = (
-        hasattr(evaluator, "concolic_many")
-        or hasattr(evaluator, "concolic_suggest")
-    )
-    if not supports_concolic:
-        return 0, {"skipped": "evaluator-does-not-support-concolic"}
-
     gen_idx = _next_gen_idx(out_dir)
     trace_idx = _next_trace_idx(out_dir)
     new_count = 0
@@ -2191,81 +2065,44 @@ def run_concolic(corpus, evaluator, out_dir: Path, *,
                 selected=len(selected), available=len(entries),
                 seed_limit=effective_seed_limit, jobs=jobs)
 
-    if hasattr(evaluator, "concolic_many"):
-        tasks = []
-        remaining = max_solver_queries
-        weights = [score for _entry_idx, _entry, score in selected]
-        for selected_idx, (entry_idx, entry, _score) in enumerate(selected):
-            if remaining <= 0:
-                stats_total["solver_query_bounded"] = True
-                break
-            budget = _budget_slice(remaining, weights, selected_idx)
-            remaining -= budget
-            tasks.append({
-                "index": entry_idx,
-                "kwargs": {
-                    "program_inputs": entry.inputs,
-                    "input_name": f"concolic_seed_{entry_idx}",
-                    "covered_blocks": set(corpus.covered),
-                    "loop_bound": loop_bound,
-                    "max_path_depth": max_path_depth,
-                    "max_solver_queries": budget,
-                    "solver_timeout_ms": solver_timeout_ms,
-                    "havoc_bound": havoc_bound,
-                    "branch_distance_policy": branch_distance_policy,
-                },
-            })
-        candidate_batch = []
-        for result in evaluator.concolic_many(tasks):
-            _merge_stats(stats_total, result.get("stats", {}))
-            entry = entries[result["index"]]
-            for candidate in result.get("candidates", []):
-                candidate_batch.append((
-                    candidate,
-                    entry.params_line or corpus.params_line,
-                    "concolic",
-                ))
-        batch_new, _trace_new, gen_idx, trace_idx = _evaluate_candidate_batch(
-            corpus, evaluator, out_dir, candidate_batch, gen_idx=gen_idx,
-            trace_idx=trace_idx, debug_candidates=debug_candidates,
-            debug_logger=debug_logger, diagnostics=replay_diagnostics)
-        new_count += batch_new
-    else:
-        for entry_idx, entry, _score in selected:
-            remaining = max_solver_queries - int(stats_total.get("solver_queries", 0))
-            if remaining <= 0:
-                stats_total["solver_query_bounded"] = True
-                break
-            candidates, stats = evaluator.concolic_suggest(
-                entry.inputs,
-                f"concolic_seed_{entry_idx}",
-                corpus.covered,
-                loop_bound=loop_bound,
-                max_path_depth=max_path_depth,
-                max_solver_queries=remaining,
-                solver_timeout_ms=solver_timeout_ms,
-                havoc_bound=havoc_bound,
-                branch_distance_policy=branch_distance_policy,
-            )
-            _merge_stats(stats_total, stats)
-            for candidate in candidates:
-                result = _run_eval(evaluator, candidate, f"gen_{gen_idx}")
-                covered = set(result.get("covered") or [])
-                _record_path_diagnostic(
-                    replay_diagnostics, candidate, result,
-                    covered - corpus.covered,
-                )
-                kind, gen_idx, trace_idx = _record_candidate_result(
-                    corpus, out_dir, candidate, covered,
-                    entry.params_line or corpus.params_line,
-                    gen_idx, trace_idx, "concolic",
-                    status=result.get("status", "ok"),
-                    violation_pc=result.get("violation_pc"),
-                    violation_block=result.get("violation_block"),
-                    debug_logger=debug_logger,
-                )
-                if kind == "coverage":
-                    new_count += 1
+    tasks = []
+    remaining = max_solver_queries
+    weights = [score for _entry_idx, _entry, score in selected]
+    for selected_idx, (entry_idx, entry, _score) in enumerate(selected):
+        if remaining <= 0:
+            stats_total["solver_query_bounded"] = True
+            break
+        budget = _budget_slice(remaining, weights, selected_idx)
+        remaining -= budget
+        tasks.append({
+            "index": entry_idx,
+            "kwargs": {
+                "program_inputs": entry.inputs,
+                "input_name": f"concolic_seed_{entry_idx}",
+                "covered_blocks": set(corpus.covered),
+                "loop_bound": loop_bound,
+                "max_path_depth": max_path_depth,
+                "max_solver_queries": budget,
+                "solver_timeout_ms": solver_timeout_ms,
+                "havoc_bound": havoc_bound,
+                "branch_distance_policy": branch_distance_policy,
+            },
+        })
+    candidate_batch = []
+    for result in executor.concolic_many(tasks):
+        _merge_stats(stats_total, result.get("stats", {}))
+        entry = entries[result["index"]]
+        for candidate in result.get("candidates", []):
+            candidate_batch.append((
+                candidate,
+                entry.params_line or corpus.params_line,
+                "concolic",
+            ))
+    batch_new, _trace_new, gen_idx, trace_idx = _evaluate_candidate_batch(
+        corpus, executor, out_dir, candidate_batch, gen_idx=gen_idx,
+        trace_idx=trace_idx, debug_candidates=debug_candidates,
+        debug_logger=debug_logger, diagnostics=replay_diagnostics)
+    new_count += batch_new
 
     _merge_stats(stats_total, replay_diagnostics)
     stats_total["branch_distance_policy"] = branch_distance_policy
@@ -2424,7 +2261,7 @@ def generate_coverage_inputs(program, test_name: str, seed_dir: Path,
                              out_dir: Path, *, mode: str | None = None,
                              profile: str | None = None,
                              iters: int | None = None,
-                             timeout: int = 30, engine: str = "native",
+                             timeout: int = 30,
                              rng_seed: int = 0,
                              path_engine: str = "hybrid",
                              jobs: int | None = None,
@@ -2521,7 +2358,7 @@ def generate_coverage_inputs(program, test_name: str, seed_dir: Path,
     out_dir.mkdir(parents=True, exist_ok=True)
 
     executor = CoverageExecutor(program, test_name, timeout=timeout,
-                                engine=engine, jobs=jobs,
+                                jobs=jobs,
                                 max_steps_per_input=max_steps_per_input,
                                 debug_logger=debug)
     corpus = Corpus(coverage_metric=coverage_metric)
@@ -2543,13 +2380,12 @@ def generate_coverage_inputs(program, test_name: str, seed_dir: Path,
 
     print("[driver] gen-input pipeline")
     print(f"[driver] target={test_name} mode={mode} profile={profile} "
-          f"path_engine={path_engine} engine={engine} "
+          f"path_engine={path_engine} "
           f"coverage_metric={coverage_metric} rng_seed={rng_seed}")
     print(f"[driver] seed_dir={seed_dir} out_dir={out_dir}")
     print(f"[driver] jobs={executor.jobs}/{executor.cpu_count} "
           f"parallel={executor.parallel_enabled} "
           f"worker_setup={executor.worker_setup_seconds:.3f}s")
-    print(f"[driver] engine_detail={_engine_detail(executor)}")
     print(f"[driver] budgets: deterministic={deterministic_budget}, "
           f"rounds={rounds}, iters={iters}, loop_bound={loop_bound}, "
           f"havoc_bound={havoc_bound}, depth={max_path_depth}, "
@@ -2569,16 +2405,12 @@ def generate_coverage_inputs(program, test_name: str, seed_dir: Path,
           f"corpus_reduce={corpus_reduce}, "
           f"solver_timeout_ms={solver_timeout_ms}, "
           f"max_steps_per_input={max_steps_per_input}")
-    if executor.native_fallback_reason:
-        print("[driver] native evaluator fallback: "
-              f"{executor.native_fallback_reason}")
     debug.event(
         "exec",
         "coverage_pipeline_start",
         mode=mode,
         profile=profile,
         path_engine=path_engine,
-        engine=engine,
         coverage_metric=coverage_metric,
         seed_dir=seed_dir,
         out_dir=out_dir,
@@ -3065,7 +2897,6 @@ def generate_coverage_inputs(program, test_name: str, seed_dir: Path,
         and bounded_symbolic_complete
         and executor.errors == 0
         and executor.timeouts == 0
-        and executor.native_fallback_reason is None
     )
     total_new_inputs = (
         deterministic_new
@@ -3154,11 +2985,6 @@ def generate_coverage_inputs(program, test_name: str, seed_dir: Path,
         "total_seconds": round(total_elapsed, 6),
         "phase_timings": phase_timings,
         "phase_decisions": phase_decisions,
-        "engine_requested": executor.engine_requested,
-        "engine_used": executor.engine,
-        "engine_detail": _engine_detail(executor),
-        "native_fallback": executor.native_fallback_reason is not None,
-        "native_fallback_reason": executor.native_fallback_reason,
         "rng_seed": rng_seed,
         "path_engine": path_engine,
         "coverage_metric": coverage_metric,
@@ -3263,7 +3089,7 @@ def generate_coverage_inputs(program, test_name: str, seed_dir: Path,
           f"trace_inputs={corpus.generated_trace_inputs} "
           f"assert_feedback={len(corpus.assertion_feedback_entries)} "
           f"step_limits={executor.step_limits} "
-          f"stall={stall_reason} engine={_engine_detail(executor)} "
+          f"stall={stall_reason} "
           f"elapsed={total_elapsed:.2f}s")
     return report
 
@@ -3437,9 +3263,6 @@ def main(argv=None):
                         help="Override deterministic probe candidate budget")
     parser.add_argument("--timeout", type=int, default=30,
                         help="Per-execution timeout in seconds (default: 30)")
-    parser.add_argument("--engine", choices=["native"],
-                        default="native",
-                        help="Execution engine for coverage candidates (default: native)")
     parser.add_argument("--rng-seed", type=int, default=0,
                         help="RNG seed for reproducible greybox mutation "
                              "(default: 0)")
@@ -3540,10 +3363,10 @@ def main(argv=None):
                              "(default: all; e.g. candidate,solver)")
     parser.add_argument("--out-dir",
                         help="Output directory for generated .input files "
-                             "(default: test_input/<name>/)")
+                             "(default: canonical target input directory)")
     parser.add_argument("--seed",
                         help="Seed corpus directory "
-                             "(default: test_input/<name>/)")
+                             "(default: canonical target input directory)")
     args = parser.parse_args(argv)
 
     pkg_path = Path(args.pkg_dir)
@@ -3564,7 +3387,12 @@ def main(argv=None):
     program_hash = hashlib.sha256(program_bytes).hexdigest()
     program = pickle.loads(program_bytes)
 
-    seed_dir = Path(args.seed) if args.seed else Path(f"test_input/{test_name}")
+    from swoosh_cli.workspace import Workspace
+    seed_dir = (
+        Path(args.seed)
+        if args.seed
+        else Workspace.from_env().target_paths(test_name).inputs
+    )
     out_dir = Path(args.out_dir) if args.out_dir else seed_dir
     out_dir.mkdir(parents=True, exist_ok=True)
     debug_logger = DebugLogger.from_options(
@@ -3581,7 +3409,6 @@ def main(argv=None):
         "profile": args.profile,
         "iters": args.iters,
         "timeout": args.timeout,
-        "engine": args.engine,
         "rng_seed": args.rng_seed,
         "path_engine": args.path_engine,
         "jobs": args.jobs,

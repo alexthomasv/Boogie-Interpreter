@@ -33,7 +33,7 @@ class TestProcessSingleInput(unittest.TestCase):
     def setUp(self):
         self.tmpdir = Path(tempfile.mkdtemp())
         self.test_name = "test_resume_bench"
-        self.trace_dir = self.tmpdir / "positive_examples" / self.test_name
+        self.trace_dir = self.tmpdir / "target" / "swoosh" / "traces" / self.test_name
         self.trace_dir.mkdir(parents=True)
 
     def tearDown(self):
@@ -156,7 +156,7 @@ class TestHashBasedCache(unittest.TestCase):
         # Set up directory structure
         self.bpl_dir = self.tmpdir / "bpl_out" / self.test_name
         self.bpl_dir.mkdir(parents=True)
-        self.trace_dir = self.tmpdir / "positive_examples" / self.test_name
+        self.trace_dir = self.tmpdir / "target" / "swoosh" / "traces" / self.test_name
         self.trace_dir.mkdir(parents=True)
         self.input_dir = self.tmpdir / "test_input" / self.test_name
         self.input_dir.mkdir(parents=True)
@@ -277,7 +277,7 @@ class TestResumeIntegration(unittest.TestCase):
         # Directory structure
         self.pkg_dir = self.tmpdir / f"{self.test_name}_pkg"
         self.pkg_dir.mkdir()
-        self.trace_dir = self.tmpdir / "positive_examples" / self.test_name
+        self.trace_dir = self.tmpdir / "target" / "swoosh" / "traces" / self.test_name
         self.trace_dir.mkdir(parents=True)
         self.input_dir = self.tmpdir / "test_input" / self.test_name
         self.input_dir.mkdir(parents=True)

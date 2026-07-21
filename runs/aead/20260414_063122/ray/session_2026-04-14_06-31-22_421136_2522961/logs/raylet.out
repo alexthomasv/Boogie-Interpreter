@@ -1,0 +1,289 @@
+[2026-04-14 06:31:24,389 I 2523653 2523653] (raylet) main.cc:270: Setting cluster ID to: 51107f539e736e862d88c15d7cd86254377053940b8a8117b3b97b9d
+[2026-04-14 06:31:24,395 I 2523653 2523653] (raylet) main.cc:458: Per-worker process group cleanup is DISABLED, subreaper is DISABLED
+[2026-04-14 06:31:24,395 I 2523653 2523653] (raylet) main.cc:592: Setting node ID node_id=bce5d801e889c88ab5f2006d175a861558f1b9a01f75fbf4ee022b17
+[2026-04-14 06:31:24,395 I 2523653 2523653] (raylet) store_runner.cc:50: Allowing the Plasma store to use up to 149.131GB of memory.
+[2026-04-14 06:31:24,395 I 2523653 2523653] (raylet) store_runner.cc:66: Starting object store with directory /dev/shm, fallback /tmp/_sr_2522961/session_2026-04-14_06-31-22_421136_2522961, and huge page support disabled
+[2026-04-14 06:31:24,396 I 2523653 2523676] (raylet) dlmalloc.cc:324: Setting dlmalloc config: plasma_directory=/dev/shm, fallback_directory=/tmp/_sr_2522961/session_2026-04-14_06-31-22_421136_2522961, hugepage_enabled=0, fallback_enabled=1
+[2026-04-14 06:31:24,396 I 2523653 2523676] (raylet) dlmalloc.cc:153: create_and_mmap_buffer(149131100168, /dev/shm/plasmaXXXXXX)
+[2026-04-14 06:31:24,396 I 2523653 2523676] (raylet) store.cc:573: Plasma store debug dump: 
+Current usage: 0 / 149.131 GB
+- num bytes created total: 0
+0 pending objects of total size 0MB
+- objects spillable: 0
+- bytes spillable: 0
+- objects unsealed: 0
+- bytes unsealed: 0
+- objects in use: 0
+- bytes in use: 0
+- objects evictable: 0
+- bytes evictable: 0
+
+- objects created by worker: 0
+- bytes created by worker: 0
+- objects restored: 0
+- bytes restored: 0
+- objects received: 0
+- bytes received: 0
+- objects errored: 0
+- bytes errored: 0
+
+[2026-04-14 06:31:24,398 I 2523653 2523653] (raylet) grpc_server.cc:142: ObjectManager server started, listening on port 46093.
+[2026-04-14 06:31:24,402 W 2523653 2523653] (raylet) memory_monitor.cc:197: Got negative used memory for cgroup -1, setting it to zero
+[2026-04-14 06:31:24,402 I 2523653 2523653] (raylet) memory_monitor.cc:47: MemoryMonitor initialized with usage threshold at 505715163136 bytes (0.95 system memory), total system memory bytes: 532331769856
+[2026-04-14 06:31:24,402 I 2523653 2523653] (raylet) node_manager.cc:241: Initializing NodeManager node_id=bce5d801e889c88ab5f2006d175a861558f1b9a01f75fbf4ee022b17
+[2026-04-14 06:31:24,402 I 2523653 2523653] (raylet) grpc_server.cc:142: NodeManager server started, listening on port 38973.
+[2026-04-14 06:31:24,409 I 2523653 2523722] (raylet) agent_manager.cc:81: Monitor agent process with name dashboard_agent
+[2026-04-14 06:31:24,409 I 2523653 2523653] (raylet) io_service_pool.cc:37: IOServicePool is running with 1 io_service.
+[2026-04-14 06:31:24,410 I 2523653 2523724] (raylet) agent_manager.cc:81: Monitor agent process with name runtime_env_agent
+[2026-04-14 06:31:24,410 I 2523653 2523653] (raylet) metrics_agent_client.cc:42: Initializing exporter ...
+[2026-04-14 06:31:24,410 I 2523653 2523653] (raylet) event.cc:499: Ray Event initialized for RAYLET
+[2026-04-14 06:31:24,410 I 2523653 2523653] (raylet) event.cc:332: Set ray event level to warning
+[2026-04-14 06:31:24,412 I 2523653 2523653] (raylet) node_manager.cc:291: Raylet of id, bce5d801e889c88ab5f2006d175a861558f1b9a01f75fbf4ee022b17 started. Raylet consists of node_manager and object_manager. node_manager address: 172.31.1.230:0 object_manager address: 172.31.1.230:46093 hostname: ip-172-31-1-230
+[2026-04-14 06:31:24,413 I 2523653 2523653] (raylet) node_manager.cc:424: [state-dump] NodeManager:
+[state-dump] Node ID: bce5d801e889c88ab5f2006d175a861558f1b9a01f75fbf4ee022b17
+[state-dump] Node name: 172.31.1.230
+[state-dump] InitialConfigResources: {node:__internal_head__: 1, memory: 3.47972e+11, CPU: 64, node:172.31.1.230: 1, object_store_memory: 1.49131e+11}
+[state-dump] ClusterLeaseManager:
+[state-dump] ========== Node: bce5d801e889c88ab5f2006d175a861558f1b9a01f75fbf4ee022b17 =================
+[state-dump] Infeasible queue length: 0
+[state-dump] Schedule queue length: 0
+[state-dump] Grant queue length: 0
+[state-dump] num_waiting_for_resource: 0
+[state-dump] num_waiting_for_plasma_memory: 0
+[state-dump] num_waiting_for_remote_node_resources: 0
+[state-dump] num_worker_not_started_by_job_config_not_exist: 0
+[state-dump] num_worker_not_started_by_registration_timeout: 0
+[state-dump] num_tasks_waiting_for_workers: 0
+[state-dump] num_cancelled_leases: 0
+[state-dump] cluster_resource_scheduler state: 
+[state-dump] Local id: -6073564855285555282 Local resources: {"total":{CPU: [640000], object_store_memory: [1491309981690000], memory: [3479723290630000], node:__internal_head__: [10000], node:172.31.1.230: [10000]}}, "available": {node:__internal_head__: [10000], CPU: [640000], memory: [3479723290630000], object_store_memory: [1491309981690000], node:172.31.1.230: [10000]}}, "labels":{"ray.io/node-id":"bce5d801e889c88ab5f2006d175a861558f1b9a01f75fbf4ee022b17",} is_draining: 0 is_idle: 1 Cluster resources (at most 20 nodes are shown): node id: -6073564855285555282{"total":{CPU: 640000, memory: 3479723290630000, node:__internal_head__: 10000, node:172.31.1.230: 10000, object_store_memory: 1491309981690000}}, "available": {CPU: 640000, memory: 3479723290630000, node:__internal_head__: 10000, node:172.31.1.230: 10000, object_store_memory: 1491309981690000}}, "labels":{"ray.io/node-id":"bce5d801e889c88ab5f2006d175a861558f1b9a01f75fbf4ee022b17",}, "is_draining": 0, "draining_deadline_timestamp_ms": -1} { "placement group locations": [], "node to bundles": []}
+[state-dump] Waiting leases size: 0
+[state-dump] Number of granted lease arguments: 0
+[state-dump] Number of pinned lease arguments: 0
+[state-dump] Number of total spilled leases: 0
+[state-dump] Number of spilled waiting leases: 0
+[state-dump] Number of spilled unschedulable leases: 0
+[state-dump] Resource usage {
+[state-dump] }
+[state-dump] Backlog Size per scheduling descriptor :{workerId: num backlogs}:
+[state-dump] 
+[state-dump] Granted leases by scheduling class:
+[state-dump] ==================================================
+[state-dump] 
+[state-dump] ClusterResources:
+[state-dump] LocalObjectManager:
+[state-dump] - num pinned objects: 0
+[state-dump] - pinned objects size: 0
+[state-dump] - num objects pending restore: 0
+[state-dump] - num objects pending spill: 0
+[state-dump] - num bytes pending spill: 0
+[state-dump] - num bytes currently spilled: 0
+[state-dump] - cumulative spill requests: 0
+[state-dump] - cumulative restore requests: 0
+[state-dump] - spilled objects pending delete: 0
+[state-dump] 
+[state-dump] ObjectManager:
+[state-dump] - num local objects: 0
+[state-dump] - num unfulfilled push requests: 0
+[state-dump] - num object pull requests: 0
+[state-dump] - num chunks received total: 0
+[state-dump] - num chunks received failed (all): 0
+[state-dump] - num chunks received failed / cancelled: 0
+[state-dump] - num chunks received failed / plasma error: 0
+[state-dump] Event stats:
+[state-dump] Global stats: 0 total (0 active)
+[state-dump] Queueing time: mean = -nanms, max = -0.00ms, min = 9223372036854.78ms, total = 0.00ms
+[state-dump] Execution time:  mean = -nanms, total = 0.00ms
+[state-dump] Event stats:
+[state-dump] PushManager:
+[state-dump] - num pushes remaining: 0
+[state-dump] - num chunks in flight: 0
+[state-dump] - num chunks remaining: 0
+[state-dump] - max chunks allowed: 409
+[state-dump] OwnershipBasedObjectDirectory:
+[state-dump] - num listeners: 0
+[state-dump] - cumulative location updates: 0
+[state-dump] - num location updates per second: 0.000
+[state-dump] - num location lookups per second: 0.000
+[state-dump] - num locations added per second: 0.000
+[state-dump] - num locations removed per second: 0.000
+[state-dump] BufferPool:
+[state-dump] - create buffer state map size: 0
+[state-dump] PullManager:
+[state-dump] - num bytes available for pulled objects: 149130998169
+[state-dump] - num bytes being pulled (all): 0
+[state-dump] - num bytes being pulled / pinned: 0
+[state-dump] - get request bundles: BundlePullRequestQueue{0 total, 0 active, 0 inactive, 0 unpullable}
+[state-dump] - wait request bundles: BundlePullRequestQueue{0 total, 0 active, 0 inactive, 0 unpullable}
+[state-dump] - task request bundles: BundlePullRequestQueue{0 total, 0 active, 0 inactive, 0 unpullable}
+[state-dump] - first get request bundle: N/A
+[state-dump] - first wait request bundle: N/A
+[state-dump] - first task request bundle: N/A
+[state-dump] - num objects queued: 0
+[state-dump] - num objects actively pulled (all): 0
+[state-dump] - num objects actively pulled / pinned: 0
+[state-dump] - num bundles being pulled: 0
+[state-dump] - num pull retries: 0
+[state-dump] - max timeout seconds: 0
+[state-dump] - max timeout request is already processed. No entry.
+[state-dump] 
+[state-dump] WorkerPool:
+[state-dump] - registered jobs: 0
+[state-dump] - process_failed_job_config_missing: 0
+[state-dump] - process_failed_rate_limited: 0
+[state-dump] - process_failed_pending_registration: 0
+[state-dump] - process_failed_runtime_env_setup_failed: 0
+[state-dump] - num PYTHON workers: 0
+[state-dump] - num PYTHON drivers: 0
+[state-dump] - num PYTHON pending start requests: 0
+[state-dump] - num PYTHON pending registration requests: 0
+[state-dump] - num object spill callbacks queued: 0
+[state-dump] - num object restore queued: 0
+[state-dump] - num util functions queued: 0
+[state-dump] - num idle workers: 0
+[state-dump] LeaseDependencyManager:
+[state-dump] - lease deps map size: 0
+[state-dump] - get req map size: 0
+[state-dump] - wait req map size: 0
+[state-dump] - local objects map size: 0
+[state-dump] WaitManager:
+[state-dump] - num active wait requests: 0
+[state-dump] Subscriber:
+[state-dump] Channel WORKER_OBJECT_LOCATIONS_CHANNEL
+[state-dump] - cumulative subscribe requests: 0
+[state-dump] - cumulative unsubscribe requests: 0
+[state-dump] - active subscribed publishers: 0
+[state-dump] - cumulative published messages: 0
+[state-dump] - cumulative processed messages: 0
+[state-dump] Channel WORKER_REF_REMOVED_CHANNEL
+[state-dump] - cumulative subscribe requests: 0
+[state-dump] - cumulative unsubscribe requests: 0
+[state-dump] - active subscribed publishers: 0
+[state-dump] - cumulative published messages: 0
+[state-dump] - cumulative processed messages: 0
+[state-dump] Channel WORKER_OBJECT_EVICTION
+[state-dump] - cumulative subscribe requests: 0
+[state-dump] - cumulative unsubscribe requests: 0
+[state-dump] - active subscribed publishers: 0
+[state-dump] - cumulative published messages: 0
+[state-dump] - cumulative processed messages: 0
+[state-dump] num async plasma notifications: 0
+[state-dump] Event stats:
+[state-dump] Global stats: 34 total (15 active)
+[state-dump] Queueing time: mean = 1.30ms, max = 8.66ms, min = 0.00ms, total = 44.09ms
+[state-dump] Execution time:  mean = 0.62ms, total = 21.05ms
+[state-dump] Event stats:
+[state-dump] 	PeriodicalRunner.RunFnPeriodically - 12 total (2 active, 1 running), Execution time: mean = 0.08ms, total = 1.00ms, Queueing time: mean = 3.22ms, max = 8.66ms, min = 0.03ms, total = 38.64ms
+[state-dump] 	event_loop_lag_probe - 2 total (0 active), Execution time: mean = 0.01ms, total = 0.01ms, Queueing time: mean = 2.58ms, max = 5.16ms, min = 0.00ms, total = 5.16ms
+[state-dump] 	ReporterService.grpc_client.HealthCheck.OnReplyReceived - 1 total (0 active), Execution time: mean = 0.06ms, total = 0.06ms, Queueing time: mean = 0.02ms, max = 0.02ms, min = 0.02ms, total = 0.02ms
+[state-dump] 	NodeManager.ScheduleAndGrantLeases - 1 total (1 active), Execution time: mean = 0.00ms, total = 0.00ms, Queueing time: mean = 0.00ms, max = -0.00ms, min = 9223372036854.78ms, total = 0.00ms
+[state-dump] 	MemoryMonitor.CheckIsMemoryUsageAboveThreshold - 1 total (1 active), Execution time: mean = 0.00ms, total = 0.00ms, Queueing time: mean = 0.00ms, max = -0.00ms, min = 9223372036854.78ms, total = 0.00ms
+[state-dump] 	ray::rpc::InternalPubSubGcsService.grpc_client.GcsSubscriberPoll - 1 total (1 active), Execution time: mean = 0.00ms, total = 0.00ms, Queueing time: mean = 0.00ms, max = -0.00ms, min = 9223372036854.78ms, total = 0.00ms
+[state-dump] 	ray::rpc::InternalKVGcsService.grpc_client.GetInternalConfig.OnReplyReceived - 1 total (0 active), Execution time: mean = 15.15ms, total = 15.15ms, Queueing time: mean = 0.12ms, max = 0.12ms, min = 0.12ms, total = 0.12ms
+[state-dump] 	NodeManager.deadline_timer.debug_state_dump - 1 total (1 active), Execution time: mean = 0.00ms, total = 0.00ms, Queueing time: mean = 0.00ms, max = -0.00ms, min = 9223372036854.78ms, total = 0.00ms
+[state-dump] 	ray::rpc::InternalPubSubGcsService.grpc_client.GcsSubscriberCommandBatch.OnReplyReceived - 1 total (1 active), Execution time: mean = 0.00ms, total = 0.00ms, Queueing time: mean = 0.00ms, max = -0.00ms, min = 9223372036854.78ms, total = 0.00ms
+[state-dump] 	NodeManager.deadline_timer.flush_free_objects - 1 total (1 active), Execution time: mean = 0.00ms, total = 0.00ms, Queueing time: mean = 0.00ms, max = -0.00ms, min = 9223372036854.78ms, total = 0.00ms
+[state-dump] 	ray::rpc::InternalKVGcsService.grpc_client.GetInternalConfig - 1 total (0 active), Execution time: mean = 1.07ms, total = 1.07ms, Queueing time: mean = 0.00ms, max = -0.00ms, min = 9223372036854.78ms, total = 0.00ms
+[state-dump] 	ReporterService.grpc_client.HealthCheck - 1 total (0 active), Execution time: mean = 0.96ms, total = 0.96ms, Queueing time: mean = 0.00ms, max = -0.00ms, min = 9223372036854.78ms, total = 0.00ms
+[state-dump] 	ClusterResourceManager.ResetRemoteNodeView - 1 total (1 active), Execution time: mean = 0.00ms, total = 0.00ms, Queueing time: mean = 0.00ms, max = -0.00ms, min = 9223372036854.78ms, total = 0.00ms
+[state-dump] 	NodeManager.GCTaskFailureReason - 1 total (1 active), Execution time: mean = 0.00ms, total = 0.00ms, Queueing time: mean = 0.00ms, max = -0.00ms, min = 9223372036854.78ms, total = 0.00ms
+[state-dump] 	ray::rpc::NodeInfoGcsService.grpc_client.RegisterNode - 1 total (0 active), Execution time: mean = 1.40ms, total = 1.40ms, Queueing time: mean = 0.00ms, max = -0.00ms, min = 9223372036854.78ms, total = 0.00ms
+[state-dump] 	RayletWorkerPool.deadline_timer.kill_idle_workers - 1 total (1 active), Execution time: mean = 0.00ms, total = 0.00ms, Queueing time: mean = 0.00ms, max = -0.00ms, min = 9223372036854.78ms, total = 0.00ms
+[state-dump] 	ray::rpc::NodeInfoGcsService.grpc_client.RegisterNode.OnReplyReceived - 1 total (0 active), Execution time: mean = 0.24ms, total = 0.24ms, Queueing time: mean = 0.15ms, max = 0.15ms, min = 0.15ms, total = 0.15ms
+[state-dump] 	NodeManager.CheckForUnexpectedWorkerDisconnects - 1 total (1 active), Execution time: mean = 0.00ms, total = 0.00ms, Queueing time: mean = 0.00ms, max = -0.00ms, min = 9223372036854.78ms, total = 0.00ms
+[state-dump] 	NodeManager.deadline_timer.spill_objects_when_over_threshold - 1 total (1 active), Execution time: mean = 0.00ms, total = 0.00ms, Queueing time: mean = 0.00ms, max = -0.00ms, min = 9223372036854.78ms, total = 0.00ms
+[state-dump] 	NodeManager.deadline_timer.record_metrics - 1 total (1 active), Execution time: mean = 0.00ms, total = 0.00ms, Queueing time: mean = 0.00ms, max = -0.00ms, min = 9223372036854.78ms, total = 0.00ms
+[state-dump] 	MetricsAgentClient.WaitForServerReadyWithRetry - 1 total (1 active), Execution time: mean = 0.00ms, total = 0.00ms, Queueing time: mean = 0.00ms, max = -0.00ms, min = 9223372036854.78ms, total = 0.00ms
+[state-dump] 	ray::rpc::InternalPubSubGcsService.grpc_client.GcsSubscriberCommandBatch - 1 total (0 active), Execution time: mean = 1.15ms, total = 1.15ms, Queueing time: mean = 0.00ms, max = -0.00ms, min = 9223372036854.78ms, total = 0.00ms
+[state-dump] DebugString() time ms: 0
+[state-dump] 
+[state-dump] 
+[2026-04-14 06:31:24,414 I 2523653 2523653] (raylet) accessor.cc:847: Received address and liveness notification for node, IsAlive = 1 node_id=bce5d801e889c88ab5f2006d175a861558f1b9a01f75fbf4ee022b17
+[2026-04-14 06:31:24,524 I 2523653 2523653] (raylet) worker_pool.cc:749: [Eagerly] Start install runtime environment for job 01000000.
+[2026-04-14 06:31:24,525 I 2523653 2523653] (raylet) worker_pool.cc:530: Started worker process with pid 2523758, the token is 0
+[2026-04-14 06:31:24,527 I 2523653 2523653] (raylet) worker_pool.cc:530: Started worker process with pid 2523759, the token is 1
+[2026-04-14 06:31:24,528 I 2523653 2523653] (raylet) worker_pool.cc:530: Started worker process with pid 2523760, the token is 2
+[2026-04-14 06:31:24,530 I 2523653 2523653] (raylet) worker_pool.cc:530: Started worker process with pid 2523761, the token is 3
+[2026-04-14 06:31:24,531 I 2523653 2523653] (raylet) worker_pool.cc:530: Started worker process with pid 2523762, the token is 4
+[2026-04-14 06:31:24,533 I 2523653 2523653] (raylet) worker_pool.cc:530: Started worker process with pid 2523763, the token is 5
+[2026-04-14 06:31:24,534 I 2523653 2523653] (raylet) worker_pool.cc:530: Started worker process with pid 2523764, the token is 6
+[2026-04-14 06:31:24,535 I 2523653 2523653] (raylet) worker_pool.cc:530: Started worker process with pid 2523765, the token is 7
+[2026-04-14 06:31:24,537 I 2523653 2523653] (raylet) worker_pool.cc:530: Started worker process with pid 2523766, the token is 8
+[2026-04-14 06:31:24,538 I 2523653 2523653] (raylet) worker_pool.cc:530: Started worker process with pid 2523767, the token is 9
+[2026-04-14 06:31:24,539 I 2523653 2523653] (raylet) worker_pool.cc:530: Started worker process with pid 2523768, the token is 10
+[2026-04-14 06:31:24,540 I 2523653 2523653] (raylet) worker_pool.cc:530: Started worker process with pid 2523769, the token is 11
+[2026-04-14 06:31:24,542 I 2523653 2523653] (raylet) worker_pool.cc:530: Started worker process with pid 2523770, the token is 12
+[2026-04-14 06:31:24,543 I 2523653 2523653] (raylet) worker_pool.cc:530: Started worker process with pid 2523771, the token is 13
+[2026-04-14 06:31:24,545 I 2523653 2523653] (raylet) worker_pool.cc:530: Started worker process with pid 2523772, the token is 14
+[2026-04-14 06:31:24,546 I 2523653 2523653] (raylet) worker_pool.cc:530: Started worker process with pid 2523773, the token is 15
+[2026-04-14 06:31:24,547 I 2523653 2523653] (raylet) worker_pool.cc:530: Started worker process with pid 2523774, the token is 16
+[2026-04-14 06:31:24,549 I 2523653 2523653] (raylet) worker_pool.cc:530: Started worker process with pid 2523775, the token is 17
+[2026-04-14 06:31:24,550 I 2523653 2523653] (raylet) worker_pool.cc:530: Started worker process with pid 2523776, the token is 18
+[2026-04-14 06:31:24,558 I 2523653 2523653] (raylet) worker_pool.cc:530: Started worker process with pid 2523777, the token is 19
+[2026-04-14 06:31:24,560 I 2523653 2523653] (raylet) worker_pool.cc:530: Started worker process with pid 2523778, the token is 20
+[2026-04-14 06:31:24,561 I 2523653 2523653] (raylet) worker_pool.cc:530: Started worker process with pid 2523779, the token is 21
+[2026-04-14 06:31:24,562 I 2523653 2523653] (raylet) worker_pool.cc:530: Started worker process with pid 2523780, the token is 22
+[2026-04-14 06:31:24,564 I 2523653 2523653] (raylet) worker_pool.cc:530: Started worker process with pid 2523781, the token is 23
+[2026-04-14 06:31:24,565 I 2523653 2523653] (raylet) worker_pool.cc:530: Started worker process with pid 2523782, the token is 24
+[2026-04-14 06:31:24,567 I 2523653 2523653] (raylet) worker_pool.cc:530: Started worker process with pid 2523783, the token is 25
+[2026-04-14 06:31:24,568 I 2523653 2523653] (raylet) worker_pool.cc:530: Started worker process with pid 2523784, the token is 26
+[2026-04-14 06:31:24,570 I 2523653 2523653] (raylet) worker_pool.cc:530: Started worker process with pid 2523785, the token is 27
+[2026-04-14 06:31:24,571 I 2523653 2523653] (raylet) worker_pool.cc:530: Started worker process with pid 2523786, the token is 28
+[2026-04-14 06:31:24,573 I 2523653 2523653] (raylet) worker_pool.cc:530: Started worker process with pid 2523787, the token is 29
+[2026-04-14 06:31:24,575 I 2523653 2523653] (raylet) worker_pool.cc:530: Started worker process with pid 2523788, the token is 30
+[2026-04-14 06:31:24,577 I 2523653 2523653] (raylet) worker_pool.cc:530: Started worker process with pid 2523789, the token is 31
+[2026-04-14 06:31:24,579 I 2523653 2523653] (raylet) worker_pool.cc:530: Started worker process with pid 2523790, the token is 32
+[2026-04-14 06:31:24,581 I 2523653 2523653] (raylet) worker_pool.cc:530: Started worker process with pid 2523791, the token is 33
+[2026-04-14 06:31:24,584 I 2523653 2523653] (raylet) worker_pool.cc:530: Started worker process with pid 2523792, the token is 34
+[2026-04-14 06:31:24,586 I 2523653 2523653] (raylet) worker_pool.cc:530: Started worker process with pid 2523793, the token is 35
+[2026-04-14 06:31:24,588 I 2523653 2523653] (raylet) worker_pool.cc:530: Started worker process with pid 2523794, the token is 36
+[2026-04-14 06:31:24,590 I 2523653 2523653] (raylet) worker_pool.cc:530: Started worker process with pid 2523795, the token is 37
+[2026-04-14 06:31:24,592 I 2523653 2523653] (raylet) worker_pool.cc:530: Started worker process with pid 2523796, the token is 38
+[2026-04-14 06:31:24,594 I 2523653 2523653] (raylet) worker_pool.cc:530: Started worker process with pid 2523797, the token is 39
+[2026-04-14 06:31:24,596 I 2523653 2523653] (raylet) worker_pool.cc:530: Started worker process with pid 2523798, the token is 40
+[2026-04-14 06:31:24,599 I 2523653 2523653] (raylet) worker_pool.cc:530: Started worker process with pid 2523799, the token is 41
+[2026-04-14 06:31:24,601 I 2523653 2523653] (raylet) worker_pool.cc:530: Started worker process with pid 2523800, the token is 42
+[2026-04-14 06:31:24,603 I 2523653 2523653] (raylet) worker_pool.cc:530: Started worker process with pid 2523801, the token is 43
+[2026-04-14 06:31:24,605 I 2523653 2523653] (raylet) worker_pool.cc:530: Started worker process with pid 2523802, the token is 44
+[2026-04-14 06:31:24,608 I 2523653 2523653] (raylet) worker_pool.cc:530: Started worker process with pid 2523803, the token is 45
+[2026-04-14 06:31:24,610 I 2523653 2523653] (raylet) worker_pool.cc:530: Started worker process with pid 2523804, the token is 46
+[2026-04-14 06:31:24,612 I 2523653 2523653] (raylet) worker_pool.cc:530: Started worker process with pid 2523805, the token is 47
+[2026-04-14 06:31:24,614 I 2523653 2523653] (raylet) worker_pool.cc:530: Started worker process with pid 2523806, the token is 48
+[2026-04-14 06:31:24,616 I 2523653 2523653] (raylet) worker_pool.cc:530: Started worker process with pid 2523807, the token is 49
+[2026-04-14 06:31:24,618 I 2523653 2523653] (raylet) worker_pool.cc:530: Started worker process with pid 2523808, the token is 50
+[2026-04-14 06:31:24,621 I 2523653 2523653] (raylet) worker_pool.cc:530: Started worker process with pid 2523809, the token is 51
+[2026-04-14 06:31:24,623 I 2523653 2523653] (raylet) worker_pool.cc:530: Started worker process with pid 2523810, the token is 52
+[2026-04-14 06:31:24,625 I 2523653 2523653] (raylet) worker_pool.cc:530: Started worker process with pid 2523811, the token is 53
+[2026-04-14 06:31:24,627 I 2523653 2523653] (raylet) worker_pool.cc:530: Started worker process with pid 2523812, the token is 54
+[2026-04-14 06:31:24,629 I 2523653 2523653] (raylet) worker_pool.cc:530: Started worker process with pid 2523813, the token is 55
+[2026-04-14 06:31:24,632 I 2523653 2523653] (raylet) worker_pool.cc:530: Started worker process with pid 2523814, the token is 56
+[2026-04-14 06:31:24,634 I 2523653 2523653] (raylet) worker_pool.cc:530: Started worker process with pid 2523815, the token is 57
+[2026-04-14 06:31:24,636 I 2523653 2523653] (raylet) worker_pool.cc:530: Started worker process with pid 2523816, the token is 58
+[2026-04-14 06:31:24,638 I 2523653 2523653] (raylet) worker_pool.cc:530: Started worker process with pid 2523817, the token is 59
+[2026-04-14 06:31:24,640 I 2523653 2523653] (raylet) worker_pool.cc:530: Started worker process with pid 2523818, the token is 60
+[2026-04-14 06:31:24,642 I 2523653 2523653] (raylet) worker_pool.cc:530: Started worker process with pid 2523819, the token is 61
+[2026-04-14 06:31:24,645 I 2523653 2523653] (raylet) worker_pool.cc:530: Started worker process with pid 2523821, the token is 62
+[2026-04-14 06:31:24,647 I 2523653 2523653] (raylet) worker_pool.cc:530: Started worker process with pid 2523824, the token is 63
+[2026-04-14 06:31:24,647 I 2523653 2523653] (raylet) runtime_env_agent_client.cc:344: Runtime Env Agent network error: NotFound: on_connect Connection refused, the server may be still starting or is already failed. Scheduling a retry in 1000ms...
+[2026-04-14 06:31:24,952 I 2523653 2523676] (raylet) object_store.cc:37: Object store current usage 8e-09 / 149.131 GB.
+[2026-04-14 06:31:25,251 I 2523653 2523653] (raylet) worker_pool.cc:739: Job 01000000 already started in worker pool.
+[2026-04-14 06:31:25,657 I 2523653 2523653] (raylet) runtime_env_agent_client.cc:387: Create runtime env for job 01000000
+[2026-04-14 06:31:25,657 I 2523653 2523653] (raylet) worker_pool.cc:760: [Eagerly] Create runtime env successful for job 01000000.
+[2026-04-14 06:31:26,412 I 2523653 2523653] (raylet) metrics_agent_client.cc:54: Exporter initialized.
+[2026-04-14 06:31:27,084 I 2523653 2523653] (raylet) node_manager.cc:1433: Disconnecting client, graceful=true, disconnect_type=3, has_creation_task_exception=false worker_id=01000000ffffffffffffffffffffffffffffffffffffffffffffffff
+[2026-04-14 06:31:27,085 I 2523653 2523653] (raylet) node_manager.cc:1560: Driver (pid=2522961) is disconnected. worker_id=01000000ffffffffffffffffffffffffffffffffffffffffffffffff job_id=01000000
+[2026-04-14 06:31:27,087 I 2523653 2523653] (raylet) worker_pool.cc:739: Job 01000000 already started in worker pool.
+[2026-04-14 06:31:27,087 W 2523653 2523676] (raylet) store.cc:366: Disconnecting client due to connection error with code 2: End of file
+[2026-04-14 06:31:27,228 I 2523653 2523653] (raylet) main.cc:1029: received SIGTERM. Existing local drain request = None
+[2026-04-14 06:31:27,228 I 2523653 2523653] (raylet) main.cc:412: Raylet graceful shutdown triggered with death info: reason: EXPECTED_TERMINATION
+reason_message: "received SIGTERM"
+
+[2026-04-14 06:31:27,228 I 2523653 2523653] (raylet) accessor.cc:493: Unregistering node node_id=bce5d801e889c88ab5f2006d175a861558f1b9a01f75fbf4ee022b17
+[2026-04-14 06:31:27,230 I 2523653 2523653] (raylet) accessor.cc:501: Finished unregistering node info, status = OK node_id=bce5d801e889c88ab5f2006d175a861558f1b9a01f75fbf4ee022b17
+[2026-04-14 06:31:27,230 W 2523653 2523676] (raylet) store.cc:366: Disconnecting client due to connection error with code 2: End of file
+[2026-04-14 06:31:27,231 I 2523653 2523653] (raylet) agent_manager.cc:116: Killing agent dashboard_agent, pid 2523721.
+[2026-04-14 06:31:27,237 I 2523653 2523722] (raylet) agent_manager.cc:83: Agent process with name dashboard_agent exited, exit code 0.
+[2026-04-14 06:31:27,237 I 2523653 2523653] (raylet) agent_manager.cc:116: Killing agent runtime_env_agent, pid 2523723.
+[2026-04-14 06:31:27,240 I 2523653 2523724] (raylet) agent_manager.cc:83: Agent process with name runtime_env_agent exited, exit code 0.
+[2026-04-14 06:31:27,241 I 2523653 2523653] (raylet) io_service_pool.cc:49: IOServicePool is stopped.
+[2026-04-14 06:31:27,314 I 2523653 2523653] (raylet) stats.h:149: Stats module has shutdown.

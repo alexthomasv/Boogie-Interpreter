@@ -24,15 +24,21 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from interpreter.parser.declaration import ImplementationDeclaration
-from interpreter.utils.utils import (
-    preprocess_external_inputs,
+from interpreter.utils.bitops import generate_function_map
+from interpreter.utils.inputs import (
     parse_inputs,
-    generate_function_map,
+    preprocess_external_inputs,
+)
+from interpreter.utils.program import (
     generate_label_to_block,
     initialize_code_metadata,
 )
-from interpreter.python.interpreter import BoogieInterpreter, find_entry_point, process_single_input
-from interpreter.python.Environment import Environment
+from interpreter.archive.legacy_python.runtime.python.interpreter import (
+    BoogieInterpreter,
+    find_entry_point,
+    process_single_input,
+)
+from interpreter.archive.legacy_python.runtime.python.Environment import Environment
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 TEST_PACKAGES = PROJECT_ROOT / "test_packages"
@@ -610,7 +616,7 @@ class TestInterpreterExecution:
         # proving the RSA computation actually ran.  The scratch buffer ($p5)
         # is allocated via $alloc and used for the full modular exponentiation.
         # Scan all memory maps for any store activity beyond initialisation.
-        from interpreter.python.MemoryMap import MemoryMap
+        from interpreter.archive.legacy_python.runtime.python.MemoryMap import MemoryMap
         maps_with_data = 0
         for vname in list(env._var_store):
             if vname.startswith("$M.") and ".shadow" not in vname:

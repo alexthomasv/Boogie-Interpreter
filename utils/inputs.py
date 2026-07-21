@@ -1,16 +1,23 @@
 """Program input parsing and array/field metadata extraction."""
 
-import json
+import copy
 import os
 import re
 from collections import defaultdict
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 
-from interpreter.parser.declaration import ImplementationDeclaration
+from interpreter.parser.declaration import (
+    ImplementationDeclaration,
+    ProcedureDeclaration,
+)
 from interpreter.parser.statement import CallStatement
 from interpreter.parser.specifications import RequiresClause
 
-from interpreter.utils.program import extract_boogie_variables, RE_SMACK
+from interpreter.utils.program import (
+    RE_SMACK,
+    extract_boogie_variables,
+    find_entry_point,
+)
 
 # ---------------------------------------------------------------------------
 # Value helpers — expand shorthand in buffer contents / struct field values
@@ -98,21 +105,102 @@ class Input:
 
 
 class ProgramInputs:
-    """Parsed program inputs from a .input file."""
+    """Canonical input payload passed to the native interpreter.
+
+    Shadow lanes are explicit data, not derived aliases. If the compiled
+    program exposes ``name.shadow`` for a supplied input, ``variables`` must
+    contain a separate ``Input`` under that exact key with the same payload
+    kind. The native boundary rejects omitted or structurally mismatched
+    shadow rows.
+    """
 
     def __init__(self, variables: dict[str, Input], extra_data: bytes | None = None):
-        self.variables = variables
+        if type(variables) is not dict:
+            raise TypeError("ProgramInputs.variables must be a dict")
+        for name, value in variables.items():
+            if type(name) is not str or not name:
+                raise TypeError(
+                    "ProgramInputs variable names must be non-empty strings")
+            if type(value) is not Input:
+                raise TypeError(
+                    f"ProgramInputs[{name!r}] must be Input, got "
+                    f"{type(value).__name__}")
+            if value.name != name:
+                raise ValueError(
+                    f"ProgramInputs key {name!r} does not match Input.name "
+                    f"{value.name!r}")
+        if extra_data is not None and type(extra_data) is not bytes:
+            raise TypeError("ProgramInputs.extra_data must be bytes or None")
+        self.variables = dict(variables)
         self.extra_data = extra_data
 
-    def with_shadows(self) -> dict[str, Input]:
-        """Return variables dict with legacy shadow copies for public variables."""
-        result = dict(self.variables)
-        for name, inp in self.variables.items():
-            if name.endswith(".shadow"):
-                continue
-            if not inp.private:
-                result[f"{name}.shadow"] = replace(inp, name=f"{name}.shadow")
-        return result
+
+def complete_declared_shadow_inputs(
+    program,
+    program_inputs: ProgramInputs,
+) -> ProgramInputs:
+    """Materialize omitted entrypoint shadow lanes at a pipeline boundary.
+
+    Input files may compactly specify only a base lane.  Coverage and trace
+    preparation call this helper before the strict native boundary so the
+    executed payload still contains every shadow formal declared by the
+    cross-product entrypoint.  An explicitly supplied shadow remains
+    authoritative.
+    """
+    shadow_names = _entry_shadow_parameter_names(program)
+    if not shadow_names:
+        return program_inputs
+    if type(program_inputs) is not ProgramInputs:
+        raise TypeError("shadow completion requires ProgramInputs")
+
+    missing = []
+    for shadow_name in sorted(shadow_names):
+        if shadow_name in program_inputs.variables:
+            continue
+        base_name = shadow_name.removesuffix(".shadow")
+        if base_name in program_inputs.variables:
+            missing.append((shadow_name, base_name))
+
+    if not missing:
+        return program_inputs
+
+    variables = copy.deepcopy(program_inputs.variables)
+    for shadow_name, base_name in missing:
+        clone = copy.deepcopy(variables[base_name])
+        clone.name = shadow_name
+        variables[shadow_name] = clone
+    return ProgramInputs(variables, extra_data=program_inputs.extra_data)
+
+
+def _entry_shadow_parameter_names(program) -> frozenset[str]:
+    """Return the shadow formals from the entrypoint's procedure contract."""
+    try:
+        entry = find_entry_point(program)
+    except Exception:
+        return frozenset()
+    if entry is None:
+        return frozenset()
+
+    source = entry
+    for declaration in getattr(program, "declarations", ()) or ():
+        if (
+            isinstance(declaration, ProcedureDeclaration)
+            and not isinstance(declaration, ImplementationDeclaration)
+            and getattr(declaration, "name", None) == getattr(entry, "name", None)
+            and getattr(declaration, "parameters", None)
+        ):
+            source = declaration
+            break
+
+    names = []
+    for parameter in getattr(source, "parameters", ()) or ():
+        raw_names = getattr(parameter, "names", ()) or ()
+        if len(raw_names) != 1:
+            continue
+        name = str(raw_names[0])
+        if name.endswith(".shadow"):
+            names.append(name)
+    return frozenset(names)
 
 
 def input_contract_from_requires(proc_decl, input_names=None) -> tuple[set[str], set[str]]:
@@ -185,11 +273,12 @@ class ArrayInfo:
 
 
 class FieldInfo:
-    def __init__(self, var_name, mem_map, base_ptr, size):
+    def __init__(self, var_name, mem_map, base_ptr, size, kind):
         self.var_name = var_name
         self.mem_map = mem_map
         self.base_ptr = base_ptr
         self.size = size
+        self.kind = kind
 
     def __str__(self):
         return f"FieldInfo(var_name={self.var_name}, mem_map={self.mem_map}, base_ptr={self.base_ptr}, size={self.size})"
@@ -208,7 +297,8 @@ def process_field_stmt(stmt, is_shadow):
     else:
         mem_map = field_info[1].name
     size = int(field_info[3].value)
-    return FieldInfo(var_name, mem_map, base_ptr, size)
+    kind = "buffer" if stmt.has_attribute("array") else "value"
+    return FieldInfo(var_name, mem_map, base_ptr, size, kind)
 
 
 def process_array_stmt(stmt, is_shadow):
@@ -230,7 +320,9 @@ def process_array_stmt(stmt, is_shadow):
 
 
 def gather_field_info_stmts(proc):
-    assert isinstance(proc, ImplementationDeclaration), f"{type(proc)}"
+    assert isinstance(proc, ProcedureDeclaration) and proc.body is not None, (
+        f"expected a procedure with a body, got {type(proc)}"
+    )
     field_info_stmts = []
     seen_offsets = set()
     for block in proc.body.blocks:
@@ -248,7 +340,9 @@ def gather_field_info_stmts(proc):
 
 
 def gather_array_info_stmts(proc):
-    assert isinstance(proc, ImplementationDeclaration), f"{type(proc)}"
+    assert isinstance(proc, ProcedureDeclaration) and proc.body is not None, (
+        f"expected a procedure with a body, got {type(proc)}"
+    )
     array_info_stmts = []
     for block in proc.body.blocks:
         for stmt in block.statements:
@@ -313,35 +407,3 @@ def gather_ptr_aliases(proc):
                 aliases[this] = first
                 aliases[f"{this}.shadow"] = f"{first}.shadow"
     return aliases
-
-
-# ── Legacy JSON input parsing ────────────────────────────────────────────
-
-def parse_inputs(input_json) -> ProgramInputs:
-    """Parse a legacy JSON input file into ProgramInputs.
-
-    Kept for backward compatibility with existing tests and .json input files.
-    New code should use input_parser.parse_input_file() for .input files.
-    """
-    with open(input_json, 'r') as f:
-        raw = json.load(f)
-
-    variables = {}
-    extra_data = None
-
-    for entry in raw:
-        if 'extra_data' in entry:
-            extra_data = bytes.fromhex(entry['extra_data'])
-            continue
-
-        name = entry['var']
-        inp = Input(
-            name=name,
-            private=entry['private'],
-            value=entry.get('value'),
-            buffers=entry.get('buffers'),
-            struct=entry.get('struct'),
-        )
-        variables[name] = inp
-
-    return ProgramInputs(variables=variables, extra_data=extra_data)

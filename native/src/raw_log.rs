@@ -9,19 +9,32 @@
 //! On-disk format:
 //!   header (in frame 0):
 //!     magic = b"SWRL"                4 bytes
-//!     version = 2                    1 byte
+//!     version = 3                    1 byte
 //!     var_table_len (u32 LE)         4 bytes
 //!     var_table = [len:u16, bytes]*  variable
 //!     block_table_len (u32 LE)       4 bytes
 //!     block_table = [len:u16, bytes]*variable
 //!   records (repeated across frames 1..N):
-//!     kind (u8)    1 byte  — `b'W'` write / `b'R'` read / `b'I'` iter context
+//!     kind (u8)    1 byte  — event kind (see below)
 //!     var_id (u32) 4 bytes — variable id, or context id for `b'I'`
 //!     pc (u32)     4 bytes — pc, or parent context id for `b'I'`
 //!     block_id(u32)4 bytes — block id, or loop header block id for `b'I'`
 //!     value(i64)   8 bytes
 //!     iter_id(u32) 4 bytes — context id, or depth for `b'I'`
 //!   = 25 bytes/record
+//!
+//! SWRL v3 retains the v2 `W`/`R`/`I` events and adds the ordered state
+//! events needed to reconstruct an exact concrete pre-state:
+//!
+//! * `S` — authoritative initial scalar value (virtual pc 0),
+//! * `P` — statement PRE visit, emitted before any operation in that statement,
+//! * `U` — scalar write whose exact value is unavailable (state invalidation).
+//!
+//! A `P` record has no variable, so its `var_id` is [`NO_VAR_ID`].  A `U`
+//! record stores an [`UNKNOWN_REASON_*`] code in `value`.  Record position in
+//! the decompressed, concatenated frame stream is the authoritative event
+//! order.  There is deliberately no redundant sequence field: writers append
+//! from one execution thread, and frame boundaries are record-aligned.
 //!
 //! All fields are little-endian. The byte stream is wrapped in one or
 //! more zstd frames concatenated into a single file. Each frame is
@@ -31,13 +44,30 @@
 //! carry records. The writer closes a frame every ~64 MiB
 //! uncompressed, giving ~50 frames for a pkcs1-sized trace.
 
+use crate::opcodes::NameTable;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::Path;
 
 pub const MAGIC: &[u8; 4] = b"SWRL";
-pub const VERSION: u8 = 2;
+pub const VERSION: u8 = 3;
 pub const RECORD_SIZE: usize = 1 + 4 + 4 + 4 + 8 + 4;
+
+pub const OP_WRITE: u8 = b'W';
+pub const OP_READ: u8 = b'R';
+pub const OP_ITER_CONTEXT: u8 = b'I';
+pub const OP_INITIAL_SCALAR: u8 = b'S';
+pub const OP_PRE_PC: u8 = b'P';
+pub const OP_UNKNOWN_WRITE: u8 = b'U';
+
+/// Sentinel in the `var_id` field for events (currently `P`) that are tied to
+/// a program point rather than a variable.
+pub const NO_VAR_ID: u32 = u32::MAX;
+
+/// `U.value`: an exact mathematical integer did not fit the raw log's i64
+/// value field.  The consumer must treat the variable as unknown until a later
+/// `S` or `W`, never wrap or clamp this value.
+pub const UNKNOWN_REASON_BIG_INT: i64 = 1;
 
 /// Number of zstd encoder worker threads. Multi-worker encoding within
 /// a SINGLE frame uses worker threads internally but still produces
@@ -50,6 +80,12 @@ const ENCODER_WORKERS: u32 = 4;
 /// written to the current frame, the writer closes it and starts a new
 /// one. 64 MiB matches the Python writer's `FRAME_FLUSH_BYTES`.
 const FRAME_FLUSH_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Records are staged in an in-process buffer and handed to the zstd
+/// encoder in chunks of this size, instead of one FFI call per 25-byte
+/// record. Must be a multiple of `RECORD_SIZE` so frame rolls (which
+/// only happen after a drain) stay record-aligned.
+const RECORD_BUF_BYTES: usize = 2621 * RECORD_SIZE; // ~64 KiB
 
 /// Streaming raw-log writer. Buffers records and flushes to a zstd-wrapped
 /// file. Call `write_header` exactly once, then `record` as many times as
@@ -69,6 +105,8 @@ pub struct RawLogWriter {
     inner: Option<BufWriter<File>>,
     /// Active encoder (``Some`` between frame-start and frame-close).
     enc: Option<zstd::stream::write::Encoder<'static, BufWriter<File>>>,
+    /// Staged records not yet handed to the encoder (see `RECORD_BUF_BYTES`).
+    buf: Vec<u8>,
     /// Uncompressed bytes written to the current frame. Reset on
     /// ``close_frame``.
     frame_bytes: u64,
@@ -85,6 +123,7 @@ impl RawLogWriter {
         let mut w = Self {
             inner: Some(buf),
             enc: None,
+            buf: Vec::with_capacity(RECORD_BUF_BYTES),
             frame_bytes: 0,
             count: 0,
         };
@@ -111,6 +150,7 @@ impl RawLogWriter {
     /// frame footer + checksum) and immediately start a new one so the
     /// caller can continue writing records.
     fn roll_frame(&mut self) -> std::io::Result<()> {
+        self.drain_buf()?;
         let enc = self
             .enc
             .take()
@@ -120,6 +160,20 @@ impl RawLogWriter {
         self.start_new_frame()
     }
 
+    /// Hand all staged records to the zstd encoder. Buffer drains are the
+    /// only points where frame accounting advances, so frames always close
+    /// on record boundaries (the buffer holds whole records only).
+    fn drain_buf(&mut self) -> std::io::Result<()> {
+        if self.buf.is_empty() {
+            return Ok(());
+        }
+        let enc = self.enc.as_mut().expect("writer uninitialised");
+        enc.write_all(&self.buf)?;
+        self.frame_bytes += self.buf.len() as u64;
+        self.buf.clear();
+        Ok(())
+    }
+
     /// Write the header (magic + version + var/block name tables). Must be
     /// called once before any records. The header occupies frame 0
     /// exclusively — we close the frame immediately after the header so
@@ -127,19 +181,25 @@ impl RawLogWriter {
     /// prefix of the file.
     pub fn write_header(
         &mut self,
-        var_names: &[String],
+        var_names: &NameTable,
         block_names: &[String],
     ) -> std::io::Result<()> {
         let enc = self.enc.as_mut().expect("writer uninitialised");
         enc.write_all(MAGIC)?;
         enc.write_all(&[VERSION])?;
-        write_name_table(enc, var_names)?;
-        write_name_table(enc, block_names)?;
+        write_name_table(enc, var_names.len(), var_names.iter())?;
+        write_name_table(
+            enc,
+            block_names.len(),
+            block_names.iter().map(String::as_str),
+        )?;
         self.roll_frame()?;
         Ok(())
     }
 
-    /// Append a single trace record.
+    /// Append a single trace record. Records are staged in `self.buf` and
+    /// pushed to the zstd encoder in ~64 KiB chunks — one libzstd call per
+    /// chunk instead of one per record.
     #[inline]
     pub fn record(
         &mut self,
@@ -150,21 +210,20 @@ impl RawLogWriter {
         value: i64,
         iter_id: u32,
     ) -> std::io::Result<()> {
-        let mut buf = [0u8; RECORD_SIZE];
-        buf[0] = kind;
-        buf[1..5].copy_from_slice(&var_id.to_le_bytes());
-        buf[5..9].copy_from_slice(&pc.to_le_bytes());
-        buf[9..13].copy_from_slice(&block_id.to_le_bytes());
-        buf[13..21].copy_from_slice(&(value as u64).to_le_bytes());
-        buf[21..25].copy_from_slice(&iter_id.to_le_bytes());
-        {
-            let enc = self.enc.as_mut().expect("writer uninitialised");
-            enc.write_all(&buf)?;
-        }
+        let mut rec = [0u8; RECORD_SIZE];
+        rec[0] = kind;
+        rec[1..5].copy_from_slice(&var_id.to_le_bytes());
+        rec[5..9].copy_from_slice(&pc.to_le_bytes());
+        rec[9..13].copy_from_slice(&block_id.to_le_bytes());
+        rec[13..21].copy_from_slice(&(value as u64).to_le_bytes());
+        rec[21..25].copy_from_slice(&iter_id.to_le_bytes());
+        self.buf.extend_from_slice(&rec);
         self.count += 1;
-        self.frame_bytes += RECORD_SIZE as u64;
-        if self.frame_bytes >= FRAME_FLUSH_BYTES {
-            self.roll_frame()?;
+        if self.buf.len() >= RECORD_BUF_BYTES {
+            self.drain_buf()?;
+            if self.frame_bytes >= FRAME_FLUSH_BYTES {
+                self.roll_frame()?;
+            }
         }
         Ok(())
     }
@@ -174,6 +233,7 @@ impl RawLogWriter {
     /// frames that can appear if the last record happens to land
     /// exactly on a ``FRAME_FLUSH_BYTES`` boundary.
     pub fn finish(mut self) -> std::io::Result<u64> {
+        self.drain_buf()?;
         let count = self.count;
         let enc = self.enc.take().expect("writer uninitialised at finish");
         let buf = enc.finish()?;
@@ -183,8 +243,12 @@ impl RawLogWriter {
     }
 }
 
-fn write_name_table<W: Write>(w: &mut W, names: &[String]) -> std::io::Result<()> {
-    w.write_all(&(names.len() as u32).to_le_bytes())?;
+fn write_name_table<'a, W, I>(w: &mut W, len: usize, names: I) -> std::io::Result<()>
+where
+    W: Write,
+    I: IntoIterator<Item = &'a str>,
+{
+    w.write_all(&(len as u32).to_le_bytes())?;
     for name in names {
         let bytes = name.as_bytes();
         // Cap at u16::MAX — Boogie identifiers are always tiny so this is

@@ -88,16 +88,13 @@ def _run_entry(expected: dict, cache: dict, tmp_path: Path) -> dict:
     result = run_native(
         ctx["program"],
         program_inputs,
-        package,
         input_file.stem,
         raw_log_path=tmp_path / f"{package}-{input_file.stem}.raw.zst",
-        extra_data=program_inputs.extra_data,
         log_read=False,
         prepared=ctx["prepared"],
         no_trace=True,
         return_status=True,
         return_memory_summary=True,
-        validate_handoff=False,
         quiet=True,
         max_steps=100_000_000,
     )

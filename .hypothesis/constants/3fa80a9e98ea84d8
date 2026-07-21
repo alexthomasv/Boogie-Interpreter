@@ -1,0 +1,4 @@
+# file: /home/ubuntu/boogie-parser/interpreter/parser/statement.py
+# hypothesis_version: 6.151.9
+
+['\n}', ' := ', ' else {\n', '$bb', '$var', ', ', 'Default', 'arguments', 'assignments', 'blocks', 'condition', 'else_', 'expression', 'identifiers', 'invariants', 'lhs', 'locals', 'procedure', 'rhs', '{\n', '}']

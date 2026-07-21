@@ -1,0 +1,4 @@
+# file: /home/ubuntu/boogie-parser/interpreter/parser/transformer.py
+# hypothesis_version: 6.151.9
+
+['!=', '%', '&&', '*', '+', '++', '-', '/', '<', '<:', '<=', '<==>', '==', '==>', '>', '>=', 'arguments', 'attributes', 'body', 'bool', 'condition', 'else_', 'exists', 'false', 'finite', 'forall', 'int', 'name', 'names', 'order_spec', 'real', 'rets', 'specs', 'statements', 'then', 'true', 'type', 'unique', 'where', '||', '∀', '∃']

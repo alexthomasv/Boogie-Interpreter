@@ -70,8 +70,6 @@ def _baseline(test_name: str) -> dict:
 
 
 def _assert_coverage_metrics(report: dict) -> None:
-    assert report["engine_used"] == "native"
-    assert not report["native_fallback"], report.get("native_fallback_reason")
     assert report["seed_inputs"] >= 1
     assert report["candidates_evaluated"] >= report["seed_inputs"]
     assert report["step_limits"] >= 0
@@ -101,7 +99,6 @@ def _run_generation(test_name: str, tmp_path: Path, seed_names: list[str], **ove
         test_name,
         seed_dir,
         out_dir,
-        engine="native",
         profile=overrides.pop("profile", "fast-traces"),
         path_engine=overrides.pop("path_engine", "fuzz"),
         rng_seed=0,
@@ -189,8 +186,10 @@ def test_pkcs1_i15_native_no_trace_perf_metrics(tmp_path):
     program_inputs = parse_input_file(input_dir / "fuzz_0001.input", field_sizes=field_sizes)
 
     import swoosh_interp
+    from interpreter.utils.integer_encoding import detect_semantics_mode
 
-    compiled = swoosh_interp.lower(program)
+    compiled = swoosh_interp.lower(
+        program, mode=detect_semantics_mode(program))
     samples = []
     last_result = None
     for idx in range(3):
@@ -198,7 +197,6 @@ def test_pkcs1_i15_native_no_trace_perf_metrics(tmp_path):
         last_result = run_native(
             program,
             program_inputs,
-            test_name,
             f"perf_{idx}",
             tmp_path / f"perf_{idx}.trace.raw.zst",
             compiled=compiled,

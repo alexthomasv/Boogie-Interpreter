@@ -5,7 +5,7 @@
 
 #[cfg(kani)]
 mod proofs {
-    use crate::builtins::{exec_binary, exec_unary, mask, to_signed};
+    use crate::builtins::bv::{exec_binary, exec_unary, mask, to_signed};
     use crate::opcodes::BuiltinFn;
 
     /// Helper: pick a valid bit width from {8, 16, 32, 64}

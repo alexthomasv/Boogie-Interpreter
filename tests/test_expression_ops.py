@@ -13,14 +13,19 @@ if str(PARENT) not in sys.path:
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from interpreter.utils.utils import (
+from interpreter.utils.bitops import (
     slt_fn, sle_fn, sgt_fn, sge_fn,
     add_fn, sub_fn, mul_fn, and_fn, or_fn, xor_fn, not_fn,
     sext_fn, trunc_fn, eq_fn, ne_fn,
     udiv_fn, sdiv_fn, urem_fn, srem_fn,
     ult_fn, ule_fn, ugt_fn, uge_fn,
-    shl_fn, lshr_32, lshr_64, ashr_32, ashr_64,
+    shl_fn, lshr_fn, ashr_fn,
 )
+
+lshr_32 = lshr_fn(32)
+lshr_64 = lshr_fn(64)
+ashr_32 = ashr_fn(32)
+ashr_64 = ashr_fn(64)
 
 try:
     import swoosh_interp

@@ -85,6 +85,48 @@ def test_requires_violation_is_reported_as_assume_violation(tmp_path):
     assert result["invalid_reason"] == "requires"
 
 
+def test_missing_scalar_shadow_is_not_synthesized(tmp_path):
+    source = """
+    procedure main($x: int, $x.shadow: int);
+      requires $x == $x.shadow;
+    implementation {:entrypoint} main($x: int, $x.shadow: int) {
+    entry:
+      return;
+    }
+    """
+
+    with pytest.raises(
+        ValueError,
+        match=r'requires explicit shadow input "\$x\.shadow"',
+    ):
+        run_native_case(
+            source,
+            scalar_inputs({"$x": 25}),
+            tmp_path=tmp_path,
+            test_name="missing_scalar_shadow_case",
+        )
+
+
+def test_explicit_scalar_shadow_remains_authoritative(tmp_path):
+    source = """
+    procedure main($x: int, $x.shadow: int);
+      requires $x != $x.shadow;
+    implementation {:entrypoint} main($x: int, $x.shadow: int) {
+    entry:
+      return;
+    }
+    """
+
+    result = run_native_case(
+        source,
+        scalar_inputs({"$x": 25, "$x.shadow": 7}),
+        tmp_path=tmp_path,
+        test_name="explicit_scalar_shadow_case",
+    )
+
+    assert_ok(result, blocks={"entry"})
+
+
 def test_assume_violation_is_reported_as_invalid_input(tmp_path):
     source = """
     procedure main($x: int);

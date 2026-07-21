@@ -1,15 +1,43 @@
 use crate::builtins;
+use crate::builtins::int::{ZResult, Z};
 use crate::memory_map::MemoryMap;
 use crate::opcodes::*;
-use crate::trace::{TraceAccumulator, OP_READ, OP_WRITE};
-use rustc_hash::FxHashSet;
+use crate::trace::{TraceAccumulator, OP_READ, OP_WRITE, UNKNOWN_REASON_BIG_INT};
+use num_bigint::BigInt;
+use rustc_hash::{FxHashMap, FxHashSet};
+use std::sync::Arc;
 
 const MASK_64: i64 = -1i64; // all bits set = u64::MAX as i64
 
-/// Runtime value — either a scalar or a memory map index.
+/// Surface symbol for a Boogie binary operator (for failing-assume messages).
+fn binop_symbol(op: &BinOp) -> &'static str {
+    match op {
+        BinOp::Eq => "==",
+        BinOp::Ne => "!=",
+        BinOp::Lt => "<",
+        BinOp::Gt => ">",
+        BinOp::Le => "<=",
+        BinOp::Ge => ">=",
+        BinOp::And => "&&",
+        BinOp::Or => "||",
+        BinOp::Implies => "==>",
+        BinOp::Iff => "<==>",
+        BinOp::Sub => "-",
+        BinOp::Mul => "*",
+        BinOp::Add => "+",
+        BinOp::Div => "/",
+        BinOp::Mod => "%",
+    }
+}
+
+/// Runtime value — a scalar, an out-of-i64 exact integer (Int mode only),
+/// or a memory map index.
 #[derive(Debug, Clone)]
 pub enum Value {
     Scalar(i64),
+    /// Exact-ℤ value strictly outside i64 range. Only `SemanticsMode::Int`
+    /// evaluation produces these (BV mode is a closed i64 algebra).
+    Big(Box<BigInt>),
     Map(usize), // index into VM.memory_maps
 }
 
@@ -27,6 +55,13 @@ pub enum ExecutionStatus {
         pc: u32,
         block: String,
         reason: &'static str,
+        /// Human-readable description of WHICH assume failed and why — the
+        /// rendered condition plus the concrete values of the scalar variables
+        /// it references (e.g. `($i3 >= 0)  [where $i3=-1]`). Empty when no
+        /// expression is available (e.g. an infeasible goto with no candidate
+        /// guard). Surfaced to Python as `invalid_detail` so an agent fixing a
+        /// stale input knows exactly which precondition the input violates.
+        detail: String,
     },
     StepLimit {
         pc: u32,
@@ -40,23 +75,44 @@ pub struct VM {
     /// Variable store: VarId → Value
     pub vars: Vec<Value>,
     /// Variable names for trace output
-    pub var_names: Vec<String>,
+    pub var_names: Arc<NameTable>,
     /// Memory maps, indexed by map_index in Value::Map
     pub memory_maps: Vec<MemoryMap>,
     /// Which VarId is a memory map? VarId → Some(map_index)
-    pub var_to_map: Vec<Option<usize>>,
+    pub var_to_map: FxHashMap<VarId, usize>,
     /// Current PC
     pub pc: u32,
-    /// Current block name
-    pub curr_block: String,
-    /// Current block ID (for trace — avoids string allocation)
+    /// Current block ID (names are materialized only on error paths and at
+    /// the Python boundary — see `block_name`)
     pub curr_block_id: u32,
-    /// Explored block IDs. Names are materialized only at the Python boundary.
-    pub explored_blocks: FxHashSet<BlockId>,
-    /// Ordered block entries for lightweight path/edge coverage.
+    /// Explored-block bitset, indexed by BlockId (parallel to program.blocks).
+    pub explored_blocks: Vec<bool>,
+    /// Number of distinct blocks explored (popcount of `explored_blocks`).
+    pub explored_count: usize,
+    /// Distinct dynamic CFG transitions observed during this execution.
+    /// This stays bounded by the compiled CFG even when loops execute for
+    /// millions of iterations.
+    pub explored_edges: FxHashSet<(BlockId, BlockId)>,
+    /// Whether to retain the explored-block bitset/count and edge set. Result
+    /// consumers that need only concrete outputs can disable this before
+    /// execution and avoid a potentially large edge-set allocation.
+    pub record_coverage: bool,
+    /// Ordered block entries for lightweight path/edge coverage. Only
+    /// recorded when `record_block_trace` is set; `block_entries` keeps the
+    /// total count either way.
     pub block_trace: Vec<BlockId>,
+    /// Whether to record the ordered `block_trace` (returned to Python as
+    /// `block_sequence`). Long runs enter millions of blocks — callers that
+    /// don't need the sequence turn this off.
+    pub record_block_trace: bool,
+    /// Total number of block entries (what `block_trace.len()` would be).
+    pub block_entries: u64,
     /// Compact trace accumulator
     pub trace: TraceAccumulator,
+    /// Whether the authoritative scalar entry state has already been emitted.
+    /// A VM may be executed only after all concrete input initialization, so
+    /// the first `execute_with_limit` call owns this one-time snapshot.
+    initial_trace_seeded: bool,
     /// Whether to log reads
     pub log_read: bool,
     /// Whether to skip all tracing (for benchmarking)
@@ -77,8 +133,35 @@ pub struct VM {
     pub m0_id: Option<VarId>,
     pub m0_shadow_id: Option<VarId>,
     /// Per-variable nondet schedules loaded from .input int_seq entries.
-    pub havoc_sequences: Vec<Option<Vec<i64>>>,
-    pub havoc_counts: Vec<usize>,
+    pub havoc_sequences: FxHashMap<VarId, Vec<i64>>,
+    pub havoc_counts: FxHashMap<VarId, usize>,
+    /// Reusable RHS-evaluation buffer for AssignN (avoids a per-statement Vec).
+    scratch_evals: Vec<EvalResult>,
+    /// Trace records SKIPPED because the value was an out-of-i64 exact
+    /// integer (Int mode). The raw-log value field is i64; recording a
+    /// wrapped/clamped stand-in could manufacture false trace-refutations
+    /// downstream, so the escape is to drop the record and count it.
+    pub big_trace_skips: u64,
+    /// Out-of-i64 exact values folded mod 2^64 at the MEMORY interface
+    /// (Int mode). SMACK emits negative pointer offsets as u64
+    /// two's-complement literals (`p + 18446744073709551615` ≡ `p - 1`),
+    /// so exact-ℤ address chains can leave i64; the memory map is a
+    /// 64-bit-address store, and folding once at the boundary is
+    /// congruent (mod 2^64) with the historical per-op wrap for +,-,*.
+    pub mem_big_folds: u64,
+}
+
+/// Two's-complement fold of an exact integer into the 64-bit address/value
+/// space of the memory map: `v mod 2^64`, read back as i64.
+#[inline]
+fn fold_big_to_i64(b: &BigInt) -> i64 {
+    // Allocation-free: v mod 2^64 == low 64 bits of the magnitude, negated
+    // (wrapping) for negative values.
+    let low = b.iter_u64_digits().next().unwrap_or(0) as i64;
+    match b.sign() {
+        num_bigint::Sign::Minus => low.wrapping_neg(),
+        _ => low,
+    }
 }
 
 impl VM {
@@ -93,7 +176,7 @@ impl VM {
     fn new_with_trace(program: &CompiledProgram, trace_enabled: bool) -> Self {
         let n = program.num_vars as usize;
         let vars = vec![Value::Scalar(0); n];
-        let var_to_map = vec![None; n];
+        let var_to_map = FxHashMap::default();
         let mut trace = TraceAccumulator::new();
         if trace_enabled {
             // Install loop metadata so packed iter_id emission works.  The
@@ -108,15 +191,20 @@ impl VM {
         }
         Self {
             vars,
-            var_names: program.var_names.clone(),
+            var_names: Arc::clone(&program.var_names),
             memory_maps: Vec::new(),
             var_to_map,
             pc: 0,
-            curr_block: String::new(),
             curr_block_id: 0,
-            explored_blocks: FxHashSet::default(),
+            explored_blocks: vec![false; program.blocks.len()],
+            explored_count: 0,
+            explored_edges: FxHashSet::default(),
+            record_coverage: true,
             block_trace: Vec::new(),
+            record_block_trace: true,
+            block_entries: 0,
             trace,
+            initial_trace_seeded: false,
             log_read: true,
             alloc_addr: 0,
             alloc_addr_shadow: 0,
@@ -129,48 +217,63 @@ impl VM {
             m0_id: program.m0_id,
             m0_shadow_id: program.m0_shadow_id,
             no_trace: !trace_enabled,
-            havoc_sequences: vec![None; n],
-            havoc_counts: vec![0; n],
+            havoc_sequences: FxHashMap::default(),
+            havoc_counts: FxHashMap::default(),
+            scratch_evals: Vec::new(),
+            big_trace_skips: 0,
+            mem_big_folds: 0,
+        }
+    }
+
+    /// Materialize the current block's name. Only used on error paths and at
+    /// the Python boundary — the hot loop tracks `curr_block_id` only.
+    #[inline]
+    pub fn block_name(&self, program: &CompiledProgram) -> String {
+        program
+            .blocks
+            .get(self.curr_block_id as usize)
+            .map(|b| b.name.clone())
+            .unwrap_or_default()
+    }
+
+    /// Mark a block as explored (bitset + distinct count).
+    #[inline]
+    pub fn mark_explored(&mut self, block_id: BlockId) {
+        let idx = block_id as usize;
+        if idx >= self.explored_blocks.len() {
+            self.explored_blocks.resize(idx + 1, false);
+        }
+        if !self.explored_blocks[idx] {
+            self.explored_blocks[idx] = true;
+            self.explored_count += 1;
         }
     }
 
     pub fn set_havoc_sequence(&mut self, var_id: VarId, seq: Vec<i64>) {
-        let vid = var_id as usize;
-        if vid >= self.havoc_sequences.len() {
-            return;
-        }
-        self.havoc_sequences[vid] = Some(seq);
-        self.havoc_counts[vid] = 0;
+        self.havoc_sequences.insert(var_id, seq);
+        self.havoc_counts.insert(var_id, 0);
     }
 
     #[inline]
     pub fn havoc_count(&self, var_id: VarId) -> usize {
-        self.havoc_counts.get(var_id as usize).copied().unwrap_or(0)
+        self.havoc_counts.get(&var_id).copied().unwrap_or(0)
     }
 
     pub fn set_havoc_value_at(&mut self, var_id: VarId, idx: usize, value: i64) {
-        let vid = var_id as usize;
-        if vid >= self.havoc_sequences.len() {
-            return;
-        }
-        let seq = self.havoc_sequences[vid].get_or_insert_with(Vec::new);
+        let seq = self.havoc_sequences.entry(var_id).or_default();
         if seq.len() <= idx {
             seq.resize(idx + 1, 0);
         }
         seq[idx] = value;
-        self.havoc_counts[vid] = 0;
+        self.havoc_counts.insert(var_id, 0);
     }
 
     #[inline]
     pub fn next_havoc_value(&mut self, var_id: VarId) -> i64 {
-        let vid = var_id as usize;
-        let Some(count) = self.havoc_counts.get_mut(vid) else {
-            return 0;
-        };
+        let count = self.havoc_counts.entry(var_id).or_insert(0);
         let value = self
             .havoc_sequences
-            .get(vid)
-            .and_then(|seq| seq.as_ref())
+            .get(&var_id)
             .and_then(|seq| seq.get(*count).copied())
             .unwrap_or(0);
         *count += 1;
@@ -182,8 +285,34 @@ impl VM {
         let map = MemoryMap::new(name, index_bw, element_bw);
         let idx = self.memory_maps.len();
         self.memory_maps.push(map);
-        self.var_to_map[var_id as usize] = Some(idx);
+        self.var_to_map.insert(var_id, idx);
         self.vars[var_id as usize] = Value::Map(idx);
+    }
+
+    /// Emit the complete concrete scalar entry state exactly once, after all
+    /// input/static initialization and before the first statement PRE event.
+    /// Maps have no scalar value.  An out-of-i64 initial integer is represented
+    /// by `U`, so consumers never revive a stale or wrapped stand-in.
+    fn seed_initial_trace(&mut self, entry_block_id: BlockId) {
+        if self.no_trace || self.initial_trace_seeded {
+            return;
+        }
+        self.initial_trace_seeded = true;
+        for (vid, value) in self.vars.iter().enumerate() {
+            match value {
+                Value::Scalar(value) => {
+                    self.trace
+                        .record_initial_scalar(vid as VarId, *value, entry_block_id)
+                }
+                Value::Big(_) => self.trace.record_unknown_write(
+                    vid as VarId,
+                    0,
+                    entry_block_id,
+                    UNKNOWN_REASON_BIG_INT,
+                ),
+                Value::Map(_) => {}
+            }
+        }
     }
 
     /// Set a scalar variable.
@@ -196,11 +325,51 @@ impl VM {
         } else if Some(var_id) == self.curr_addr_shadow_id {
             self.alloc_addr_shadow = value;
         }
-        if !self.no_trace && !silent {
+        // `silent` is an initialization-only escape hatch. Once the entry
+        // snapshot has been emitted, every scalar mutation must remain visible
+        // even if a caller accidentally retains the initialization flag.
+        if !self.no_trace && (!silent || self.initial_trace_seeded) {
             self.trace
                 .record(var_id, value, self.pc, self.curr_block_id, OP_WRITE);
         }
         self.vars[vid] = Value::Scalar(value);
+    }
+
+    /// Store an out-of-i64 exact integer (Int mode). The fixed-width trace
+    /// cannot carry its value, so emit an explicit `U` invalidation and count
+    /// the escape in `big_trace_skips`.
+    #[inline]
+    pub fn set_big(&mut self, var_id: VarId, value: Box<BigInt>) {
+        if Some(var_id) == self.curr_addr_id || Some(var_id) == self.curr_addr_shadow_id {
+            panic!(
+                "exact-int overflow escape: allocation cursor {} left i64 range ({})",
+                &self.var_names[var_id as usize], value
+            );
+        }
+        if !self.no_trace {
+            self.big_trace_skips += 1;
+            self.trace.record_unknown_write(
+                var_id,
+                self.pc,
+                self.curr_block_id,
+                UNKNOWN_REASON_BIG_INT,
+            );
+        }
+        self.vars[var_id as usize] = Value::Big(value);
+    }
+
+    /// Memory-interface read of a variable: like `get_scalar`, but an
+    /// out-of-i64 exact value folds mod 2^64 (counted) instead of panicking
+    /// — used by the memcpy/memset/read handlers whose operands are
+    /// 64-bit addresses/lengths by construction.
+    #[inline]
+    fn get_scalar_mem(&mut self, var_id: VarId) -> i64 {
+        if let Value::Big(b) = &self.vars[var_id as usize] {
+            let folded = fold_big_to_i64(b);
+            self.mem_big_folds += 1;
+            return folded;
+        }
+        self.get_scalar(var_id)
     }
 
     /// Get a scalar variable value, with optional read tracing.
@@ -216,9 +385,14 @@ impl VM {
                 }
                 v
             }
+            Value::Big(b) => panic!(
+                "exact-int overflow escape: {} = {} is outside i64 in an \
+                 i64-only context (memory/handoff)",
+                &self.var_names[vid], b
+            ),
             Value::Map(_) => panic!(
                 "get_scalar called on memory map variable: {}",
-                self.var_names[vid]
+                &self.var_names[vid]
             ),
         }
     }
@@ -228,9 +402,14 @@ impl VM {
     pub fn get_scalar_silent(&self, var_id: VarId) -> i64 {
         match &self.vars[var_id as usize] {
             Value::Scalar(v) => *v,
+            Value::Big(b) => panic!(
+                "exact-int overflow escape: {} = {} is outside i64 in an \
+                 i64-only context (memory/handoff)",
+                &self.var_names[var_id as usize], b
+            ),
             Value::Map(_) => panic!(
                 "get_scalar_silent called on memory map variable: {}",
-                self.var_names[var_id as usize]
+                &self.var_names[var_id as usize]
             ),
         }
     }
@@ -242,7 +421,7 @@ impl VM {
             Value::Map(idx) => *idx,
             _ => panic!(
                 "get_map_idx called on non-map variable: {}",
-                self.var_names[var_id as usize]
+                &self.var_names[var_id as usize]
             ),
         }
     }
@@ -250,9 +429,17 @@ impl VM {
     /// Clear a variable (remove from store or clear its map).
     pub fn clear_var(&mut self, var_id: VarId) {
         let vid = var_id as usize;
-        if let Some(map_idx) = self.var_to_map[vid] {
+        if let Some(&map_idx) = self.var_to_map.get(&var_id) {
             self.memory_maps[map_idx].clear();
         } else {
+            // Do not route this through set_scalar: clearing $CurrAddr's
+            // materialized slot must not reset the separate allocation cursor.
+            // It is nevertheless a real scalar mutation and therefore a known
+            // W in the ordered witness stream.
+            if !self.no_trace {
+                self.trace
+                    .record(var_id, 0, self.pc, self.curr_block_id, OP_WRITE);
+            }
             self.vars[vid] = Value::Scalar(0);
         }
     }
@@ -273,54 +460,13 @@ impl VM {
             if self.memory_maps[map_idx].element_bit_width != 8 {
                 continue;
             }
-            let is_shadow = self.memory_maps[map_idx].name.ends_with(".shadow");
-            let (dst_base, src_base) = if is_shadow {
+            let (dst_base, src_base) = if self.memory_maps[map_idx].is_shadow {
                 (dst_shadow, src_shadow)
             } else {
                 (dst, src)
             };
-            self.memmove_sparse_map(map_idx, dst_base, src_base, len);
+            self.memory_maps[map_idx].move_range(src_base, dst_base, len);
         }
-    }
-
-    fn memmove_sparse_map(&mut self, map_idx: usize, dst: i64, src: i64, len: i64) {
-        let Some(src_end) = src.checked_add(len) else {
-            return;
-        };
-        let Some(dst_end) = dst.checked_add(len) else {
-            return;
-        };
-
-        let copied: Vec<(i64, i64)> = self.memory_maps[map_idx]
-            .memory
-            .iter()
-            .filter_map(|(&addr, &value)| {
-                if addr >= src && addr < src_end {
-                    Some((dst + (addr - src), value))
-                } else {
-                    None
-                }
-            })
-            .collect();
-        let clear: Vec<i64> = self.memory_maps[map_idx]
-            .memory
-            .keys()
-            .filter(|&&addr| addr >= dst && addr < dst_end)
-            .copied()
-            .collect();
-
-        let map = &mut self.memory_maps[map_idx];
-        for addr in clear {
-            map.memory.remove(&addr);
-        }
-        for (addr, value) in copied {
-            map.set(addr, value);
-        }
-    }
-
-    /// Execute the program starting from the entry block.
-    pub fn execute(&mut self, program: &CompiledProgram) -> ExecutionStatus {
-        self.execute_with_limit(program, 0)
     }
 
     /// Execute with an optional instruction/block-entry budget.
@@ -334,16 +480,29 @@ impl VM {
         max_steps: usize,
     ) -> ExecutionStatus {
         let mut block_id = program.entry_block;
+        let mut previous_block_id = None;
         let mut steps = 0usize;
+        // Concrete inputs/static state are fully installed before execution
+        // enters here.  Seed them before preconditions and, critically, before
+        // the first statement PRE marker.
+        self.seed_initial_trace(program.entry_block);
         if let Some(status) = self.check_entry_preconditions(program) {
             return status;
         }
 
         loop {
             let block = &program.blocks[block_id as usize];
-            self.explored_blocks.insert(block_id);
-            self.block_trace.push(block_id);
-            self.curr_block.clone_from(&block.name);
+            if self.record_coverage {
+                if let Some(source_id) = previous_block_id {
+                    self.explored_edges.insert((source_id, block_id));
+                }
+                previous_block_id = Some(block_id);
+                self.mark_explored(block_id);
+            }
+            self.block_entries += 1;
+            if self.record_block_trace {
+                self.block_trace.push(block_id);
+            }
             self.curr_block_id = block_id;
             self.pc = block.start_pc;
             // Let the trace accumulator update its loop stack for this
@@ -351,22 +510,46 @@ impl VM {
             if !self.no_trace {
                 self.trace.on_block_enter(block_id);
             }
-            if let Some(status) = self.consume_step(&mut steps, max_steps) {
+            if let Some(status) = self.consume_step(&mut steps, max_steps, program) {
                 return status;
             }
 
-            // Execute body statements
+            // Execute verifier-addressable (top-level) body statements. Nested
+            // structured If/While bodies are part of their enclosing statement
+            // and do not own PCs in static metadata, so there is exactly one P
+            // per top-level dispatch. Re-establishing pc from the top-level
+            // index also prevents nested execution from shifting a later real
+            // statement onto a fake verifier PC.
+            let mut stmt_pc = block.start_pc;
             for stmt in &block.body {
-                if let Some(status) = self.consume_step(&mut steps, max_steps) {
+                if stmt.is_internal_maintenance() {
+                    if let Err(status) = self.execute_stmt(stmt, program) {
+                        return status;
+                    }
+                    continue;
+                }
+                self.pc = stmt_pc;
+                if let Some(status) = self.consume_step(&mut steps, max_steps, program) {
                     return status;
+                }
+                if !self.no_trace {
+                    self.trace.record_pre_pc(self.pc, self.curr_block_id);
                 }
                 if let Err(status) = self.execute_stmt(stmt, program) {
                     return status;
                 }
-                self.pc += 1;
+                stmt_pc += 1;
+            }
+            self.pc = stmt_pc;
+
+            // The terminator is also a verifier-addressable statement. Its P
+            // must precede branch-resolution reads, and a def-free Return still
+            // needs exact visit authority.
+            if !self.no_trace {
+                self.trace.record_pre_pc(self.pc, self.curr_block_id);
             }
 
-            // Handle terminator
+            // Handle terminator.
             match &block.terminator {
                 Stmt::Return => return ExecutionStatus::Completed,
                 Stmt::Goto { targets } => {
@@ -385,14 +568,19 @@ impl VM {
     }
 
     #[inline(always)]
-    fn consume_step(&self, steps: &mut usize, max_steps: usize) -> Option<ExecutionStatus> {
+    fn consume_step(
+        &self,
+        steps: &mut usize,
+        max_steps: usize,
+        program: &CompiledProgram,
+    ) -> Option<ExecutionStatus> {
         if max_steps == 0 {
             return None;
         }
         if *steps >= max_steps {
             return Some(ExecutionStatus::StepLimit {
                 pc: self.pc,
-                block: self.curr_block.clone(),
+                block: self.block_name(program),
             });
         }
         *steps += 1;
@@ -404,15 +592,16 @@ impl VM {
             return None;
         }
         let entry = &program.blocks[program.entry_block as usize];
-        self.curr_block.clone_from(&entry.name);
         self.curr_block_id = program.entry_block;
         self.pc = entry.start_pc;
         for expr in &program.entry_preconditions {
             if !self.eval_bool(expr, program) {
+                let detail = self.describe_assume_expr(expr, program);
                 return Some(ExecutionStatus::AssumeViolation {
                     pc: self.pc,
-                    block: self.curr_block.clone(),
+                    block: self.block_name(program),
                     reason: "requires",
+                    detail,
                 });
             }
         }
@@ -442,10 +631,31 @@ impl VM {
                 }
             }
         }
-        taken.ok_or_else(|| ExecutionStatus::AssumeViolation {
-            pc: self.pc,
-            block: self.curr_block.clone(),
-            reason: "infeasible_goto",
+        taken.ok_or_else(|| {
+            // No branch guard held for the current state: render each candidate
+            // target's guard (and the live values) so the caller sees which
+            // partition the input fell outside of.
+            let mut detail = String::from("no goto target feasible; guards: ");
+            for (i, &target_id) in targets.iter().enumerate() {
+                if i > 0 {
+                    detail.push_str(" | ");
+                }
+                let block = &program.blocks[target_id as usize];
+                match &block.assume_cond {
+                    Some(cond) => detail.push_str(&self.describe_assume_expr(cond, program)),
+                    None => detail.push_str(&format!("{}=<unconditional>", block.name)),
+                }
+                if detail.len() > 400 {
+                    detail.push('…');
+                    break;
+                }
+            }
+            ExecutionStatus::AssumeViolation {
+                pc: self.pc,
+                block: self.block_name(program),
+                reason: "infeasible_goto",
+                detail,
+            }
         })
     }
 
@@ -461,42 +671,72 @@ impl VM {
                 self.set_eval_result(*lhs, val);
             }
             Stmt::AssignN { lhs, rhs } => {
-                let vals: Vec<EvalResult> = rhs.iter().map(|r| self.eval(r, program)).collect();
-                for (var_id, val) in lhs.iter().zip(vals) {
+                let mut vals = std::mem::take(&mut self.scratch_evals);
+                vals.clear();
+                vals.extend(rhs.iter().map(|r| self.eval(r, program)));
+                for (var_id, val) in lhs.iter().zip(vals.drain(..)) {
                     self.set_eval_result(*var_id, val);
                 }
+                self.scratch_evals = vals;
             }
             Stmt::Assert { expr } => {
                 if !self.eval_bool(expr, program) {
                     return Err(ExecutionStatus::AssertViolation {
                         pc: self.pc,
-                        block: self.curr_block.clone(),
+                        block: self.block_name(program),
                     });
                 }
             }
             Stmt::Assume { expr } => {
-                // `$isExternal` is a verifier-only hint that always reads 0 on
-                // heap pointers during concrete execution; skip asserting it.
-                if !expr_contains_is_external(expr) {
-                    // Concrete execution: assume is treated as assert — if the
-                    // expression is false, the inputs violate a precondition
-                    // the verifier is allowed to rely on, so fail loudly.
-                    if !self.eval_bool(expr, program) {
-                        return Err(ExecutionStatus::AssumeViolation {
-                            pc: self.pc,
-                            block: self.curr_block.clone(),
-                            reason: "assume",
-                        });
-                    }
+                // Concrete execution: assume is treated as assert — if the
+                // expression is false, the inputs violate a precondition
+                // the verifier is allowed to rely on, so fail loudly.
+                // (`$isExternal` assumes are rewritten to AssumeTrue at
+                // lowering — see lowering::normalize_is_external_assumes.)
+                if !self.eval_bool(expr, program) {
+                    let detail = self.describe_assume_expr(expr, program);
+                    return Err(ExecutionStatus::AssumeViolation {
+                        pc: self.pc,
+                        block: self.block_name(program),
+                        reason: "assume",
+                        detail,
+                    });
                 }
             }
             Stmt::AssumeTrue => {}
+            Stmt::ReleaseMaps { vars } => {
+                for var_id in vars {
+                    let map_idx = self.var_to_map.get(var_id).copied().unwrap_or_else(|| {
+                        panic!(
+                            "ReleaseMaps references non-map variable: {}",
+                            &self.var_names[*var_id as usize]
+                        )
+                    });
+                    self.memory_maps[map_idx].clear();
+                }
+            }
             Stmt::LoopHeaderSnap { live_vars } => {
                 if !self.no_trace {
                     for &vid in live_vars {
-                        if let Value::Scalar(val) = self.vars[vid as usize] {
-                            self.trace
-                                .record(vid, val, self.pc, self.curr_block_id, OP_WRITE);
+                        match &self.vars[vid as usize] {
+                            Value::Scalar(val) => {
+                                let val = *val;
+                                self.trace
+                                    .record(vid, val, self.pc, self.curr_block_id, OP_WRITE);
+                            }
+                            // The snapshot is a logical write in the trace. An
+                            // out-of-i64 value must invalidate older exact
+                            // values instead of silently leaving one live.
+                            Value::Big(_) => {
+                                self.big_trace_skips += 1;
+                                self.trace.record_unknown_write(
+                                    vid,
+                                    self.pc,
+                                    self.curr_block_id,
+                                    UNKNOWN_REASON_BIG_INT,
+                                );
+                            }
+                            Value::Map(_) => {}
                         }
                     }
                 }
@@ -518,7 +758,7 @@ impl VM {
                 assert!(
                     *alloc_size_var != u32::MAX,
                     "HavocCurrAddr alloc_size_var not resolved for {}",
-                    self.var_names[*var_id as usize]
+                    &self.var_names[*var_id as usize]
                 );
                 let alloc_size = self.get_scalar_silent(*alloc_size_var);
                 let is_shadow = Some(*var_id) == self.curr_addr_shadow_id;
@@ -608,18 +848,55 @@ impl VM {
                 }
             }
             Stmt::CallMemmove { args } => {
-                let vals: Vec<i64> = args.iter().map(|a| self.eval_i64(a, program)).collect();
-                if vals.len() >= 6 {
-                    let len = vals[4];
-                    let len_shadow = vals[5];
-                    if len != len_shadow || len < 0 {
+                let vals: Vec<i64> = args.iter().map(|a| self.eval_mem_i64(a, program)).collect();
+                match vals.as_slice() {
+                    // Unshadowed LLVM ABI: (dst, src, len, is_volatile).
+                    // Every byte map represents the same address space here,
+                    // so use the concrete bases for both map families.
+                    [dst, src, len, _is_volatile] => {
+                        if *len < 0 {
+                            return Err(ExecutionStatus::AssumeViolation {
+                                pc: self.pc,
+                                block: self.block_name(program),
+                                reason: "invalid_memmove",
+                                detail: format!(
+                                    "memmove length check failed: len={} (requires len >= 0)",
+                                    len
+                                ),
+                            });
+                        }
+                        self.memmove_i8_maps(*dst, *dst, *src, *src, *len);
+                    }
+                    // Shadow ABI: (dst, dst.shadow, src, src.shadow,
+                    // len, len.shadow, ...). Volatility operands, when
+                    // present, have no effect on concrete memory contents.
+                    [dst, dst_shadow, src, src_shadow, len, len_shadow, ..] => {
+                        if len != len_shadow || *len < 0 {
+                            return Err(ExecutionStatus::AssumeViolation {
+                                pc: self.pc,
+                                block: self.block_name(program),
+                                reason: "invalid_memmove",
+                                detail: format!(
+                                    "memmove length check failed: len={} len_shadow={} \
+                                     (requires len == len_shadow && len >= 0)",
+                                    len, len_shadow
+                                ),
+                            });
+                        }
+                        self.memmove_i8_maps(*dst, *dst_shadow, *src, *src_shadow, *len);
+                    }
+                    _ => {
                         return Err(ExecutionStatus::AssumeViolation {
                             pc: self.pc,
-                            block: self.curr_block.clone(),
+                            block: self.block_name(program),
                             reason: "invalid_memmove",
+                            detail: format!(
+                                "memmove arity check failed: got {} arguments \
+                                 (requires 4 unshadowed or at least 6 shadow arguments)",
+                                vals.len()
+                            ),
                         });
                     }
-                    self.memmove_i8_maps(vals[0], vals[1], vals[2], vals[3], len);
                 }
             }
             // Quantified assumes for memset/memcpy
@@ -629,27 +906,19 @@ impl VM {
                 len,
                 val,
             } => {
-                let dst_val = self.get_scalar(*dst);
-                let len_val = self.get_scalar(*len);
-                let val_val = self.get_scalar(*val);
+                let dst_val = self.get_scalar_mem(*dst);
+                let len_val = self.get_scalar_mem(*len);
+                let val_val = self.get_scalar_mem(*val);
                 let map_idx = self.get_map_idx(*m_ret);
-                for addr in dst_val..dst_val + len_val {
-                    self.memory_maps[map_idx].set(addr, val_val);
-                }
+                self.memory_maps[map_idx].fill_range(dst_val, len_val, val_val);
             }
             Stmt::QuantMemsetPreserveLt { m_ret, m_src, dst } => {
-                let dst_val = self.get_scalar(*dst);
+                let dst_val = self.get_scalar_mem(*dst);
                 let src_idx = self.get_map_idx(*m_src);
                 let dst_idx = self.get_map_idx(*m_ret);
-                // Collect addresses first to avoid borrow issues
-                let addrs: Vec<(i64, i64)> = self.memory_maps[src_idx]
-                    .memory
-                    .iter()
-                    .filter(|(&addr, _)| addr < dst_val)
-                    .map(|(&addr, &val)| (addr, val))
-                    .collect();
-                for (addr, val) in addrs {
-                    self.memory_maps[dst_idx].set(addr, val);
+                if src_idx != dst_idx {
+                    let (dst_map, src_map) = two_maps(&mut self.memory_maps, dst_idx, src_idx);
+                    dst_map.merge_below(src_map, dst_val);
                 }
             }
             Stmt::QuantMemsetPreserveGe {
@@ -658,19 +927,14 @@ impl VM {
                 dst,
                 len,
             } => {
-                let dst_val = self.get_scalar(*dst);
-                let len_val = self.get_scalar(*len);
+                let dst_val = self.get_scalar_mem(*dst);
+                let len_val = self.get_scalar_mem(*len);
                 let boundary = dst_val + len_val;
                 let src_idx = self.get_map_idx(*m_src);
                 let dst_idx = self.get_map_idx(*m_ret);
-                let addrs: Vec<(i64, i64)> = self.memory_maps[src_idx]
-                    .memory
-                    .iter()
-                    .filter(|(&addr, _)| addr >= boundary)
-                    .map(|(&addr, &val)| (addr, val))
-                    .collect();
-                for (addr, val) in addrs {
-                    self.memory_maps[dst_idx].set(addr, val);
+                if src_idx != dst_idx {
+                    let (dst_map, src_map) = two_maps(&mut self.memory_maps, dst_idx, src_idx);
+                    dst_map.merge_from(src_map, boundary);
                 }
             }
             Stmt::QuantMemcpyWrite {
@@ -680,31 +944,25 @@ impl VM {
                 src,
                 len,
             } => {
-                let dst_val = self.get_scalar(*dst);
-                let src_val = self.get_scalar(*src);
-                let len_val = self.get_scalar(*len);
+                let dst_val = self.get_scalar_mem(*dst);
+                let src_val = self.get_scalar_mem(*src);
+                let len_val = self.get_scalar_mem(*len);
                 let src_idx = self.get_map_idx(*m_src);
                 let dst_idx = self.get_map_idx(*m_ret);
-                // Read all source values first
-                let vals: Vec<i64> = (0..len_val)
-                    .map(|offset| self.memory_maps[src_idx].get(src_val + offset))
-                    .collect();
-                for (offset, val) in vals.into_iter().enumerate() {
-                    self.memory_maps[dst_idx].set(dst_val + offset as i64, val);
+                if src_idx == dst_idx {
+                    self.memory_maps[dst_idx].move_range_all_init(src_val, dst_val, len_val);
+                } else {
+                    let (dst_map, src_map) = two_maps(&mut self.memory_maps, dst_idx, src_idx);
+                    dst_map.copy_range_values(src_map, src_val, dst_val, len_val);
                 }
             }
             Stmt::QuantMemcpyPreserveLt { m_ret, m_src, dst } => {
-                let dst_val = self.get_scalar(*dst);
+                let dst_val = self.get_scalar_mem(*dst);
                 let src_idx = self.get_map_idx(*m_src);
                 let dst_idx = self.get_map_idx(*m_ret);
-                let addrs: Vec<(i64, i64)> = self.memory_maps[src_idx]
-                    .memory
-                    .iter()
-                    .filter(|(&addr, _)| addr < dst_val)
-                    .map(|(&addr, &val)| (addr, val))
-                    .collect();
-                for (addr, val) in addrs {
-                    self.memory_maps[dst_idx].set(addr, val);
+                if src_idx != dst_idx {
+                    let (dst_map, src_map) = two_maps(&mut self.memory_maps, dst_idx, src_idx);
+                    dst_map.merge_below(src_map, dst_val);
                 }
             }
             Stmt::QuantMemcpyPreserveGe {
@@ -713,22 +971,21 @@ impl VM {
                 dst,
                 len,
             } => {
-                let dst_val = self.get_scalar(*dst);
-                let len_val = self.get_scalar(*len);
+                let dst_val = self.get_scalar_mem(*dst);
+                let len_val = self.get_scalar_mem(*len);
                 let boundary = dst_val + len_val;
                 let src_idx = self.get_map_idx(*m_src);
                 let dst_idx = self.get_map_idx(*m_ret);
-                let addrs: Vec<(i64, i64)> = self.memory_maps[src_idx]
-                    .memory
-                    .iter()
-                    .filter(|(&addr, _)| addr >= boundary)
-                    .map(|(&addr, &val)| (addr, val))
-                    .collect();
-                for (addr, val) in addrs {
-                    self.memory_maps[dst_idx].set(addr, val);
+                if src_idx != dst_idx {
+                    let (dst_map, src_map) = two_maps(&mut self.memory_maps, dst_idx, src_idx);
+                    dst_map.merge_from(src_map, boundary);
                 }
             }
-            Stmt::If { cond, then_body, else_body } => {
+            Stmt::If {
+                cond,
+                then_body,
+                else_body,
+            } => {
                 // Evaluate condition; pick branch; recursively execute its body.
                 // Both bodies are guaranteed (by lowering) to contain no
                 // terminator stmts, so recursion stays inside this block.
@@ -736,7 +993,6 @@ impl VM {
                 let body: &Vec<Stmt> = if take_then { then_body } else { else_body };
                 for inner in body {
                     self.execute_stmt(inner, program)?;
-                    self.pc += 1;
                 }
             }
             Stmt::While { cond, body } => {
@@ -746,7 +1002,6 @@ impl VM {
                 while self.eval_bool(cond, program) {
                     for inner in body {
                         self.execute_stmt(inner, program)?;
-                        self.pc += 1;
                     }
                 }
             }
@@ -762,15 +1017,16 @@ impl VM {
     fn set_eval_result(&mut self, var_id: VarId, result: EvalResult) {
         match result {
             EvalResult::Scalar(v) => self.set_scalar(var_id, v, false),
+            EvalResult::Big(b) => self.set_big(var_id, b),
             EvalResult::Bool(b) => self.set_scalar(var_id, b as i64, false),
             EvalResult::MapRef(map_idx) => {
                 // Assignment of a map — the store.iN returns the modified map
                 let vid = var_id as usize;
-                let existing_map = self.var_to_map[vid];
+                let existing_map = self.var_to_map.get(&var_id).copied();
                 if let Some(existing_idx) = existing_map {
                     if existing_idx != map_idx {
                         // Copy map contents
-                        let new_name = self.var_names[vid].clone();
+                        let new_name = self.var_names[vid].to_string();
                         let src = &self.memory_maps[map_idx];
                         let copied = src.copy_with_name(new_name);
                         self.memory_maps[existing_idx] = copied;
@@ -778,15 +1034,141 @@ impl VM {
                     // If same index, the map was modified in-place
                 } else {
                     // New map variable — copy
-                    let new_name = self.var_names[vid].clone();
+                    let new_name = self.var_names[vid].to_string();
                     let src = &self.memory_maps[map_idx];
                     let copied = src.copy_with_name(new_name);
                     let new_idx = self.memory_maps.len();
                     self.memory_maps.push(copied);
-                    self.var_to_map[vid] = Some(new_idx);
+                    self.var_to_map.insert(var_id, new_idx);
                     self.vars[vid] = Value::Map(new_idx);
                 }
             }
+        }
+    }
+
+    /// Describe a failing assume for a human/agent: render the condition and
+    /// append the concrete values of the scalar variables it references, so the
+    /// caller knows EXACTLY which precondition the input violated and with what
+    /// values. Read-only; safe to call on the error path after `eval_bool`.
+    fn describe_assume_expr(&self, expr: &Expr, program: &CompiledProgram) -> String {
+        let mut cond = String::new();
+        let mut vars: Vec<VarId> = Vec::new();
+        self.render_expr(expr, program, &mut cond, &mut vars);
+        let mut vals = String::new();
+        for vid in vars.iter().take(12) {
+            if !vals.is_empty() {
+                vals.push_str(", ");
+            }
+            let name = program
+                .var_names
+                .get(*vid as usize)
+                .map(|s| s)
+                .unwrap_or("?");
+            match self.vars.get(*vid as usize) {
+                Some(Value::Scalar(v)) => vals.push_str(&format!("{}={}", name, v)),
+                Some(Value::Big(b)) => vals.push_str(&format!("{}={}", name, b)),
+                Some(Value::Map(_)) => vals.push_str(&format!("{}=<map>", name)),
+                None => vals.push_str(&format!("{}=?", name)),
+            }
+        }
+        if vals.is_empty() {
+            cond
+        } else {
+            format!("{}  [where {}]", cond, vals)
+        }
+    }
+
+    /// Compact recursive render of an `Expr` into Boogie-ish surface syntax,
+    /// collecting referenced variable ids (deduped) into `vars`. Bounded length
+    /// so a pathological expression cannot produce an unbounded message.
+    fn render_expr(
+        &self,
+        expr: &Expr,
+        program: &CompiledProgram,
+        out: &mut String,
+        vars: &mut Vec<VarId>,
+    ) {
+        if out.len() > 300 {
+            if !out.ends_with('…') {
+                out.push('…');
+            }
+            return;
+        }
+        match expr {
+            Expr::Var(id) => {
+                let name = program
+                    .var_names
+                    .get(*id as usize)
+                    .map(|s| s)
+                    .unwrap_or("?");
+                out.push_str(name);
+                if !vars.contains(id) {
+                    vars.push(*id);
+                }
+            }
+            Expr::Const(v) => out.push_str(&v.to_string()),
+            Expr::ConstBig(b) => out.push_str(&b.to_string()),
+            Expr::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+            Expr::BinOp { op, lhs, rhs } => {
+                out.push('(');
+                self.render_expr(lhs, program, out, vars);
+                out.push(' ');
+                out.push_str(binop_symbol(op));
+                out.push(' ');
+                self.render_expr(rhs, program, out, vars);
+                out.push(')');
+            }
+            Expr::Not(inner) => {
+                out.push_str("!(");
+                self.render_expr(inner, program, out, vars);
+                out.push(')');
+            }
+            Expr::Builtin { fn_id, args } => {
+                out.push_str(&format!("{:?}", fn_id));
+                out.push('(');
+                for (i, a) in args.iter().enumerate() {
+                    if i > 0 {
+                        out.push_str(", ");
+                    }
+                    self.render_expr(a, program, out, vars);
+                }
+                out.push(')');
+            }
+            Expr::Load {
+                bit_width,
+                map,
+                index,
+            } => {
+                out.push_str(&format!("load.i{}(", bit_width));
+                self.render_expr(map, program, out, vars);
+                out.push_str(", ");
+                self.render_expr(index, program, out, vars);
+                out.push(')');
+            }
+            Expr::Store {
+                bit_width,
+                map,
+                index,
+                value,
+            } => {
+                out.push_str(&format!("store.i{}(", bit_width));
+                self.render_expr(map, program, out, vars);
+                out.push_str(", ");
+                self.render_expr(index, program, out, vars);
+                out.push_str(", ");
+                self.render_expr(value, program, out, vars);
+                out.push(')');
+            }
+            Expr::IfThenElse { cond, then_, else_ } => {
+                out.push('(');
+                self.render_expr(cond, program, out, vars);
+                out.push_str(" ? ");
+                self.render_expr(then_, program, out, vars);
+                out.push_str(" : ");
+                self.render_expr(else_, program, out, vars);
+                out.push(')');
+            }
+            Expr::IsExternal => out.push_str("$isExternal"),
         }
     }
 
@@ -795,6 +1177,8 @@ impl VM {
     fn eval_bool(&mut self, expr: &Expr, program: &CompiledProgram) -> bool {
         match self.eval(expr, program) {
             EvalResult::Scalar(v) => v != 0,
+            // Big is strictly outside i64, hence never zero.
+            EvalResult::Big(_) => true,
             EvalResult::Bool(b) => b,
             EvalResult::MapRef(_) => panic!("Expected bool, got map"),
         }
@@ -815,42 +1199,190 @@ impl VM {
                         }
                         EvalResult::Scalar(v)
                     }
+                    Value::Big(b) => {
+                        // Out-of-i64 exact value: the read is NOT trace-
+                        // recorded (i64 value field) — counted skip.
+                        let b = b.clone();
+                        if !self.no_trace && self.log_read {
+                            self.big_trace_skips += 1;
+                        }
+                        EvalResult::Big(b)
+                    }
                     Value::Map(idx) => EvalResult::MapRef(*idx),
                 }
             }
             Expr::Const(v) => EvalResult::Scalar(*v),
+            Expr::ConstBig(b) => EvalResult::Big(b.clone()),
             Expr::Bool(b) => EvalResult::Bool(*b),
             Expr::BinOp { op, lhs, rhs } => {
-                let l = self.eval_i64(lhs, program);
-                let r = self.eval_i64(rhs, program);
-                match op {
-                    BinOp::Eq => EvalResult::Bool(l == r),
-                    BinOp::Ne => EvalResult::Bool(l != r),
-                    BinOp::Lt => EvalResult::Bool(l < r),
-                    BinOp::Gt => EvalResult::Bool(l > r),
-                    BinOp::Le => EvalResult::Bool(l <= r),
-                    BinOp::Ge => EvalResult::Bool(l >= r),
-                    BinOp::And => EvalResult::Bool(l != 0 && r != 0),
-                    BinOp::Or => EvalResult::Bool(l != 0 || r != 0),
-                    BinOp::Implies => EvalResult::Bool(l == 0 || r != 0),
-                    BinOp::Iff => EvalResult::Bool((l != 0) == (r != 0)),
-                    BinOp::Sub => EvalResult::Scalar((l.wrapping_sub(r)) & MASK_64),
-                    BinOp::Mul => EvalResult::Scalar((l.wrapping_mul(r)) & MASK_64),
-                    BinOp::Add => EvalResult::Scalar((l.wrapping_add(r)) & MASK_64),
+                if program.mode == SemanticsMode::Bv {
+                    // BV mode: the historical wrapping i64 algebra, unchanged.
+                    let l = self.eval_i64(lhs, program);
+                    let r = self.eval_i64(rhs, program);
+                    match op {
+                        BinOp::Eq => EvalResult::Bool(l == r),
+                        BinOp::Ne => EvalResult::Bool(l != r),
+                        BinOp::Lt => EvalResult::Bool(l < r),
+                        BinOp::Gt => EvalResult::Bool(l > r),
+                        BinOp::Le => EvalResult::Bool(l <= r),
+                        BinOp::Ge => EvalResult::Bool(l >= r),
+                        BinOp::And => EvalResult::Bool(l != 0 && r != 0),
+                        BinOp::Or => EvalResult::Bool(l != 0 || r != 0),
+                        BinOp::Implies => EvalResult::Bool(l == 0 || r != 0),
+                        BinOp::Iff => EvalResult::Bool((l != 0) == (r != 0)),
+                        BinOp::Sub => EvalResult::Scalar((l.wrapping_sub(r)) & MASK_64),
+                        BinOp::Mul => EvalResult::Scalar((l.wrapping_mul(r)) & MASK_64),
+                        BinOp::Add => EvalResult::Scalar((l.wrapping_add(r)) & MASK_64),
+                        // Generic Boogie `/` over BV-mode scalar operands is
+                        // translated to bvudiv by the verifier model. Match
+                        // SMT-LIB's total zero-divisor values exactly.
+                        BinOp::Div => EvalResult::Scalar(if r == 0 {
+                            -1
+                        } else {
+                            ((l as u64) / (r as u64)) as i64
+                        }),
+                        BinOp::Mod => EvalResult::Scalar(if r == 0 {
+                            l
+                        } else {
+                            ((l as u64) % (r as u64)) as i64
+                        }),
+                    }
+                } else {
+                    // Int mode: exact-ℤ core. Arithmetic uses checked ops with
+                    // BigInt promotion; comparisons compare exact values.
+                    let le = self.eval(lhs, program);
+                    let re = self.eval(rhs, program);
+                    // Hot path: both operands are in-i64 (the overwhelmingly
+                    // common case) — direct i64 comparisons, checked arith.
+                    if let (Some(l), Some(r)) = (as_small(&le), as_small(&re)) {
+                        return match op {
+                            BinOp::Eq => EvalResult::Bool(l == r),
+                            BinOp::Ne => EvalResult::Bool(l != r),
+                            BinOp::Lt => EvalResult::Bool(l < r),
+                            BinOp::Gt => EvalResult::Bool(l > r),
+                            BinOp::Le => EvalResult::Bool(l <= r),
+                            BinOp::Ge => EvalResult::Bool(l >= r),
+                            BinOp::And => EvalResult::Bool(l != 0 && r != 0),
+                            BinOp::Or => EvalResult::Bool(l != 0 || r != 0),
+                            BinOp::Implies => EvalResult::Bool(l == 0 || r != 0),
+                            BinOp::Iff => EvalResult::Bool((l != 0) == (r != 0)),
+                            BinOp::Sub => match l.checked_sub(r) {
+                                Some(v) => EvalResult::Scalar(v),
+                                None => z_to_eval(crate::builtins::int::sub(&Z::S(l), &Z::S(r))),
+                            },
+                            BinOp::Mul => match l.checked_mul(r) {
+                                Some(v) => EvalResult::Scalar(v),
+                                None => z_to_eval(crate::builtins::int::mul(&Z::S(l), &Z::S(r))),
+                            },
+                            BinOp::Add => match l.checked_add(r) {
+                                Some(v) => EvalResult::Scalar(v),
+                                None => z_to_eval(crate::builtins::int::add(&Z::S(l), &Z::S(r))),
+                            },
+                            BinOp::Div => {
+                                z_to_eval(crate::builtins::int::euclid_div(&Z::S(l), &Z::S(r)))
+                            }
+                            BinOp::Mod => {
+                                z_to_eval(crate::builtins::int::euclid_mod(&Z::S(l), &Z::S(r)))
+                            }
+                        };
+                    }
+                    let l = eval_result_to_z(le);
+                    let r = eval_result_to_z(re);
+                    use std::cmp::Ordering::*;
+                    let ord = || crate::builtins::int::cmp(&l, &r);
+                    match op {
+                        BinOp::Eq => EvalResult::Bool(ord() == Equal),
+                        BinOp::Ne => EvalResult::Bool(ord() != Equal),
+                        BinOp::Lt => EvalResult::Bool(ord() == Less),
+                        BinOp::Gt => EvalResult::Bool(ord() == Greater),
+                        BinOp::Le => EvalResult::Bool(ord() != Greater),
+                        BinOp::Ge => EvalResult::Bool(ord() != Less),
+                        BinOp::And => EvalResult::Bool(!l.is_zero() && !r.is_zero()),
+                        BinOp::Or => EvalResult::Bool(!l.is_zero() || !r.is_zero()),
+                        BinOp::Implies => EvalResult::Bool(l.is_zero() || !r.is_zero()),
+                        BinOp::Iff => EvalResult::Bool(l.is_zero() == r.is_zero()),
+                        BinOp::Sub => z_to_eval(crate::builtins::int::sub(&l, &r)),
+                        BinOp::Mul => z_to_eval(crate::builtins::int::mul(&l, &r)),
+                        BinOp::Add => z_to_eval(crate::builtins::int::add(&l, &r)),
+                        BinOp::Div => z_to_eval(crate::builtins::int::euclid_div(&l, &r)),
+                        BinOp::Mod => z_to_eval(crate::builtins::int::euclid_mod(&l, &r)),
+                    }
                 }
             }
             Expr::Builtin { fn_id, args } => {
-                if builtins::num_args(*fn_id) == 1 {
-                    let x = self.eval_i64(&args[0], program);
-                    EvalResult::Scalar(builtins::exec_unary(*fn_id, x))
-                } else {
-                    let a = self.eval_i64(&args[0], program);
-                    let b = self.eval_i64(&args[1], program);
-                    let (result, is_bool) = builtins::exec_binary(*fn_id, a, b);
-                    if is_bool {
-                        EvalResult::Bool(result != 0)
+                if program.mode == SemanticsMode::Bv {
+                    if builtins::num_args(*fn_id) == 1 {
+                        let x = self.eval_i64(&args[0], program);
+                        EvalResult::Scalar(builtins::bv::exec_unary(*fn_id, x))
                     } else {
-                        EvalResult::Scalar(result & MASK_64)
+                        let a = self.eval_i64(&args[0], program);
+                        let b = self.eval_i64(&args[1], program);
+                        let (result, is_bool) = builtins::bv::exec_binary(*fn_id, a, b);
+                        if is_bool {
+                            EvalResult::Bool(result != 0)
+                        } else {
+                            EvalResult::Scalar(result & MASK_64)
+                        }
+                    }
+                } else if builtins::num_args(*fn_id) == 1 {
+                    // Identity casts dominate: pass in-i64 values straight through.
+                    let xe = self.eval(&args[0], program);
+                    if !matches!(*fn_id, BuiltinFn::Not { .. }) {
+                        if let EvalResult::Scalar(_) | EvalResult::Big(_) = xe {
+                            return xe;
+                        }
+                    }
+                    let x = eval_result_to_z(xe);
+                    z_to_eval(builtins::int::exec_unary(*fn_id, &x))
+                } else {
+                    let ae = self.eval(&args[0], program);
+                    let be = self.eval(&args[1], program);
+                    // Hot path: both operands in-i64 — direct machine ops for
+                    // the arithmetic/comparison family (semantically identical
+                    // to the exec_binary Z path; see builtins::int).
+                    if let (Some(a), Some(b)) = (as_small(&ae), as_small(&be)) {
+                        match *fn_id {
+                            BuiltinFn::Add { .. } => {
+                                if let Some(v) = a.checked_add(b) {
+                                    return EvalResult::Scalar(v);
+                                }
+                            }
+                            BuiltinFn::Sub { .. } => {
+                                if let Some(v) = a.checked_sub(b) {
+                                    return EvalResult::Scalar(v);
+                                }
+                            }
+                            BuiltinFn::Mul { .. } => {
+                                if let Some(v) = a.checked_mul(b) {
+                                    return EvalResult::Scalar(v);
+                                }
+                            }
+                            BuiltinFn::Slt { .. } | BuiltinFn::Ult { .. } => {
+                                return EvalResult::Scalar((a < b) as i64)
+                            }
+                            BuiltinFn::Sle { .. } | BuiltinFn::Ule { .. } => {
+                                return EvalResult::Scalar((a <= b) as i64)
+                            }
+                            BuiltinFn::Sgt { .. } | BuiltinFn::Ugt { .. } => {
+                                return EvalResult::Scalar((a > b) as i64)
+                            }
+                            BuiltinFn::Sge { .. } | BuiltinFn::Uge { .. } => {
+                                return EvalResult::Scalar((a >= b) as i64)
+                            }
+                            BuiltinFn::BvEq { .. } => return EvalResult::Scalar((a == b) as i64),
+                            BuiltinFn::BvNe { .. } => return EvalResult::Scalar((a != b) as i64),
+                            BuiltinFn::SltBool { .. } => return EvalResult::Bool(a < b),
+                            BuiltinFn::SleBool { .. } => return EvalResult::Bool(a <= b),
+                            BuiltinFn::SgtBool { .. } => return EvalResult::Bool(a > b),
+                            BuiltinFn::SgeBool { .. } => return EvalResult::Bool(a >= b),
+                            _ => {}
+                        }
+                    }
+                    let a = eval_result_to_z(ae);
+                    let b = eval_result_to_z(be);
+                    match builtins::int::exec_binary(*fn_id, &a, &b) {
+                        ZResult::Num(z) => z_to_eval(z),
+                        ZResult::Bool(b) => EvalResult::Bool(b),
                     }
                 }
             }
@@ -864,23 +1396,23 @@ impl VM {
                     EvalResult::MapRef(idx) => idx,
                     _ => panic!("store: expected map"),
                 };
-                let idx_val = self.eval_i64(index, program);
-                let val = self.eval_i64(value, program);
-                let bw = *bit_width as u8;
+                let idx_val = self.eval_mem_i64(index, program);
+                let val = self.eval_mem_i64(value, program);
                 let ew = self.memory_maps[map_idx].element_bit_width;
+                let bw = if *bit_width == 0 { ew } else { *bit_width };
                 if bw <= ew {
                     // Single cell. bw == ew is the common byte store; bw < ew is a
                     // sub-element store (e.g. $store.i1 of a bool into a byte-addressed
                     // map) — keep it one cell, masking the value to bw bits.
-                    let v = if bw < ew { val & ((1i64 << bw) - 1) } else { val };
+                    let v = if bw < ew {
+                        val & ((1i64 << bw) - 1)
+                    } else {
+                        val
+                    };
                     self.memory_maps[map_idx].set(idx_val, v);
                 } else {
-                    let ew_mask = self.memory_maps[map_idx].element_mask();
-                    let count = bw / ew;
-                    for i in 0..count as i64 {
-                        self.memory_maps[map_idx]
-                            .set(idx_val + i, (val >> (i * ew as i64)) & ew_mask);
-                    }
+                    let count = (bw / ew) as u32;
+                    self.memory_maps[map_idx].store_wide(idx_val, count, ew as u32, val);
                 }
                 EvalResult::MapRef(map_idx)
             }
@@ -893,21 +1425,23 @@ impl VM {
                     EvalResult::MapRef(idx) => idx,
                     _ => panic!("load: expected map"),
                 };
-                let idx_val = self.eval_i64(index, program);
-                let bw = *bit_width as u8;
+                let idx_val = self.eval_mem_i64(index, program);
                 let ew = self.memory_maps[map_idx].element_bit_width;
+                let bw = if *bit_width == 0 { ew } else { *bit_width };
                 if bw <= ew {
                     // Single cell; mask to bw bits for a sub-element load ($load.i1).
                     let raw = self.memory_maps[map_idx].get(idx_val);
-                    let v = if bw < ew { raw & ((1i64 << bw) - 1) } else { raw };
+                    let v = if bw < ew {
+                        raw & ((1i64 << bw) - 1)
+                    } else {
+                        raw
+                    };
                     EvalResult::Scalar(v)
                 } else {
-                    let mut result: i64 = 0;
-                    let count = bw / ew;
-                    for i in 0..count as i64 {
-                        result |= self.memory_maps[map_idx].get(idx_val + i) << (i * ew as i64);
-                    }
-                    EvalResult::Scalar(result)
+                    let count = (bw / ew) as u32;
+                    EvalResult::Scalar(
+                        self.memory_maps[map_idx].load_wide(idx_val, count, ew as u32),
+                    )
                 }
             }
             Expr::IfThenElse { cond, then_, else_ } => {
@@ -931,6 +1465,28 @@ impl VM {
         match self.eval(expr, program) {
             EvalResult::Scalar(v) => v,
             EvalResult::Bool(b) => b as i64,
+            EvalResult::Big(b) => panic!(
+                "exact-int overflow escape: value {} is outside i64 in an \
+                 i64-only context (memory index/value or call argument)",
+                b
+            ),
+            EvalResult::MapRef(_) => panic!("Expected scalar, got map"),
+        }
+    }
+
+    /// Memory-interface evaluation: like `eval_i64`, but an out-of-i64
+    /// exact value folds mod 2^64 (counted). Used for load/store
+    /// indices/values and external-call arguments — 64-bit address-space
+    /// quantities by construction.
+    #[inline]
+    fn eval_mem_i64(&mut self, expr: &Expr, program: &CompiledProgram) -> i64 {
+        match self.eval(expr, program) {
+            EvalResult::Scalar(v) => v,
+            EvalResult::Bool(b) => b as i64,
+            EvalResult::Big(b) => {
+                self.mem_big_folds += 1;
+                fold_big_to_i64(&b)
+            }
             EvalResult::MapRef(_) => panic!("Expected scalar, got map"),
         }
     }
@@ -964,7 +1520,7 @@ impl VM {
         if args.is_empty() {
             return; // malformed printf without format string — skip silently
         }
-        let vals: Vec<i64> = args.iter().map(|a| self.eval_i64(a, program)).collect();
+        let vals: Vec<i64> = args.iter().map(|a| self.eval_mem_i64(a, program)).collect();
 
         let m0_id = match self.m0_id {
             Some(id) => id,
@@ -1190,39 +1746,264 @@ fn format_printf(fmt: &str, args: &[i64], m0: &crate::memory_map::MemoryMap) -> 
     result
 }
 
+/// Disjoint `(&mut dst, &src)` borrows of two distinct memory maps.
+#[inline]
+fn two_maps(maps: &mut [MemoryMap], dst: usize, src: usize) -> (&mut MemoryMap, &MemoryMap) {
+    debug_assert_ne!(dst, src);
+    if dst < src {
+        let (lo, hi) = maps.split_at_mut(src);
+        (&mut lo[dst], &hi[0])
+    } else {
+        let (lo, hi) = maps.split_at_mut(dst);
+        (&mut hi[0], &lo[src])
+    }
+}
+
 /// Result of evaluating an expression.
 #[derive(Debug, Clone)]
 pub enum EvalResult {
     Scalar(i64),
+    /// Exact-ℤ value strictly outside i64 range (Int mode only).
+    Big(Box<BigInt>),
     Bool(bool),
     MapRef(usize),
 }
 
-/// True if `expr` mentions `$isExternal` anywhere in its tree. Used to skip
-/// concrete assume-as-assert for verifier-only hints.
-fn expr_contains_is_external(expr: &Expr) -> bool {
-    match expr {
-        Expr::IsExternal => true,
-        Expr::Var(_) | Expr::Const(_) | Expr::Bool(_) => false,
-        Expr::BinOp { lhs, rhs, .. } => {
-            expr_contains_is_external(lhs) || expr_contains_is_external(rhs)
+/// Fold an exact integer back into an `EvalResult`, preserving the
+/// "Big only when outside i64" invariant maintained by `builtins::int`.
+#[inline]
+fn z_to_eval(z: Z) -> EvalResult {
+    match z {
+        Z::S(v) => EvalResult::Scalar(v),
+        Z::B(b) => EvalResult::Big(b),
+    }
+}
+
+/// In-i64 numeric view of an eval result (Bool → 0/1); None for Big/Map.
+#[inline]
+fn as_small(e: &EvalResult) -> Option<i64> {
+    match e {
+        EvalResult::Scalar(v) => Some(*v),
+        EvalResult::Bool(b) => Some(*b as i64),
+        _ => None,
+    }
+}
+
+/// Exact-integer view of an eval result (Int mode).
+#[inline]
+fn eval_result_to_z(e: EvalResult) -> Z {
+    match e {
+        EvalResult::Scalar(v) => Z::S(v),
+        EvalResult::Bool(b) => Z::S(b as i64),
+        EvalResult::Big(b) => Z::B(b),
+        EvalResult::MapRef(_) => panic!("Expected scalar, got map"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::raw_log::RawLogWriter;
+    use crate::raw_log::{
+        NO_VAR_ID, OP_INITIAL_SCALAR, OP_PRE_PC, OP_UNKNOWN_WRITE, RECORD_SIZE,
+        UNKNOWN_REASON_BIG_INT, VERSION,
+    };
+    use rustc_hash::FxHashMap;
+    use std::fs::File;
+    use std::io::Read;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct RawRecord {
+        kind: u8,
+        var_id: u32,
+        pc: u32,
+        block_id: u32,
+        value: i64,
+        iter_id: u32,
+    }
+
+    fn test_program() -> CompiledProgram {
+        let mut program = CompiledProgram {
+            blocks: vec![Block {
+                name: "entry".to_string(),
+                id: 0,
+                body: vec![
+                    Stmt::Assign1 {
+                        lhs: 0,
+                        rhs: Expr::Const(7),
+                    },
+                    Stmt::If {
+                        cond: Expr::Bool(true),
+                        then_body: vec![Stmt::Assign1 {
+                            lhs: 1,
+                            rhs: Expr::Var(0),
+                        }],
+                        else_body: vec![],
+                    },
+                    Stmt::Assign1 {
+                        lhs: 0,
+                        rhs: Expr::ConstBig(Box::new(BigInt::from(i64::MAX) + BigInt::from(1u8))),
+                    },
+                    Stmt::Havoc { vars: vec![0] },
+                ],
+                terminator: Stmt::Return,
+                start_pc: 10,
+                assume_cond: None,
+            }],
+            label_to_block: FxHashMap::default(),
+            var_names: Arc::new(NameTable::from(vec!["$x".to_string(), "$y".to_string()])),
+            name_index: NameIndex::default(),
+            entry_block: 0,
+            entry_preconditions: vec![],
+            mem_maps: vec![],
+            num_vars: 2,
+            curr_addr_id: None,
+            curr_addr_shadow_id: None,
+            m0_id: None,
+            m0_shadow_id: None,
+            loop_header_live_vars: FxHashMap::default(),
+            is_loop_header: vec![false],
+            block_innermost_header: vec![None],
+            loop_parent_header: vec![None],
+            static_scalars: vec![],
+            mode: SemanticsMode::Int,
+        };
+        program.rebuild_runtime_name_index();
+        program
+    }
+
+    fn read_raw_records(path: &std::path::Path) -> (u8, Vec<RawRecord>) {
+        let file = File::open(path).unwrap();
+        let mut decoder = zstd::stream::read::Decoder::new(file).unwrap();
+        let mut data = Vec::new();
+        decoder.read_to_end(&mut data).unwrap();
+        assert_eq!(&data[..4], b"SWRL");
+        let version = data[4];
+        let mut offset = 5usize;
+        for _ in 0..2 {
+            let count = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
+            offset += 4;
+            for _ in 0..count {
+                let size =
+                    u16::from_le_bytes(data[offset..offset + 2].try_into().unwrap()) as usize;
+                offset += 2 + size;
+            }
         }
-        Expr::Builtin { args, .. } => args.iter().any(expr_contains_is_external),
-        Expr::Store {
-            map, index, value, ..
-        } => {
-            expr_contains_is_external(map)
-                || expr_contains_is_external(index)
-                || expr_contains_is_external(value)
-        }
-        Expr::Load { map, index, .. } => {
-            expr_contains_is_external(map) || expr_contains_is_external(index)
-        }
-        Expr::IfThenElse { cond, then_, else_ } => {
-            expr_contains_is_external(cond)
-                || expr_contains_is_external(then_)
-                || expr_contains_is_external(else_)
-        }
-        Expr::Not(inner) => expr_contains_is_external(inner),
+        assert_eq!((data.len() - offset) % RECORD_SIZE, 0);
+        let records = data[offset..]
+            .chunks_exact(RECORD_SIZE)
+            .map(|record| RawRecord {
+                kind: record[0],
+                var_id: u32::from_le_bytes(record[1..5].try_into().unwrap()),
+                pc: u32::from_le_bytes(record[5..9].try_into().unwrap()),
+                block_id: u32::from_le_bytes(record[9..13].try_into().unwrap()),
+                value: i64::from_le_bytes(record[13..21].try_into().unwrap()),
+                iter_id: u32::from_le_bytes(record[21..25].try_into().unwrap()),
+            })
+            .collect();
+        (version, records)
+    }
+
+    #[test]
+    fn execution_can_skip_coverage_bookkeeping() {
+        let mut program = test_program();
+        program.blocks[0].terminator = Stmt::Goto { targets: vec![1] };
+        program.blocks.push(Block {
+            name: "exit".to_string(),
+            id: 1,
+            body: vec![],
+            terminator: Stmt::Return,
+            start_pc: 15,
+            assume_cond: None,
+        });
+        program.is_loop_header.push(false);
+        program.block_innermost_header.push(None);
+        program.loop_parent_header.push(None);
+
+        let mut vm = VM::new_no_trace(&program);
+        vm.record_coverage = false;
+        vm.record_block_trace = false;
+        let status = vm.execute_with_limit(&program, 100);
+
+        assert!(matches!(status, ExecutionStatus::Completed));
+        assert_eq!(vm.block_entries, 2);
+        assert_eq!(vm.explored_count, 0);
+        assert!(vm.explored_blocks.iter().all(|explored| !explored));
+        assert!(vm.explored_edges.is_empty());
+    }
+
+    #[test]
+    fn ordered_trace_has_entry_state_real_pre_pcs_and_unknown_invalidation() {
+        let program = test_program();
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "swoosh_vm_trace_v3_{}_{}.raw.zst",
+            std::process::id(),
+            unique,
+        ));
+        let mut writer = RawLogWriter::create(&path).unwrap();
+        writer
+            .write_header(&program.var_names, &["entry".to_string()])
+            .unwrap();
+
+        let mut vm = VM::new(&program);
+        vm.trace.raw_log = Some(writer);
+        let status = vm.execute_with_limit(&program, 100);
+        assert!(matches!(status, ExecutionStatus::Completed));
+        let record_count = vm.trace.raw_log.take().unwrap().finish().unwrap();
+
+        let (version, records) = read_raw_records(&path);
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(version, VERSION);
+        assert_eq!(record_count as usize, records.len());
+
+        // Both scalar entry values precede every statement visit.
+        assert_eq!(records[0].kind, OP_INITIAL_SCALAR);
+        assert_eq!(records[0].var_id, 0);
+        assert_eq!(records[0].value, 0);
+        assert_eq!(records[1].kind, OP_INITIAL_SCALAR);
+        assert_eq!(records[1].var_id, 1);
+        assert_eq!(records[1].value, 0);
+
+        // Structured bodies are not verifier-addressable PCs. The enclosing
+        // If owns exactly one P at 11, its nested R/W stay at 11, and the next
+        // real top-level statement gets P at 12 rather than a shifted fake PC.
+        let pre_pcs: Vec<u32> = records
+            .iter()
+            .filter(|record| record.kind == OP_PRE_PC)
+            .map(|record| {
+                assert_eq!(record.var_id, NO_VAR_ID);
+                record.pc
+            })
+            .collect();
+        assert_eq!(pre_pcs, vec![10, 11, 12, 13, 14]);
+
+        let if_events: Vec<(u8, u32)> = records
+            .iter()
+            .filter(|record| record.pc == 11)
+            .map(|record| (record.kind, record.var_id))
+            .collect();
+        assert_eq!(
+            if_events,
+            vec![(OP_PRE_PC, NO_VAR_ID), (OP_READ, 0), (OP_WRITE, 1)]
+        );
+
+        let unknown = records
+            .iter()
+            .find(|record| record.kind == OP_UNKNOWN_WRITE)
+            .expect("BigInt assignment must invalidate the prior scalar value");
+        assert_eq!(unknown.var_id, 0);
+        assert_eq!(unknown.pc, 12);
+        assert_eq!(unknown.value, UNKNOWN_REASON_BIG_INT);
+
+        let clear = records
+            .iter()
+            .find(|record| record.kind == OP_WRITE && record.pc == 13 && record.var_id == 0)
+            .expect("havoc clear must restore an exact scalar write");
+        assert_eq!(clear.value, 0);
     }
 }

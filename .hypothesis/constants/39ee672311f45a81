@@ -1,0 +1,4 @@
+# file: /home/ubuntu/boogie-parser/interpreter/utils/support_matrix.py
+# hypothesis_version: 6.151.9
+
+['assert', 'assign', 'assume', 'booleans', 'ensures checking', 'execution_engines', 'expressions', 'goto', 'havoc', 'if-then-else', 'integers/bitvectors', 'map load/store', 'partial', 'return', 'statements', 'supported', 'unsupported']

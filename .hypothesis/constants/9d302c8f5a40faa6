@@ -1,0 +1,4 @@
+# file: /home/ubuntu/boogie-parser/interpreter/utils/inputs.py
+# hypothesis_version: 6.151.9
+
+['array', 'buffer', 'buffers', 'extra_data', 'field', 'name', 'private', 'r', 'struct', 'value', 'var']

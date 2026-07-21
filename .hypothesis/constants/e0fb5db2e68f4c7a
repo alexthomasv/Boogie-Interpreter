@@ -1,0 +1,4 @@
+# file: /home/ubuntu/boogie-parser/interpreter/python/Environment.py
+# hypothesis_version: 6.151.9
+
+[255, 50000, '$CurrAddr', '$CurrAddr.shadow', '$n', '$n.shadow', '.shadow', 'GLOBAL', 'R', 'W', 'a', 'block', 'block_registry', 'block_values', 'last_block', 'op_type', 'op_values', 'pc', 'pc_registry', 'pc_values', 'positive_examples', 'total', 'value', 'var', 'wb']

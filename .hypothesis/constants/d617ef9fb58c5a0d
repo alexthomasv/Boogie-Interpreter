@@ -1,0 +1,4 @@
+# file: /home/ubuntu/boogie-parser/interpreter/parser/specifications.py
+# hypothesis_version: 6.151.9
+
+[', ', 'expression', 'free', 'free ', 'identifiers']

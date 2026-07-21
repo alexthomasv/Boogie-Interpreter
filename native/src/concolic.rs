@@ -290,6 +290,13 @@ pub fn suggest(
 ) -> PyResult<PyObject> {
     let wrapper: PyRef<'_, CompiledProgramWrapper> = compiled.extract()?;
     let program = &wrapper.inner;
+    if program.mode == crate::opcodes::SemanticsMode::Int {
+        // Concolic path reasoning is a BV-mode (wrapping i64) mirror of the
+        // interpreter; under exact-ℤ semantics its algebra is wrong. It only
+        // affects INPUT FINDING (never verdicts), so Int mode returns no
+        // candidates instead of unsound ones. See interpreter/README.md.
+        return int_mode_disabled_result(py);
+    }
 
     let symbols = parse_symbols(symbols_py, program)?;
     let covered = parse_covered(covered_blocks)?;
@@ -423,6 +430,10 @@ pub fn explore(
 ) -> PyResult<PyObject> {
     let wrapper: PyRef<'_, CompiledProgramWrapper> = compiled.extract()?;
     let program = &wrapper.inner;
+    if program.mode == crate::opcodes::SemanticsMode::Int {
+        // See the identical gate in `suggest` — BV-only engine.
+        return int_mode_disabled_result(py);
+    }
 
     let symbols = parse_symbols(symbols_py, program)?;
     let covered = parse_covered(covered_blocks)?;
@@ -753,7 +764,7 @@ impl<'a> Engine<'a> {
         let mut event_fields = vec![
             ("reason", reason.to_string()),
             ("pc", self.vm.pc.to_string()),
-            ("block", self.vm.curr_block.clone()),
+            ("block", self.vm.block_name(self.program)),
         ];
         for (key, value) in fields {
             event_fields.push((*key, value.clone()));
@@ -777,7 +788,7 @@ impl<'a> Engine<'a> {
                         &[
                             ("depth", depth.to_string()),
                             ("max_path_depth", self.max_path_depth.to_string()),
-                            ("block", self.vm.curr_block.clone()),
+                            ("block", self.vm.block_name(self.program)),
                         ],
                     );
                 }
@@ -799,8 +810,7 @@ impl<'a> Engine<'a> {
             }
 
             let block = &self.program.blocks[block_id as usize];
-            self.vm.explored_blocks.insert(block_id);
-            self.vm.curr_block.clone_from(&block.name);
+            self.vm.mark_explored(block_id);
             self.vm.curr_block_id = block_id;
             self.vm.pc = block.start_pc;
             if !self.vm.no_trace {
@@ -811,7 +821,9 @@ impl<'a> Engine<'a> {
                 if !self.execute_stmt(stmt) {
                     return;
                 }
-                self.vm.pc += 1;
+                if !stmt.is_internal_maintenance() {
+                    self.vm.pc += 1;
+                }
             }
 
             match &block.terminator {
@@ -835,7 +847,6 @@ impl<'a> Engine<'a> {
             return true;
         }
         let entry = &self.program.blocks[self.program.entry_block as usize];
-        self.vm.curr_block.clone_from(&entry.name);
         self.vm.curr_block_id = self.program.entry_block;
         self.vm.pc = entry.start_pc;
         for (idx, expr) in self.program.entry_preconditions.iter().enumerate() {
@@ -1410,7 +1421,7 @@ impl<'a> Engine<'a> {
                 self.candidate_score(CandidateKind::ValueProfile, &target_block);
             let inserted = self.push_candidate(Candidate {
                 updates,
-                source_block: self.vm.curr_block.clone(),
+                source_block: self.vm.block_name(self.program),
                 target_block,
                 branch_index: 0,
                 kind: CandidateKind::ValueProfile,
@@ -1478,7 +1489,7 @@ impl<'a> Engine<'a> {
             priority += distance_bonus;
             let inserted = self.push_candidate(Candidate {
                 updates,
-                source_block: self.vm.curr_block.clone(),
+                source_block: self.vm.block_name(self.program),
                 target_block,
                 branch_index: 0,
                 kind: CandidateKind::DistanceGuided,
@@ -1562,7 +1573,7 @@ impl<'a> Engine<'a> {
                         if let Some(bool_expr) = sym_bool_text(sym) {
                             self.stats.objectives += 1;
                             self.try_solve(
-                                self.vm.curr_block.clone(),
+                                self.vm.block_name(self.program),
                                 format!("assert@{}", self.vm.pc),
                                 0,
                                 bool_expr,
@@ -1592,6 +1603,16 @@ impl<'a> Engine<'a> {
                 }
             }
             Stmt::AssumeTrue | Stmt::LoopHeaderSnap { .. } | Stmt::CallIgnored => {}
+            Stmt::ReleaseMaps { vars } => {
+                for var_id in vars {
+                    let Some(map_idx) = self.vm.var_to_map.get(var_id).copied() else {
+                        self.unsupported("release_non_map", &[("var_id", var_id.to_string())]);
+                        return false;
+                    };
+                    self.vm.memory_maps[map_idx].clear();
+                    self.sym_maps[map_idx] = FxHashMap::default();
+                }
+            }
             Stmt::Havoc { vars } => {
                 for &var_id in vars {
                     self.vm.clear_var(var_id);
@@ -1682,17 +1703,52 @@ impl<'a> Engine<'a> {
             }
             Stmt::CallMemmove { args } => {
                 let vals: Vec<CEval> = args.iter().map(|a| self.eval_i64(a)).collect();
-                if vals.len() >= 6 {
-                    let dst = scalar_value(&vals[0].value).unwrap_or(0);
-                    let dst_shadow = scalar_value(&vals[1].value).unwrap_or(0);
-                    let src = scalar_value(&vals[2].value).unwrap_or(0);
-                    let src_shadow = scalar_value(&vals[3].value).unwrap_or(0);
-                    let len = scalar_value(&vals[4].value).unwrap_or(0);
-                    let len_shadow = scalar_value(&vals[5].value).unwrap_or(0);
-                    if len != len_shadow || len < 0 {
+                match vals.as_slice() {
+                    // Unshadowed LLVM ABI: (dst, src, len, is_volatile).
+                    [dst, src, len, _is_volatile] => {
+                        let Some(dst) = scalar_value(&dst.value) else {
+                            return false;
+                        };
+                        let Some(src) = scalar_value(&src.value) else {
+                            return false;
+                        };
+                        let Some(len) = scalar_value(&len.value) else {
+                            return false;
+                        };
+                        if len < 0 {
+                            return false;
+                        }
+                        self.memmove_i8_maps(dst, dst, src, src, len);
+                    }
+                    // Retain the shadow ABI, including the historical
+                    // acceptance of optional trailing volatility operands.
+                    [dst, dst_shadow, src, src_shadow, len, len_shadow, ..] => {
+                        let Some(dst) = scalar_value(&dst.value) else {
+                            return false;
+                        };
+                        let Some(dst_shadow) = scalar_value(&dst_shadow.value) else {
+                            return false;
+                        };
+                        let Some(src) = scalar_value(&src.value) else {
+                            return false;
+                        };
+                        let Some(src_shadow) = scalar_value(&src_shadow.value) else {
+                            return false;
+                        };
+                        let Some(len) = scalar_value(&len.value) else {
+                            return false;
+                        };
+                        let Some(len_shadow) = scalar_value(&len_shadow.value) else {
+                            return false;
+                        };
+                        if len != len_shadow || len < 0 {
+                            return false;
+                        }
+                        self.memmove_i8_maps(dst, dst_shadow, src, src_shadow, len);
+                    }
+                    _ => {
                         return false;
                     }
-                    self.memmove_i8_maps(dst, dst_shadow, src, src_shadow, len);
                 }
             }
             Stmt::QuantMemsetWrite {
@@ -1746,7 +1802,11 @@ impl<'a> Engine<'a> {
                 let boundary = self.vm.get_scalar_silent(*dst) + self.vm.get_scalar_silent(*len);
                 self.copy_filtered(*m_ret, *m_src, |addr, boundary| addr >= boundary, boundary);
             }
-            Stmt::If { cond, then_body, else_body } => {
+            Stmt::If {
+                cond,
+                then_body,
+                else_body,
+            } => {
                 // Concolic execution of structured if: pick the branch based
                 // on the concrete value, recurse. Path constraint over
                 // ``cond`` is recorded so the solver can flip branches in a
@@ -1883,30 +1943,25 @@ impl<'a> Engine<'a> {
             return;
         };
 
+        // Keep the per-entry structure: the symbolic mirror tracks exactly
+        // which concrete addrs were initialized, so this cannot Arc-share.
         let copied: Vec<(i64, i64, Option<Sym>)> = self.vm.memory_maps[map_idx]
-            .memory
-            .iter()
-            .filter_map(|(&addr, &value)| {
-                if addr >= src && addr < src_end {
-                    Some((
-                        dst + (addr - src),
-                        value,
-                        self.sym_maps[map_idx].get(&addr).cloned(),
-                    ))
-                } else {
-                    None
-                }
+            .iter_init_range(src, src_end)
+            .map(|(addr, value)| {
+                (
+                    dst + (addr - src),
+                    value,
+                    self.sym_maps[map_idx].get(&addr).cloned(),
+                )
             })
             .collect();
         let clear: Vec<i64> = self.vm.memory_maps[map_idx]
-            .memory
-            .keys()
-            .filter(|&&addr| addr >= dst && addr < dst_end)
-            .copied()
+            .iter_init_range(dst, dst_end)
+            .map(|(addr, _)| addr)
             .collect();
 
         for addr in clear {
-            self.vm.memory_maps[map_idx].memory.remove(&addr);
+            self.vm.memory_maps[map_idx].remove(addr);
             self.sym_maps[map_idx].remove(&addr);
         }
         for (addr, value, sym) in copied {
@@ -1925,9 +1980,8 @@ impl<'a> Engine<'a> {
     {
         if let (Some(src_idx), Some(dst_idx)) = (self.get_map_idx(m_src), self.get_map_idx(m_ret)) {
             let addrs: Vec<i64> = self.vm.memory_maps[src_idx]
-                .memory
-                .keys()
-                .copied()
+                .iter_init()
+                .map(|(addr, _)| addr)
                 .filter(|addr| pred(*addr, boundary))
                 .collect();
             for addr in addrs {
@@ -1945,23 +1999,26 @@ impl<'a> Engine<'a> {
     fn set_eval_result(&mut self, var_id: VarId, ev: CEval) {
         match ev.value {
             EvalResult::Scalar(v) => self.vm.set_scalar(var_id, v, false),
+            EvalResult::Big(b) => {
+                unreachable!("concolic is BV-gated; Big value {} cannot occur", b)
+            }
             EvalResult::Bool(b) => self.vm.set_scalar(var_id, b as i64, false),
             EvalResult::MapRef(map_idx) => {
                 let vid = var_id as usize;
-                if let Some(existing_idx) = self.vm.var_to_map[vid] {
+                if let Some(existing_idx) = self.vm.var_to_map.get(&var_id).copied() {
                     if existing_idx != map_idx {
-                        let new_name = self.vm.var_names[vid].clone();
+                        let new_name = self.vm.var_names[vid].to_string();
                         let copied = self.vm.memory_maps[map_idx].copy_with_name(new_name);
                         self.vm.memory_maps[existing_idx] = copied;
                         self.sym_maps[existing_idx] = self.sym_maps[map_idx].clone();
                     }
                 } else {
-                    let new_name = self.vm.var_names[vid].clone();
+                    let new_name = self.vm.var_names[vid].to_string();
                     let copied = self.vm.memory_maps[map_idx].copy_with_name(new_name);
                     let new_idx = self.vm.memory_maps.len();
                     self.vm.memory_maps.push(copied);
                     self.sym_maps.push(self.sym_maps[map_idx].clone());
-                    self.vm.var_to_map[vid] = Some(new_idx);
+                    self.vm.var_to_map.insert(var_id, new_idx);
                     self.vm.vars[vid] = Value::Map(new_idx);
                 }
             }
@@ -1973,6 +2030,7 @@ impl<'a> Engine<'a> {
         let ev = self.eval(expr);
         let concrete = match ev.value {
             EvalResult::Scalar(v) => v != 0,
+            EvalResult::Big(_) => unreachable!("concolic is BV-gated; Big cannot occur"),
             EvalResult::Bool(b) => b,
             EvalResult::MapRef(_) => false,
         };
@@ -1986,6 +2044,7 @@ impl<'a> Engine<'a> {
         let ev = self.eval(expr);
         match ev.value {
             EvalResult::Scalar(_) | EvalResult::Bool(_) => ev,
+            EvalResult::Big(_) => unreachable!("concolic is BV-gated; Big cannot occur"),
             EvalResult::MapRef(_) => CEval {
                 value: EvalResult::Scalar(0),
                 sym: None,
@@ -2001,6 +2060,9 @@ impl<'a> Engine<'a> {
                 CEval {
                     value: match value {
                         Value::Scalar(v) => EvalResult::Scalar(v),
+                        Value::Big(b) => {
+                            unreachable!("concolic is BV-gated; Big value {} cannot occur", b)
+                        }
                         Value::Map(idx) => EvalResult::MapRef(idx),
                     },
                     sym: self.sym_vars[vid].clone(),
@@ -2010,6 +2072,9 @@ impl<'a> Engine<'a> {
                 value: EvalResult::Scalar(*v),
                 sym: None,
             },
+            Expr::ConstBig(b) => {
+                unreachable!("concolic is BV-gated; ConstBig literal {} cannot occur", b)
+            }
             Expr::Bool(b) => CEval {
                 value: EvalResult::Bool(*b),
                 sym: None,
@@ -2079,6 +2144,16 @@ impl<'a> Engine<'a> {
             BinOp::Sub => EvalResult::Scalar((lv.wrapping_sub(rv)) & MASK_64),
             BinOp::Mul => EvalResult::Scalar((lv.wrapping_mul(rv)) & MASK_64),
             BinOp::Add => EvalResult::Scalar((lv.wrapping_add(rv)) & MASK_64),
+            BinOp::Div => EvalResult::Scalar(if rv == 0 {
+                -1
+            } else {
+                ((lv as u64) / (rv as u64)) as i64
+            }),
+            BinOp::Mod => EvalResult::Scalar(if rv == 0 {
+                lv
+            } else {
+                ((lv as u64) % (rv as u64)) as i64
+            }),
         };
         CEval { value, sym }
     }
@@ -2087,7 +2162,7 @@ impl<'a> Engine<'a> {
         if builtins::num_args(fn_id) == 1 {
             let x = self.eval_i64(&args[0]);
             let xv = eval_to_i64(&x.value);
-            let value = builtins::exec_unary(fn_id, xv);
+            let value = builtins::bv::exec_unary(fn_id, xv);
             let sym = x.sym.map(|s| sym_unary_builtin(fn_id, s));
             CEval {
                 value: EvalResult::Scalar(value),
@@ -2098,7 +2173,7 @@ impl<'a> Engine<'a> {
             let b = self.eval_i64(&args[1]);
             let av = eval_to_i64(&a.value);
             let bv = eval_to_i64(&b.value);
-            let (result, is_bool) = builtins::exec_binary(fn_id, av, bv);
+            let (result, is_bool) = builtins::bv::exec_binary(fn_id, av, bv);
             let a_profile_sym = a.sym.clone();
             let b_profile_sym = b.sym.clone();
             self.record_builtin_value_profile(fn_id, &a_profile_sym, av, &b_profile_sym, bv);
@@ -2143,6 +2218,7 @@ impl<'a> Engine<'a> {
         let val_ev = self.eval_i64(value);
         let val = eval_to_i64(&val_ev.value);
         let ew = self.vm.memory_maps[map_idx].element_bit_width;
+        let bit_width = if bit_width == 0 { ew } else { bit_width };
         if bit_width == ew {
             self.vm.memory_maps[map_idx].set(idx_val, val);
             if let Some(sym) = val_ev.sym {
@@ -2194,6 +2270,7 @@ impl<'a> Engine<'a> {
         }
         let idx_val = eval_to_i64(&idx_ev.value);
         let ew = self.vm.memory_maps[map_idx].element_bit_width;
+        let bit_width = if bit_width == 0 { ew } else { bit_width };
         if bit_width == ew {
             CEval {
                 value: EvalResult::Scalar(self.vm.memory_maps[map_idx].get(idx_val)),
@@ -2527,6 +2604,16 @@ fn sym_binop(op: BinOp, lhs: Sym, rhs: Sym) -> Sym {
         },
         BinOp::Add => Sym::Bv {
             text: format!("(bvadd {} {})", lhs.bv_text(64), rhs.bv_text(64)),
+            bits: 64,
+            provenance,
+        },
+        BinOp::Div => Sym::Bv {
+            text: format!("(bvudiv {} {})", lhs.bv_text(64), rhs.bv_text(64)),
+            bits: 64,
+            provenance,
+        },
+        BinOp::Mod => Sym::Bv {
+            text: format!("(bvurem {} {})", lhs.bv_text(64), rhs.bv_text(64)),
             bits: 64,
             provenance,
         },
@@ -3101,7 +3188,7 @@ fn parse_symbols(
         let name: String = required(d, "name")?.extract()?;
         let bits: u32 = required(d, "bits")?.extract()?;
         let value: u64 = required(d, "value")?.extract()?;
-        let var_id = optional_string(d, "var")?.and_then(|v| program.name_to_var.get(&v).copied());
+        let var_id = optional_string(d, "var")?.and_then(|v| program.lookup_var(&v));
         let map_key = match (optional_string(d, "map")?, optional_i64(d, "addr")?) {
             (Some(m), Some(a)) => Some((m, a)),
             _ => None,
@@ -3111,7 +3198,7 @@ fn parse_symbols(
             optional_string(d, "havoc_var")?,
             optional_usize(d, "havoc_index")?,
         ) {
-            (Some(v), Some(i)) => program.name_to_var.get(&v).copied().map(|vid| (vid, i)),
+            (Some(v), Some(i)) => program.lookup_var(&v).map(|vid| (vid, i)),
             _ => None,
         };
         out.push(InputSymbol {
@@ -3160,22 +3247,22 @@ fn build_vm(
         let name: String = tuple.get_item(0)?.extract()?;
         let index_bw: u8 = tuple.get_item(1)?.extract()?;
         let element_bw: u8 = tuple.get_item(2)?.extract()?;
-        if let Some(&vid) = program.name_to_var.get(&name) {
+        if let Some(vid) = program.lookup_var(&name) {
             vm.init_memory_map(vid, name, index_bw, element_bw);
         }
     }
     for (key, val) in var_store.iter() {
         let name: String = key.extract()?;
         let value: i64 = val.extract()?;
-        if let Some(&vid) = program.name_to_var.get(&name) {
+        if let Some(vid) = program.lookup_var(&name) {
             vm.set_scalar(vid, value, true);
         }
     }
     for (key, val) in memory_maps.iter() {
         let name: String = key.extract()?;
         let contents: &Bound<'_, PyDict> = val.downcast()?;
-        if let Some(&vid) = program.name_to_var.get(&name) {
-            if let Some(map_idx) = vm.var_to_map[vid as usize] {
+        if let Some(vid) = program.lookup_var(&name) {
+            if let Some(map_idx) = vm.var_to_map.get(&vid).copied() {
                 for (addr, value) in contents.iter() {
                     vm.memory_maps[map_idx].set(addr.extract()?, value.extract()?);
                 }
@@ -3206,6 +3293,7 @@ fn eval_to_i64(value: &EvalResult) -> i64 {
     match value {
         EvalResult::Scalar(v) => *v,
         EvalResult::Bool(b) => *b as i64,
+        EvalResult::Big(b) => unreachable!("concolic is BV-gated; Big value {} cannot occur", b),
         EvalResult::MapRef(_) => 0,
     }
 }
@@ -3214,6 +3302,29 @@ fn scalar_value(value: &EvalResult) -> Option<i64> {
     match value {
         EvalResult::Scalar(v) => Some(*v),
         EvalResult::Bool(b) => Some(*b as i64),
+        EvalResult::Big(_) => None,
         EvalResult::MapRef(_) => None,
     }
+}
+
+/// Result returned when concolic/symbolic exploration is invoked on an
+/// Int-mode (exact-ℤ) program: no candidates, and a stats record that
+/// carries the reason. Shape-compatible with the real result dicts.
+fn int_mode_disabled_result(py: Python<'_>) -> PyResult<PyObject> {
+    let out = PyDict::new_bound(py);
+    out.set_item("candidates", PyList::empty_bound(py))?;
+    let stats = PyDict::new_bound(py);
+    stats.set_item("branches_seen", 0)?;
+    stats.set_item("objectives", 0)?;
+    stats.set_item("solver_queries", 0)?;
+    stats.set_item("unsupported", 0)?;
+    stats.set_item("elapsed_ms", 0.0)?;
+    stats.set_item("candidates_per_sec", 0.0)?;
+    stats.set_item("complete_within_bounds", false)?;
+    stats.set_item(
+        "disabled_reason",
+        "int-mode program: concolic engine is BV-only (input finding only,          never verdicts)",
+    )?;
+    out.set_item("stats", stats)?;
+    Ok(out.into())
 }

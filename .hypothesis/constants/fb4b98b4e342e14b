@@ -1,0 +1,4 @@
+# file: /home/ubuntu/boogie-parser/interpreter/parser/type.py
+# hypothesis_version: 6.151.9
+
+[', ', 'arguments', 'bool', 'domain', 'int', 'name', 'range', 'real']

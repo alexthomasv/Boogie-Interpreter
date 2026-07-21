@@ -1,0 +1,4 @@
+# file: /home/ubuntu/boogie-parser/swoosh_cli/layout.py
+# hypothesis_version: 6.151.9
+
+['SWOOSH_OUT_DIR', 'SwooshLayout', 'bpl', 'bpl-out', 'cache', 'checkpoints', 'cmake', 'graphs', 'inputs', 'locks', 'package', 'packages', 'redis', 'runs', 'swoosh', 'target', 'test_input', 'test_packages', 'traces']

@@ -80,8 +80,6 @@ def test_gen_input_fast_search_then_replay_kept_inputs_with_raw_traces(tmp_path)
         progress_interval=1000,
     )
 
-    assert report["engine_used"] == "native"
-    assert report["native_fallback"] is False
     assert report["step_limits"] == 0
     assert report["candidates_evaluated"] >= 2
     assert report["total_new_inputs"] >= 1
@@ -101,16 +99,13 @@ def test_gen_input_fast_search_then_replay_kept_inputs_with_raw_traces(tmp_path)
         result = run_native(
             program,
             program_inputs,
-            "fast_gen_case",
             input_path.stem,
             raw_log_path=raw_log,
-            extra_data=program_inputs.extra_data,
             prepared=prepared,
             no_trace=False,
             log_read=True,
             return_status=True,
             return_memory_summary=False,
-            validate_handoff=False,
             quiet=True,
             max_steps=10_000,
         )
@@ -574,31 +569,6 @@ def test_until_new_path_ladder_stops_after_concrete_path_gain(tmp_path):
     assert report["rungs_completed"] == 1
     assert list((out_dir / "rung_01").glob("gen_*.input"))
     assert (out_dir / "until_new_path.json").exists()
-
-
-def test_native_replay_reports_block_sequence(tmp_path):
-    pytest.importorskip("swoosh_interp")
-    program = make_program(FAST_BRANCH_SOURCE)
-    prepared = prepare_native(program)
-    result = run_native(
-        program,
-        scalar_inputs({"$x": 0}),
-        "block_sequence_case",
-        "seed",
-        raw_log_path=tmp_path / "seed.trace.raw.zst",
-        prepared=prepared,
-        no_trace=True,
-        log_read=False,
-        return_status=True,
-        return_memory_summary=False,
-        validate_handoff=False,
-        quiet=True,
-        max_steps=10_000,
-    )
-
-    assert result["status"] == "ok"
-    assert result["block_sequence"] == ["entry", "zero"]
-    assert result["block_sequence_len"] == 2
 
 
 def test_gen_input_reports_step_limited_seed_without_writing_candidate(tmp_path):

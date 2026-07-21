@@ -1,9 +1,8 @@
 """Bitvector arithmetic and logic operations for Boogie built-in functions."""
 
 __all__ = [
-    'mask_bits', '_mask', '_sign', '_to_signed',
-    'lshr_fn', 'lshr_32', 'lshr_64',
-    'ashr_fn', 'ashr_32', 'ashr_64',
+    'mask_bits', '_mask', '_to_signed',
+    'lshr_fn', 'ashr_fn',
     'shl_fn',
     'sdiv_fn', 'srem_fn', 'udiv_fn', 'urem_fn',
     'add_fn', 'sub_fn', 'mul_fn',
@@ -23,9 +22,6 @@ def mask_bits(value: int, bit_width: int) -> int:
 
 
 def _mask(w):        return (1 << w) - 1
-def _sign(x, w):     return x if x < (1 << (w-1)) else x - (1 << w)
-
-
 def _to_signed(val: int, bits: int) -> int:
     """Interpret value as two's-complement signed."""
     val &= (1 << bits) - 1
@@ -43,10 +39,6 @@ def lshr_fn(bits: int):
         return (v >> s) & m
     return _lshr
 
-# Keep legacy names for backward compatibility in fn_map_to_op
-lshr_32 = lshr_fn(32)
-lshr_64 = lshr_fn(64)
-
 def ashr_fn(bits: int):
     """Generic arithmetic shift right for any bit width (SMT-LIB bvashr)."""
     m = _mask(bits)
@@ -60,10 +52,6 @@ def ashr_fn(bits: int):
         else:
             return (v >> s) & m
     return _ashr
-
-# Keep legacy names for backward compatibility in fn_map_to_op
-ashr_32 = ashr_fn(32)
-ashr_64 = ashr_fn(64)
 
 def shl_fn(bits: int):
     m = _mask(bits)
@@ -364,11 +352,11 @@ fn_map_to_op = {
     "$shl.i64": (shl_fn(64), 2, 64, 64),
     "$shl.i32": (shl_fn(32), 2, 32, 32),
 
-    "$lshr.i64": (lshr_64, 2, 64, 64),
-    "$lshr.i32": (lshr_32, 2, 32, 32),
+    "$lshr.i64": (lshr_fn(64), 2, 64, 64),
+    "$lshr.i32": (lshr_fn(32), 2, 32, 32),
 
-    "$ashr.i64": (ashr_64, 2, 64, 64),
-    "$ashr.i32": (ashr_32, 2, 32, 32),
+    "$ashr.i64": (ashr_fn(64), 2, 64, 64),
+    "$ashr.i32": (ashr_fn(32), 2, 32, 32),
 
     # casts / identity
     "$bitcast.ref.ref": (lambda x: x, 1, 64, 64),

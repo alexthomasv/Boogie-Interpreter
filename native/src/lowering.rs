@@ -1,70 +1,145 @@
 use crate::opcodes::*;
+use num_bigint::{BigInt, Sign};
+use num_traits::ToPrimitive;
+use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyTuple};
 use rustc_hash::FxHashMap;
+use std::borrow::Cow;
 
-/// Intern table: variable name → VarId
+pub(crate) mod fold;
+pub(crate) mod inline;
+
+/// An active inlining frame. While lowering an inlined callee's body, its
+/// local/param/return names are renamed with `prefix` (e.g. `inline$Q$3$`) so
+/// each inline instance gets fresh, collision-free variables. Globals (names
+/// not in `locals`) pass through untouched, keeping observable state shared.
+pub struct Frame {
+    pub prefix: String,
+    pub locals: rustc_hash::FxHashSet<String>,
+}
+
+/// Intern table: variable name → VarId. Also carries the lowering context's
+/// `SemanticsMode` — it is threaded through every `lower_expr`/`lower_stmt`
+/// call, so mode-sensitive lowering (big literals, `$idiv`/`$smod`
+/// resolution, const-fold semantics) reads it from here.
 pub struct InternTable {
-    pub map: FxHashMap<String, VarId>,
-    names: Vec<String>,
+    index: NameIndex,
+    names: NameTable,
+    /// Active inlining frame (None at top level / the non-inlining lowering path).
+    frame: Option<Frame>,
+    /// Semantics mode the program is being lowered under.
+    pub mode: SemanticsMode,
 }
 
 impl InternTable {
-    pub fn new() -> Self {
+    pub fn new_with_mode(mode: SemanticsMode) -> Self {
         Self {
-            map: FxHashMap::default(),
-            names: Vec::new(),
+            index: NameIndex::default(),
+            names: NameTable::new(),
+            frame: None,
+            mode,
         }
     }
 
+    /// Intern a variable name, applying the active inlining frame: a name that
+    /// is a callee-local under the current frame is renamed with the instance
+    /// prefix before interning. Globals (and the top-level path) pass through.
     pub fn intern(&mut self, name: &str) -> VarId {
-        if let Some(&id) = self.map.get(name) {
+        let renamed: Option<String> = match &self.frame {
+            Some(f) if f.locals.contains(name) => Some(format!("{}{}", f.prefix, name)),
+            _ => None,
+        };
+        match renamed {
+            Some(r) => self.intern_raw(&r),
+            None => self.intern_raw(name),
+        }
+    }
+
+    /// Intern a name verbatim, bypassing the active frame (used by the inliner
+    /// when it already holds a fully-resolved, prefixed name).
+    pub fn intern_raw(&mut self, name: &str) -> VarId {
+        if let Some(id) = self.index.lookup(&self.names, name) {
             return id;
         }
-        let id = self.names.len() as VarId;
-        self.names.push(name.to_string());
-        self.map.insert(name.to_string(), id);
+        let id = self
+            .names
+            .try_push(name.into())
+            .unwrap_or_else(|error| panic!("cannot intern variable {name:?}: {error}"));
+        self.index.insert(&self.names, id);
         id
     }
 
-    pub fn get(&self, name: &str) -> Option<VarId> {
-        self.map.get(name).copied()
+    /// Apply the active frame's prefix to a block label (a callee's own labels
+    /// are renamed per instance). Identity at the top level.
+    pub fn apply_label(&self, name: &str) -> String {
+        match &self.frame {
+            Some(f) => format!("{}{}", f.prefix, name),
+            None => name.to_string(),
+        }
     }
 
-    pub fn names(&self) -> &[String] {
+    /// Install `frame` as the active inlining frame, returning the previous one
+    /// so the caller can restore it after lowering the callee body.
+    pub fn set_frame(&mut self, frame: Option<Frame>) -> Option<Frame> {
+        std::mem::replace(&mut self.frame, frame)
+    }
+
+    /// The active frame's prefix (e.g. `inline$$memcpy.i8.cross_product$3$`), or
+    /// None at top level. Used to classify a callee's quantified assumes whose
+    /// own variable names (M.ret/dst/len) don't carry the proc name pre-inline.
+    pub fn frame_prefix(&self) -> Option<&str> {
+        self.frame.as_ref().map(|f| f.prefix.as_str())
+    }
+
+    pub fn get(&self, name: &str) -> Option<VarId> {
+        self.index.lookup(&self.names, name)
+    }
+
+    pub fn names(&self) -> &NameTable {
         &self.names
     }
 
     pub fn len(&self) -> u32 {
-        self.names.len() as u32
+        u32::try_from(self.names.len()).expect("NameTable enforces the u32 variable-count limit")
+    }
+
+    /// Release the lowering-only hash index before final block assembly.
+    pub fn clear_lookup(&mut self) {
+        self.index = NameIndex::default();
+    }
+
+    pub fn take_lookup(&mut self) -> NameIndex {
+        std::mem::take(&mut self.index)
+    }
+
+    /// Forget a lowering-only name lookup while retaining its stable name and
+    /// `VarId`. Completed inline frames use this in package builds after every
+    /// reference has already been lowered to numeric bytecode.
+    pub fn remove_lookup(&mut self, id: VarId) -> bool {
+        self.index.remove(&self.names, id)
+    }
+
+    pub fn take_names(&mut self) -> NameTable {
+        std::mem::take(&mut self.names)
     }
 }
 
-/// Lower a Python AST program into a CompiledProgram.
+/// Lower a Python AST program with explicit loop metadata and semantics.
 ///
-/// `loop_metadata`, when provided, is a dict with three keys mapping
-/// block NAMES to the loop structure produced by the compile pipeline
-/// (see `interpreter/runner.py::_build_loop_metadata`):
-///   * `is_loop_header`: list of block names that are loop headers
-///   * `block_innermost_header`: dict block_name -> innermost header name
-///   * `loop_parent_header`: dict inner_header name -> parent header name
-pub fn lower_program(
-    py: Python<'_>,
-    program: &Bound<'_, PyAny>,
-    loop_header_live: Option<&Bound<'_, PyDict>>,
-) -> PyResult<CompiledProgram> {
-    lower_program_full(py, program, loop_header_live, None)
-}
-
-/// Extended form that also carries loop metadata. `lower_program` is a
-/// back-compat wrapper that passes `None` for the metadata.
+/// `loop_metadata`, when provided, maps block names to the loop structure
+/// produced by the compile pipeline (see
+/// `interpreter/runner.py::_build_loop_metadata`).
+/// The mode must be known DURING lowering (not stamped after): big-literal
+/// handling, `$idiv`/`$smod` resolution and const-folding are mode-sensitive.
 pub fn lower_program_full(
     py: Python<'_>,
     program: &Bound<'_, PyAny>,
     loop_header_live: Option<&Bound<'_, PyDict>>,
     loop_metadata: Option<&Bound<'_, PyDict>>,
+    mode: SemanticsMode,
 ) -> PyResult<CompiledProgram> {
-    let mut intern = InternTable::new();
+    let mut intern = InternTable::new_with_mode(mode);
     let mut blocks = Vec::new();
     let mut label_to_block: FxHashMap<String, BlockId> = FxHashMap::default();
     let mut mem_maps = Vec::new();
@@ -321,7 +396,7 @@ pub fn lower_program_full(
             } = stmt
             {
                 if *alloc_size_var == u32::MAX {
-                    let havoc_var_name = intern.names[*var_id as usize].clone();
+                    let havoc_var_name = intern.names[*var_id as usize].to_string();
                     // Find alloc size var by scanning forward from havoc in Python AST
                     let py_idx = if havoc_count < py_havoc_indices.len() {
                         py_havoc_indices[havoc_count]
@@ -329,7 +404,7 @@ pub fn lower_program_full(
                         0
                     };
 
-                    let utils = py.import_bound("interpreter.utils.utils")?;
+                    let utils = py.import_bound("interpreter.utils.program")?;
                     let mut size_var_id: Option<VarId> = None;
 
                     // Scan forward for AssumeStatements referencing this havoc var
@@ -459,15 +534,32 @@ pub fn lower_program_full(
         }
     }
 
+    // Post-inline ConstantFoldPass equivalent for the direct lowering path
+    // (the inline path folds interleaved in flush_block). Fold semantics
+    // match vm::eval exactly PER MODE, so results and traces are unchanged.
+    for block in blocks.iter_mut() {
+        for stmt in block.body.iter_mut() {
+            fold::fold_stmt(stmt, mode);
+        }
+        if let Some(cond) = block.assume_cond.as_mut() {
+            fold::fold_in_place(cond, mode);
+        }
+    }
+    normalize_is_external_assumes(&mut blocks);
+
+    let num_vars = intern.len();
+    let name_index = intern.take_lookup();
+    let var_names = std::sync::Arc::new(intern.take_names());
+
     Ok(CompiledProgram {
         blocks,
         label_to_block,
-        var_names: intern.names().to_vec(),
-        name_to_var: intern.map.clone(),
+        var_names,
+        name_index,
         entry_block: 0,
         entry_preconditions,
         mem_maps,
-        num_vars: intern.len(),
+        num_vars,
         curr_addr_id,
         curr_addr_shadow_id,
         m0_id,
@@ -476,7 +568,71 @@ pub fn lower_program_full(
         is_loop_header,
         block_innermost_header,
         loop_parent_header,
+        static_scalars: Vec::new(),
+        mode,
     })
+}
+
+/// True if `expr` mentions `$isExternal` anywhere in its tree.
+pub(crate) fn expr_contains_is_external(expr: &Expr) -> bool {
+    match expr {
+        Expr::IsExternal => true,
+        Expr::Var(_) | Expr::Const(_) | Expr::ConstBig(_) | Expr::Bool(_) => false,
+        Expr::BinOp { lhs, rhs, .. } => {
+            expr_contains_is_external(lhs) || expr_contains_is_external(rhs)
+        }
+        Expr::Builtin { args, .. } => args.iter().any(expr_contains_is_external),
+        Expr::Store {
+            map, index, value, ..
+        } => {
+            expr_contains_is_external(map)
+                || expr_contains_is_external(index)
+                || expr_contains_is_external(value)
+        }
+        Expr::Load { map, index, .. } => {
+            expr_contains_is_external(map) || expr_contains_is_external(index)
+        }
+        Expr::IfThenElse { cond, then_, else_ } => {
+            expr_contains_is_external(cond)
+                || expr_contains_is_external(then_)
+                || expr_contains_is_external(else_)
+        }
+        Expr::Not(inner) => expr_contains_is_external(inner),
+    }
+}
+
+/// Rewrite `assume e` to `AssumeTrue` when `e` mentions `$isExternal`.
+///
+/// `$isExternal` is a verifier-only hint; concrete execution always skips
+/// such assumes (the VM used to detect them with a per-execution tree walk).
+/// Normalizing once here keeps the exact skip semantics while removing the
+/// walk from the hot path. Also applied in `load_compiled` so `.swcp`
+/// packages serialized before this pass stay correct.
+pub(crate) fn normalize_is_external_assumes(blocks: &mut [Block]) {
+    fn normalize_stmts(stmts: &mut [Stmt]) {
+        for stmt in stmts.iter_mut() {
+            match stmt {
+                Stmt::Assume { expr } => {
+                    if expr_contains_is_external(expr) {
+                        *stmt = Stmt::AssumeTrue;
+                    }
+                }
+                Stmt::If {
+                    then_body,
+                    else_body,
+                    ..
+                } => {
+                    normalize_stmts(then_body);
+                    normalize_stmts(else_body);
+                }
+                Stmt::While { body, .. } => normalize_stmts(body),
+                _ => {}
+            }
+        }
+    }
+    for block in blocks.iter_mut() {
+        normalize_stmts(&mut block.body);
+    }
 }
 
 /// Lower a Python statement to a Rust Stmt.
@@ -544,11 +700,10 @@ fn lower_stmt(
                 }
             }
 
-            // Loop invariants and hhoudini-injected assumes are verifier
-            // annotations, not runtime preconditions. Concrete execution
-            // shouldn't assert them — the actual loop iteration will
-            // establish the invariant naturally. Skip them.
-            for attr in ["loop_invariant", "hhoudini"].iter() {
+            // These assumptions constrain symbolic verification, while
+            // concrete execution supplies ordinary host addresses and loop
+            // states. The executed path itself supplies trace evidence.
+            for attr in ["loop_invariant", "hhoudini", "external_in"].iter() {
                 let has: bool = stmt.call_method1("has_attribute", (*attr,))?.extract()?;
                 if has {
                     return Ok(Stmt::AssumeTrue);
@@ -608,7 +763,6 @@ fn lower_stmt(
     }
 }
 
-
 /// Lower a Python ``WhileStatement`` to ``Stmt::While``.
 ///
 /// Used for nested while-statements that survive desugar (top-level
@@ -637,13 +791,38 @@ fn lower_while(
     }
 
     debug_assert!(
-        body.iter().all(|s| !matches!(s, Stmt::Goto { .. } | Stmt::Return)),
+        body.iter()
+            .all(|s| !matches!(s, Stmt::Goto { .. } | Stmt::Return)),
         "Stmt::While body must not contain Goto/Return"
     );
 
     Ok(Stmt::While { cond, body })
 }
 
+/// Lower one then/else body item. The diffprod-reified `IfStatement` shape has
+/// `.blocks` = a flat list of Statements; the shadowing-constructed shape (e.g.
+/// `$$alloc.cross_product`) wraps the body in a single `Block`. Handle both:
+/// a `Block` item is unwrapped to its statements. (Boogie desugars the latter
+/// during inlining, so the post-inline lowering path never hits it — but the
+/// native inliner works on the un-inlined program, which still has it.)
+fn lower_body_item(
+    py: Python<'_>,
+    item: &Bound<'_, PyAny>,
+    intern: &mut InternTable,
+    label_map: &FxHashMap<String, BlockId>,
+    out: &mut Vec<Stmt>,
+) -> PyResult<()> {
+    if item.get_type().name()? == "Block" {
+        let stmts = item.getattr("statements")?;
+        let stmts: &Bound<'_, PyList> = stmts.downcast()?;
+        for s in stmts.iter() {
+            out.push(lower_stmt(py, &s, intern, label_map)?);
+        }
+    } else {
+        out.push(lower_stmt(py, item, intern, label_map)?);
+    }
+    Ok(())
+}
 
 /// Lower a Python `IfStatement` to `Stmt::If`.
 ///
@@ -668,7 +847,7 @@ fn lower_if(
     let then_py: &Bound<'_, PyList> = then_attr.downcast()?;
     let mut then_body: Vec<Stmt> = Vec::with_capacity(then_py.len());
     for item in then_py.iter() {
-        then_body.push(lower_stmt(py, &item, intern, label_map)?);
+        lower_body_item(py, &item, intern, label_map, &mut then_body)?;
     }
 
     let else_attr = stmt.getattr("else_")?;
@@ -684,22 +863,30 @@ fn lower_if(
             let else_py: &Bound<'_, PyList> = else_attr.downcast()?;
             let mut acc: Vec<Stmt> = Vec::with_capacity(else_py.len());
             for item in else_py.iter() {
-                acc.push(lower_stmt(py, &item, intern, label_map)?);
+                lower_body_item(py, &item, intern, label_map, &mut acc)?;
             }
             acc
         }
     };
 
     debug_assert!(
-        then_body.iter().all(|s| !matches!(s, Stmt::Goto { .. } | Stmt::Return)),
+        then_body
+            .iter()
+            .all(|s| !matches!(s, Stmt::Goto { .. } | Stmt::Return)),
         "Stmt::If then_body must not contain Goto/Return"
     );
     debug_assert!(
-        else_body.iter().all(|s| !matches!(s, Stmt::Goto { .. } | Stmt::Return)),
+        else_body
+            .iter()
+            .all(|s| !matches!(s, Stmt::Goto { .. } | Stmt::Return)),
         "Stmt::If else_body must not contain Goto/Return"
     );
 
-    Ok(Stmt::If { cond, then_body, else_body })
+    Ok(Stmt::If {
+        cond,
+        then_body,
+        else_body,
+    })
 }
 
 /// Lower a call statement.
@@ -892,7 +1079,7 @@ fn lower_quantified_assume(
     let op: String = expression.getattr("op")?.extract()?;
 
     // Get all boogie variables in the expression
-    let utils = py.import_bound("interpreter.utils.utils")?;
+    let utils = py.import_bound("interpreter.utils.program")?;
     let boogie_vars_set = utils.call_method1("extract_boogie_variables", (&expression,))?;
     let boogie_vars: Vec<Bound<'_, PyAny>> =
         boogie_vars_set.iter()?.collect::<PyResult<Vec<_>>>()?;
@@ -905,24 +1092,28 @@ fn lower_quantified_assume(
         var_names.push((name, var_id));
     }
 
-    let is_memset = var_names.iter().any(|(n, _)| n.contains("memset"));
-    let is_memcpy = var_names.iter().any(|(n, _)| n.contains("memcpy"));
+    // Classify by the inlining frame prefix too: pre-inline, a callee's own
+    // quantifier vars (M.ret/dst/len) don't carry "memset"/"memcpy" — only the
+    // enclosing proc name does (e.g. inline$$memcpy.i8.cross_product$N$).
+    let frame_pfx: String = intern.frame_prefix().unwrap_or("").to_string();
+    let is_memset =
+        frame_pfx.contains("memset") || var_names.iter().any(|(n, _)| n.contains("memset"));
+    let is_memcpy =
+        frame_pfx.contains("memcpy") || var_names.iter().any(|(n, _)| n.contains("memcpy"));
 
     if is_memset {
-        lower_memset_assume(py, &expression, &op, &var_names, intern, q_expr)
+        lower_memset_assume(&expression, &op, &var_names, q_expr)
     } else if is_memcpy {
-        lower_memcpy_assume(py, &expression, &op, &var_names, intern, q_expr)
+        lower_memcpy_assume(&expression, &op, &var_names)
     } else {
         panic!("Unknown quantified assume pattern");
     }
 }
 
 fn lower_memset_assume(
-    _py: Python<'_>,
     expression: &Bound<'_, PyAny>,
     op: &str,
     var_names: &[(String, VarId)],
-    intern: &mut InternTable,
     q_expr: &Bound<'_, PyAny>,
 ) -> PyResult<Stmt> {
     // Get free variables (not in quantifier variable list)
@@ -1016,12 +1207,9 @@ fn lower_memset_assume(
 }
 
 fn lower_memcpy_assume(
-    _py: Python<'_>,
     expression: &Bound<'_, PyAny>,
     op: &str,
     var_names: &[(String, VarId)],
-    intern: &mut InternTable,
-    _q_expr: &Bound<'_, PyAny>,
 ) -> PyResult<Stmt> {
     match op {
         "&&" => {
@@ -1098,9 +1286,23 @@ fn lower_memcpy_assume(
 }
 
 /// Find a variable by suffix match in a slice of (name, var_id) tuples.
+/// Match a variable name against a memset/memcpy operand suffix. Handles both
+/// the post-inline shape (Boogie-renamed `inline$…$M.ret`, matched by the `$`-led
+/// suffix `$M.ret`) and the pre-inline shape (bare `M.ret`, which the native
+/// inliner sees). The `$`/bare distinction is what keeps `$dst` from matching
+/// `M.dst`, so we match the bare *core* by EQUALITY, not a loose `ends_with`.
+fn suffix_matches(name: &str, suffix: &str) -> bool {
+    let core = suffix.strip_prefix('$').unwrap_or(suffix);
+    let core_shadow = format!("{}.shadow", core);
+    name.ends_with(suffix)
+        || name.ends_with(&format!("{}.shadow", suffix))
+        || name == core
+        || name == core_shadow.as_str()
+}
+
 fn find_var_by_suffix_slice(vars: &[(String, VarId)], suffix: &str) -> VarId {
     for (name, var_id) in vars {
-        if name.ends_with(suffix) || name.ends_with(&format!("{}.shadow", suffix)) {
+        if suffix_matches(name, suffix) {
             return *var_id;
         }
     }
@@ -1110,7 +1312,7 @@ fn find_var_by_suffix_slice(vars: &[(String, VarId)], suffix: &str) -> VarId {
 /// Find a variable by suffix match in a Vec of references.
 fn find_var_by_suffix_ref(vars: &[&(String, VarId)], suffix: &str) -> VarId {
     for (name, var_id) in vars {
-        if name.ends_with(suffix) || name.ends_with(&format!("{}.shadow", suffix)) {
+        if suffix_matches(name, suffix) {
             return *var_id;
         }
     }
@@ -1120,7 +1322,7 @@ fn find_var_by_suffix_ref(vars: &[&(String, VarId)], suffix: &str) -> VarId {
 fn find_var_by_suffix_either_ref(vars: &[&(String, VarId)], suffixes: &[&str]) -> VarId {
     for (name, var_id) in vars {
         for suffix in suffixes {
-            if name.ends_with(suffix) || name.ends_with(&format!("{}.shadow", suffix)) {
+            if suffix_matches(name, suffix) {
                 return *var_id;
             }
         }
@@ -1175,37 +1377,96 @@ fn lower_expr_impl(
             Ok(Expr::Var(var_id))
         }
         "IntegerLiteral" => {
-            // Boogie integers can be arbitrarily large; truncate to i64
+            // Boogie integers can be arbitrarily large.
+            //   Int mode  — keep the exact mathematical value: i64 fast path,
+            //               else ConstBig (exact-ℤ core evaluates it exactly).
+            //   BV mode   — a literal is a 64-bit pattern: i64 or the u64
+            //               two's-complement fold (e.g. SMACK's
+            //               18446744073709551615 mask constants). Beyond u64
+            //               there is NO faithful pattern: loud error (the old
+            //               silent 64-bit masking hid real data loss).
             let value_obj = expr.getattr("value")?;
-            let value: i64 = match value_obj.extract::<i64>() {
-                Ok(v) => v,
-                Err(_) => {
-                    // Large integer — extract as u64 or truncate
-                    match value_obj.extract::<u64>() {
-                        Ok(v) => v as i64,
-                        Err(_) => {
-                            // Very large — mask to 64 bits
-                            let py_int = value_obj.call_method1("__and__", (u64::MAX,))?;
-                            py_int.extract::<u64>()? as i64
-                        }
+            match value_obj.extract::<i64>() {
+                Ok(v) => Ok(Expr::Const(v)),
+                Err(_) => match intern.mode {
+                    SemanticsMode::Int => {
+                        let big: num_bigint::BigInt = value_obj.extract()?;
+                        Ok(Expr::ConstBig(Box::new(big)))
                     }
-                }
-            };
-            Ok(Expr::Const(value))
+                    SemanticsMode::Bv => match value_obj.extract::<u64>() {
+                        Ok(v) => Ok(Expr::Const(v as i64)),
+                        Err(_) => panic!(
+                            "BV-mode literal beyond u64 has no 64-bit \
+                             representation: {}",
+                            value_obj
+                        ),
+                    },
+                },
+            }
+        }
+        "BitvectorLiteral" => {
+            let value: BigInt = expr.getattr("value")?.extract()?;
+            let width: u64 = expr.getattr("base")?.extract()?;
+            Ok(Expr::Const(fold_native_bitvector_literal(value, width)?))
         }
         "BooleanLiteral" => {
             let value: bool = expr.getattr("value")?.extract()?;
             Ok(Expr::Bool(value))
         }
+        "MapSelect" => {
+            let map = expr.getattr("map")?;
+            let indexes = expr.getattr("indexes")?;
+            let indexes_list: &Bound<'_, PyList> = indexes.downcast()?;
+            if indexes_list.len() != 1 {
+                return Err(PyValueError::new_err(format!(
+                    "native interpreter supports direct MapSelect with exactly one index, got {}",
+                    indexes_list.len()
+                )));
+            }
+            let map = lower_expr_impl(py, &map, intern)?;
+            let index = lower_expr_impl(py, &indexes_list.get_item(0)?, intern)?;
+            Ok(Expr::Load {
+                // A direct Boogie map select has no $load.iN spelling from
+                // which to recover a width. Zero means one element of the
+                // selected map; execution resolves it from the map metadata.
+                bit_width: 0,
+                map: Box::new(map),
+                index: Box::new(index),
+            })
+        }
+        "MapUpdate" => {
+            let map = expr.getattr("map")?;
+            let indexes = expr.getattr("indexes")?;
+            let indexes_list: &Bound<'_, PyList> = indexes.downcast()?;
+            if indexes_list.len() != 1 {
+                return Err(PyValueError::new_err(format!(
+                    "native interpreter supports direct MapUpdate with exactly one index, got {}",
+                    indexes_list.len()
+                )));
+            }
+            let value = expr.getattr("value")?;
+            let map = lower_expr_impl(py, &map, intern)?;
+            let index = lower_expr_impl(py, &indexes_list.get_item(0)?, intern)?;
+            let value = lower_expr_impl(py, &value, intern)?;
+            Ok(Expr::Store {
+                // See MapSelect above: zero is the direct-cell sentinel.
+                bit_width: 0,
+                map: Box::new(map),
+                index: Box::new(index),
+                value: Box::new(value),
+            })
+        }
         "FunctionApplication" => {
             let func = expr.getattr("function")?;
-            let f_name: String = func.getattr("name")?.extract()?;
+            let source_name: String = func.getattr("name")?.extract()?;
+            let f_name = canonicalize_bv_intrinsic_name(&source_name, intern.mode);
+            let f_name = f_name.as_ref();
             let args = expr.getattr("arguments")?;
             let args_list: &Bound<'_, PyList> = args.downcast()?;
 
             // Store functions
             if matches!(
-                f_name.as_str(),
+                f_name,
                 "$store.i1"
                     | "$store.i8"
                     | "$store.i16"
@@ -1214,7 +1475,7 @@ fn lower_expr_impl(
                     | "$store.i128"
                     | "$store.ref"
             ) {
-                let bw = store_load_bitwidth(&f_name);
+                let bw = store_load_bitwidth(f_name);
                 let map = lower_expr_impl(py, &args_list.get_item(0)?, intern)?;
                 let index = lower_expr_impl(py, &args_list.get_item(1)?, intern)?;
                 let value = lower_expr_impl(py, &args_list.get_item(2)?, intern)?;
@@ -1228,10 +1489,16 @@ fn lower_expr_impl(
 
             // Load functions
             if matches!(
-                f_name.as_str(),
-                "$load.i1" | "$load.i8" | "$load.i16" | "$load.i32" | "$load.i64" | "$load.i128" | "$load.ref"
+                f_name,
+                "$load.i1"
+                    | "$load.i8"
+                    | "$load.i16"
+                    | "$load.i32"
+                    | "$load.i64"
+                    | "$load.i128"
+                    | "$load.ref"
             ) {
-                let bw = store_load_bitwidth(&f_name);
+                let bw = store_load_bitwidth(f_name);
                 let map = lower_expr_impl(py, &args_list.get_item(0)?, intern)?;
                 let index = lower_expr_impl(py, &args_list.get_item(1)?, intern)?;
                 return Ok(Expr::Load {
@@ -1247,18 +1514,18 @@ fn lower_expr_impl(
             }
 
             // Resolve builtin function
-            if let Some(fn_id) = resolve_builtin(&f_name) {
+            if let Some(fn_id) = resolve_builtin(f_name, intern.mode) {
                 let lowered_args: Vec<Expr> = args_list
                     .iter()
-                    .map(|a| lower_expr_impl(py, &a, intern).unwrap())
-                    .collect();
+                    .map(|a| lower_expr_impl(py, &a, intern))
+                    .collect::<PyResult<_>>()?;
                 return Ok(Expr::Builtin {
                     fn_id,
                     args: lowered_args,
                 });
             }
 
-            panic!("Unknown function: {}", f_name);
+            panic!("Unknown function: {}", source_name);
         }
         "BinaryExpression" => {
             let op_str: String = expr.getattr("op")?.extract()?;
@@ -1278,6 +1545,8 @@ fn lower_expr_impl(
                 "-" => BinOp::Sub,
                 "*" => BinOp::Mul,
                 "+" => BinOp::Add,
+                "/" => BinOp::Div,
+                "%" => BinOp::Mod,
                 _ => panic!("Unknown binary op: {}", op_str),
             };
             let lhs_expr = lower_expr_impl(py, &lhs, intern)?;
@@ -1292,6 +1561,20 @@ fn lower_expr_impl(
             let inner = expr.getattr("expression")?;
             let lowered = lower_expr_impl(py, &inner, intern)?;
             Ok(Expr::Not(Box::new(lowered)))
+        }
+        "ArithmeticNegation" => {
+            // Unary minus `-x` lowers to `0 - x` (Boogie integer negation).
+            // Dispatch is by EXACT class name, so without this arm an
+            // ArithmeticNegation node (a UnaryExpression subclass) falls
+            // through to the panic default — which crashed try-violate on
+            // every negated-arithmetic predicate (e.g. `-$i0 + 2*$i1`).
+            let inner = expr.getattr("expression")?;
+            let lowered = lower_expr_impl(py, &inner, intern)?;
+            Ok(Expr::BinOp {
+                op: BinOp::Sub,
+                lhs: Box::new(Expr::Const(0)),
+                rhs: Box::new(lowered),
+            })
         }
         "IfExpression" => {
             let cond = expr.getattr("condition")?;
@@ -1315,6 +1598,72 @@ fn lower_expr_impl(
     }
 }
 
+/// Translate SMACK's native-BV intrinsic spelling to the canonical names the
+/// opcode resolver already uses. This is a name-level compatibility boundary:
+/// execution still selects `SemanticsMode::Bv`, so reusing `$add.i32`'s opcode
+/// does not select integer semantics. Byte-memory helpers additionally drop
+/// their `bytes` component because their canonical `$load.iN`/`$store.iN`
+/// opcodes already implement the same little-endian byte-map operation.
+fn canonicalize_bv_intrinsic_name<'a>(name: &'a str, mode: SemanticsMode) -> Cow<'a, str> {
+    if mode != SemanticsMode::Bv {
+        return Cow::Borrowed(name);
+    }
+
+    let parts: Vec<&str> = name.split('.').collect();
+    let byte_memory = parts.len() == 3
+        && matches!(parts[0], "$load" | "$store")
+        && parts[1] == "bytes"
+        && (parts[2] == "ref" || native_bv_token(parts[2]).is_some());
+
+    let mut changed = byte_memory;
+    let mut canonical = Vec::with_capacity(parts.len());
+    for (index, part) in parts.iter().enumerate() {
+        if byte_memory && index == 1 {
+            continue;
+        }
+        if let Some(width) = native_bv_token(part) {
+            canonical.push(format!("i{width}"));
+            changed = true;
+        } else {
+            canonical.push((*part).to_string());
+        }
+    }
+
+    if changed {
+        Cow::Owned(canonical.join("."))
+    } else {
+        Cow::Borrowed(name)
+    }
+}
+
+fn native_bv_token(token: &str) -> Option<&str> {
+    let width = token.strip_prefix("bv")?;
+    let width_value = width.parse::<u16>().ok()?;
+    (1..=64).contains(&width_value).then_some(width)
+}
+
+fn fold_native_bitvector_literal(value: BigInt, width: u64) -> PyResult<i64> {
+    if !(1..=64).contains(&width) {
+        return Err(PyValueError::new_err(format!(
+            "native interpreter supports bit-vector literals of width 1..=64, got bv{width}"
+        )));
+    }
+    if value.sign() == Sign::Minus {
+        return Err(PyValueError::new_err(
+            "bit-vector literal payload must be non-negative",
+        ));
+    }
+    let mask = if width == 64 {
+        u64::MAX
+    } else {
+        (1u64 << width) - 1
+    };
+    let pattern = (value & BigInt::from(mask))
+        .to_u64()
+        .expect("masked bit-vector literal always fits u64");
+    Ok(pattern as i64)
+}
+
 /// Get bit width from store/load function name.
 fn store_load_bitwidth(name: &str) -> u8 {
     match name.rsplit('.').next().unwrap() {
@@ -1329,7 +1678,27 @@ fn store_load_bitwidth(name: &str) -> u8 {
 }
 
 /// Resolve a function name to a BuiltinFn.
-fn resolve_builtin(name: &str) -> Option<BuiltinFn> {
+///
+/// Mode-sensitivity: `$idiv.iN` / `$smod.iN` are the SMACK integer-encoding
+/// prelude's residual division intrinsics ({:builtin "div"/"mod"}) and only
+/// resolve under `SemanticsMode::Int`. Every other name resolves in both
+/// modes; `vm::eval` dispatches the SEMANTICS per mode (`builtins::bv` vs
+/// `builtins::int`).
+fn resolve_builtin(name: &str, mode: SemanticsMode) -> Option<BuiltinFn> {
+    // SMACK's bv64 -> mathematical-int bridge is representation-preserving
+    // in the BV VM: scalars already carry the signed two's-complement i64
+    // interpretation used for pointer arithmetic.
+    if mode == SemanticsMode::Bv && name == "$bv2int.64" {
+        return Some(BuiltinFn::Bitcast);
+    }
+    if mode == SemanticsMode::Int {
+        if let Some(bits) = parse_intrinsic_width(name, "$idiv.") {
+            return Some(BuiltinFn::Idiv { bits });
+        }
+        if let Some(bits) = parse_intrinsic_width(name, "$smod.") {
+            return Some(BuiltinFn::Smod { bits });
+        }
+    }
     if let Some((src, dst)) = parse_bitwidth_cast(name, "$sext.") {
         return Some(BuiltinFn::Sext { src, dst });
     }
@@ -1516,6 +1885,15 @@ fn parse_bitwidth_cast(name: &str, prefix: &str) -> Option<(u8, u8)> {
     Some((parse_int_bitwidth(src)?, parse_int_bitwidth(dst)?))
 }
 
+/// Parse `$idiv.i32`-style residual intrinsic widths (`ref` counts as 64).
+fn parse_intrinsic_width(name: &str, prefix: &str) -> Option<u8> {
+    let rest = name.strip_prefix(prefix)?;
+    if rest == "ref" {
+        return Some(64);
+    }
+    parse_int_bitwidth(rest)
+}
+
 fn parse_int_bitwidth(token: &str) -> Option<u8> {
     let bits = token.strip_prefix('i')?.parse::<u8>().ok()?;
     matches!(bits, 1 | 8 | 16 | 32 | 64 | 128).then_some(bits)
@@ -1526,7 +1904,12 @@ fn convert_type_to_bitwidth(py: Python<'_>, type_obj: &Bound<'_, PyAny>) -> PyRe
     let domain = type_obj.getattr("domain")?;
     let range = type_obj.getattr("range")?;
     let domain_list: &Bound<'_, PyList> = domain.downcast()?;
-    assert!(domain_list.len() == 1, "Only single-index maps supported");
+    if domain_list.len() != 1 {
+        return Err(PyValueError::new_err(format!(
+            "native interpreter supports only single-index maps, got {} indexes",
+            domain_list.len()
+        )));
+    }
     let domain_bw = scalar_type_bitwidth(py, &domain_list.get_item(0)?)?;
     let range_bw = scalar_type_bitwidth(py, &range)?;
     Ok((domain_bw, range_bw))
@@ -1540,6 +1923,9 @@ fn scalar_type_bitwidth(_py: Python<'_>, type_obj: &Bound<'_, PyAny>) -> PyResul
         "IntegerType" => Ok(32),
         "CustomType" => {
             let name: String = type_obj.getattr("name")?.extract()?;
+            if let Some(width) = parse_native_bitvector_width(&name) {
+                return Ok(width);
+            }
             match name.as_str() {
                 "i1" | "bool" => Ok(1),
                 "i8" => Ok(8),
@@ -1550,5 +1936,129 @@ fn scalar_type_bitwidth(_py: Python<'_>, type_obj: &Bound<'_, PyAny>) -> PyResul
             }
         }
         _ => panic!("Unknown type: {}", type_name),
+    }
+}
+
+/// Parse a Boogie-native scalar bit-vector type (`bvN`) that the VM can
+/// represent exactly in its i64-backed memory maps.
+fn parse_native_bitvector_width(name: &str) -> Option<u8> {
+    let width = name.strip_prefix("bv")?.parse::<u8>().ok()?;
+    (1..=64).contains(&width).then_some(width)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        canonicalize_bv_intrinsic_name, fold_native_bitvector_literal,
+        parse_native_bitvector_width, resolve_builtin, InternTable,
+    };
+    use crate::opcodes::{BuiltinFn, SemanticsMode};
+    use num_bigint::BigInt;
+
+    #[test]
+    fn compact_interner_preserves_exact_name_identity_and_ids() {
+        let mut intern = InternTable::new_with_mode(SemanticsMode::Bv);
+        assert_eq!(intern.intern_raw("$x"), 0);
+        assert_eq!(intern.intern_raw("$y"), 1);
+        assert_eq!(intern.intern_raw("$x"), 0);
+        assert_eq!(intern.get("$x"), Some(0));
+        assert_eq!(intern.get("$y"), Some(1));
+        assert_eq!(intern.get("$z"), None);
+    }
+
+    #[test]
+    fn compact_name_index_bucket_is_smaller_than_owned_string_bucket() {
+        use crate::opcodes::VarId;
+        assert!(std::mem::size_of::<(u64, VarId)>() < std::mem::size_of::<(String, VarId)>());
+    }
+
+    #[test]
+    fn canonicalizes_smack_bv_arithmetic_cast_and_byte_memory_names() {
+        for (source, canonical) in [
+            ("$add.bv32", "$add.i32"),
+            ("$slt.bv64", "$slt.i64"),
+            ("$sext.bv8.bv32", "$sext.i8.i32"),
+            ("$p2i.ref.bv64", "$p2i.ref.i64"),
+            ("$load.bytes.bv32", "$load.i32"),
+            ("$store.bytes.bv8", "$store.i8"),
+            ("$load.bytes.ref", "$load.ref"),
+        ] {
+            assert_eq!(
+                canonicalize_bv_intrinsic_name(source, SemanticsMode::Bv),
+                canonical
+            );
+        }
+
+        assert_eq!(
+            canonicalize_bv_intrinsic_name("$add.bv32", SemanticsMode::Int),
+            "$add.bv32"
+        );
+        assert_eq!(
+            canonicalize_bv_intrinsic_name("$load.bytes.float", SemanticsMode::Bv),
+            "$load.bytes.float"
+        );
+        for unsupported in ["$add.bv65", "$add.bv128"] {
+            assert_eq!(
+                canonicalize_bv_intrinsic_name(unsupported, SemanticsMode::Bv),
+                unsupported
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_bv_names_reuse_existing_opcode_resolution() {
+        for (source, expected) in [
+            ("$add.bv32", BuiltinFn::Add { bits: 32 }),
+            ("$slt.bv64", BuiltinFn::Slt { bits: 64 }),
+            ("$sext.bv8.bv32", BuiltinFn::Sext { src: 8, dst: 32 }),
+            ("$p2i.ref.bv64", BuiltinFn::P2i),
+        ] {
+            let canonical = canonicalize_bv_intrinsic_name(source, SemanticsMode::Bv);
+            assert_eq!(
+                resolve_builtin(canonical.as_ref(), SemanticsMode::Bv),
+                Some(expected),
+                "{source}"
+            );
+        }
+
+        assert_eq!(
+            resolve_builtin("$bv2int.64", SemanticsMode::Bv),
+            Some(BuiltinFn::Bitcast)
+        );
+        assert_eq!(resolve_builtin("$bv2int.64", SemanticsMode::Int), None);
+    }
+
+    #[test]
+    fn folds_native_bitvector_literals_to_their_exact_width() {
+        assert_eq!(
+            fold_native_bitvector_literal(BigInt::from(0x1ffu64), 8).unwrap(),
+            0xff
+        );
+        assert_eq!(
+            fold_native_bitvector_literal(BigInt::from(u64::MAX), 64).unwrap(),
+            -1
+        );
+        assert_eq!(
+            fold_native_bitvector_literal((BigInt::from(1u64) << 80) + 5, 32).unwrap(),
+            5
+        );
+        assert!(fold_native_bitvector_literal(BigInt::from(1u64), 65).is_err());
+    }
+
+    #[test]
+    fn parses_vm_representable_native_bitvector_widths() {
+        for width in [1, 7, 8, 16, 32, 63, 64] {
+            assert_eq!(
+                parse_native_bitvector_width(&format!("bv{width}")),
+                Some(width)
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_malformed_or_unrepresentable_native_bitvector_widths() {
+        for name in ["bv", "bv0", "bv65", "bv128", "bv-1", "i8", "byte"] {
+            assert_eq!(parse_native_bitvector_width(name), None, "{name}");
+        }
     }
 }

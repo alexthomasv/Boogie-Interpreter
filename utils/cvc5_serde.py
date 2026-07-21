@@ -50,6 +50,62 @@ _SERDE_STATS = {
     "canonical_ms": 0.0,
 }
 
+_MSGPACK_MIN_INT = -(1 << 63)
+_MSGPACK_MAX_UINT = (1 << 64) - 1
+_MSGPACK_BIGINT_EXT_CODE = 42
+
+
+def _msgpack_bigint_ext_hook(code: int, data: bytes):
+    if code != _MSGPACK_BIGINT_EXT_CODE:
+        return msgpack.ExtType(code, data)
+    try:
+        return int(data.decode("ascii"))
+    except Exception as exc:
+        raise Cvc5SerdeError("invalid cvc5 serde bigint extension") from exc
+
+
+def _msgpack_safe_obj(value):
+    """Convert Python ints outside msgpack's native range into ext payloads."""
+    if isinstance(value, bool) or value is None:
+        return value
+    if isinstance(value, int):
+        if _MSGPACK_MIN_INT <= value <= _MSGPACK_MAX_UINT:
+            return value
+        return msgpack.ExtType(_MSGPACK_BIGINT_EXT_CODE,
+                               str(value).encode("ascii"))
+    if isinstance(value, tuple):
+        return tuple(_msgpack_safe_obj(item) for item in value)
+    if isinstance(value, list):
+        return [_msgpack_safe_obj(item) for item in value]
+    if isinstance(value, dict):
+        return {
+            _msgpack_safe_obj(key): _msgpack_safe_obj(item)
+            for key, item in value.items()
+        }
+    return value
+
+
+def _pack_msgpack_obj(value, *, context: str) -> bytes:
+    try:
+        return msgpack.packb(_msgpack_safe_obj(value), use_bin_type=True)
+    except Cvc5SerdeError:
+        raise
+    except Exception as exc:
+        raise Cvc5SerdeError(
+            f"failed to msgpack-encode cvc5 serde payload: {context}"
+        ) from exc
+
+
+def _unpack_msgpack_obj(data: bytes, *, context: str):
+    try:
+        return msgpack.unpackb(data, raw=False, ext_hook=_msgpack_bigint_ext_hook)
+    except Cvc5SerdeError:
+        raise
+    except Exception as exc:
+        raise Cvc5SerdeError(
+            f"failed to msgpack-decode cvc5 serde payload: {context}"
+        ) from exc
+
 
 def reset_serde_stats() -> None:
     """Reset process-local cvc5 serialization counters."""
@@ -82,87 +138,6 @@ def get_serde_stats(*, reset: bool = False) -> dict[str, int | float | dict]:
         reset_serde_stats()
     return stats
 
-
-_COMPAT_KIND_NUMS = {
-    "EQUAL": 0,
-    "DISTINCT": 1,
-    "AND": 2,
-    "OR": 3,
-    "NOT": 4,
-    "ADD": 5,
-    "MULT": 6,
-    "SUB": 7,
-    "DIVISION": 59,
-    "ITE": 9,
-    "LEQ": 10,
-    "GEQ": 11,
-    "LT": 12,
-    "GT": 13,
-    "IMPLIES": 14,
-    "SELECT": 15,
-    "STORE": 16,
-    "APPLY_UF": 17,
-    "BITVECTOR_ADD": 18,
-    "BITVECTOR_MULT": 19,
-    "INT_TO_BITVECTOR": 20,
-    "BITVECTOR_SIGN_EXTEND": 21,
-    "BITVECTOR_ULT": 22,
-    "BITVECTOR_EXTRACT": 23,
-    "BITVECTOR_ZERO_EXTEND": 24,
-    "BITVECTOR_AND": 25,
-    "BITVECTOR_LSHR": 26,
-    "BITVECTOR_OR": 27,
-    "BITVECTOR_SHL": 28,
-    "BITVECTOR_XOR": 29,
-    "BITVECTOR_SUB": 30,
-    "BITVECTOR_CONCAT": 31,
-    "BITVECTOR_NOT": 32,
-    "BITVECTOR_SLT": 33,
-    "BITVECTOR_SREM": 34,
-    "BITVECTOR_ULE": 35,
-    "BITVECTOR_SGE": 36,
-    "BITVECTOR_UGE": 37,
-    "BITVECTOR_NEG": 38,
-    "BITVECTOR_UDIV": 39,
-    "BITVECTOR_UGT": 40,
-    "BITVECTOR_SGT": 41,
-    "BITVECTOR_ASHR": 42,
-    "BITVECTOR_UREM": 43,
-    "BITVECTOR_SLE": 44,
-    "BITVECTOR_SDIV": 45,
-    "XOR": 46,
-    "CONST_BITVECTOR": 47,
-    "CONST_BOOLEAN": 48,
-    "CONSTANT": 49,
-    "SET_MEMBER": 50,
-    "SET_INSERT": 51,
-    "SET_EMPTY": 52,
-    "CONST_INTEGER": 53,
-    "INTS_MODULUS": 54,
-    "INTS_DIVISION": 55,
-    "NEG": 56,
-    "INTS_MODULUS_TOTAL": 57,
-    "INTS_DIVISION_TOTAL": 58,
-    "DIVISION_TOTAL": 60,
-    "TO_INTEGER": 61,
-    "IS_INTEGER": 62,
-    "BITVECTOR_UBV_TO_INT": 63,
-    "BITVECTOR_SBV_TO_INT": 64,
-    "FORALL": 65,
-    "VARIABLE_LIST": 66,
-    "VARIABLE": 67,
-}
-
-_COMPAT_SORT_NUMS = {
-    "BITVECTOR_SORT": 0,
-    "BOOLEAN_SORT": 1,
-    "INTEGER_SORT": 2,
-    "ARRAY_SORT": 4,
-    "INTERNAL_SORT_KIND": 5,
-    "SET_SORT": 6,
-    "UNINTERPRETED_SORT": 7,
-    "FUNCTION_SORT": 8,
-}
 
 _COMMUTATIVE_KINDS = frozenset(
     {
@@ -232,6 +207,54 @@ def _sort_from_obj(obj) -> SerializedSort:
     return SerializedSort(kind, tuple(converted))
 
 
+def term_from_obj(value) -> "SerializedCvc5TermV2":
+    """Decode the canonical object emitted by ``SerializedCvc5TermV2.to_obj``.
+
+    Proof receipts store this JSON-safe object form directly.  Keeping its
+    decoder beside the byte codec gives every consumer one structural parser
+    and the same validation rules.
+    """
+    if (
+        not isinstance(value, (list, tuple))
+        or len(value) != 3
+        or type(value[0]) is not int
+        or type(value[1]) is not int
+        or not isinstance(value[2], (list, tuple))
+    ):
+        raise Cvc5SerdeError("malformed serialized cvc5 term object")
+    nodes = []
+    for row in value[2]:
+        if (
+            not isinstance(row, (list, tuple))
+            or len(row) != 6
+            or not isinstance(row[0], str)
+            or not isinstance(row[2], (list, tuple))
+            or not isinstance(row[4], str)
+            or not isinstance(row[5], (list, tuple))
+            or any(type(child) is not int for child in row[5])
+        ):
+            raise Cvc5SerdeError("malformed serialized cvc5 node object")
+        try:
+            nodes.append(
+                SerializedNode(
+                    kind=row[0],
+                    sort=_sort_from_obj(row[1]),
+                    op_indices=tuple(row[2]),
+                    value=row[3],
+                    symbol=row[4],
+                    children=tuple(row[5]),
+                )
+            )
+        except Exception as exc:
+            raise Cvc5SerdeError(
+                "invalid serialized cvc5 node object"
+            ) from exc
+    try:
+        return SerializedCvc5TermV2(value[0], value[1], tuple(nodes))
+    except Exception as exc:
+        raise Cvc5SerdeError("invalid serialized cvc5 term object") from exc
+
+
 @dataclass(frozen=True, slots=True)
 class SerializedCvc5TermV2:
     version: int
@@ -247,18 +270,6 @@ class SerializedCvc5TermV2:
     @property
     def node(self) -> SerializedNode:
         return self.nodes[self.root]
-
-    @property
-    def op(self) -> int | None:
-        return _COMPAT_KIND_NUMS.get(self.node.kind)
-
-    @property
-    def type(self) -> int | None:
-        return _COMPAT_SORT_NUMS.get(self.node.sort.kind)
-
-    @property
-    def var_name(self) -> str:
-        return self.node.symbol if self.node.kind in {"CONSTANT", "VARIABLE"} else ""
 
     @property
     def bitwidth(self) -> int:
@@ -314,25 +325,28 @@ class SerializedCvc5TermV2:
         return (self.version, self.root, tuple(node.to_obj() for node in self.nodes))
 
     def to_bytes(self) -> bytes:
-        return msgpack.packb(self.to_obj(), use_bin_type=True)
+        return _pack_msgpack_obj(
+            self.to_obj(),
+            context=f"term bytes root={self.root} nodes={len(self.nodes)}",
+        )
 
     def exact_fingerprint(self) -> str:
         return hashlib.sha256(self.to_bytes()).hexdigest()
 
     def canonical_bytes(self) -> bytes:
-        return msgpack.packb(_canonical_node_obj(self, self.root), use_bin_type=True)
+        return _pack_msgpack_obj(
+            _canonical_node_obj(self, self.root),
+            context=f"canonical term bytes root={self.root} nodes={len(self.nodes)}",
+        )
 
     def canonical_fingerprint(self) -> str:
         return hashlib.sha256(self.canonical_bytes()).hexdigest()
 
     def __repr__(self) -> str:
         return (
-            f"HollowCvc5TermV2(root={self.root}, op={self.op}, "
-            f"children={list(self.node.children)}, var_name={self.var_name!r})"
+            f"SerializedCvc5TermV2(root={self.root}, kind={self.node.kind!r}, "
+            f"children={list(self.node.children)}, symbol={self.node.symbol!r})"
         )
-
-
-HollowCvc5Term = SerializedCvc5TermV2
 
 
 def _sort_signature(sort) -> SerializedSort:
@@ -340,6 +354,10 @@ def _sort_signature(sort) -> SerializedSort:
         return SerializedSort("BOOLEAN_SORT")
     if sort.isInteger():
         return SerializedSort("INTEGER_SORT")
+    if sort.isReal():
+        return SerializedSort("REAL_SORT")
+    if sort.isString():
+        return SerializedSort("STRING_SORT")
     if sort.isBitVector():
         return SerializedSort("BITVECTOR_SORT", (int(sort.getBitVectorSize()),))
     if sort.isArray():
@@ -368,6 +386,10 @@ def _sort_from_signature(solver, sig: SerializedSort):
         return solver.getBooleanSort()
     if sig.kind == "INTEGER_SORT":
         return solver.getIntegerSort()
+    if sig.kind == "REAL_SORT":
+        return solver.getRealSort()
+    if sig.kind == "STRING_SORT":
+        return solver.getStringSort()
     if sig.kind == "BITVECTOR_SORT":
         return solver.mkBitVectorSort(int(sig.args[0]))
     if sig.kind == "ARRAY_SORT":
@@ -388,7 +410,13 @@ def _sort_from_signature(solver, sig: SerializedSort):
     raise Cvc5SerdeError(f"unsupported serialized sort: {sig}")
 
 
-def _term_op_indices(term: Term) -> tuple[int, ...]:
+def term_op_indices(term: Term) -> tuple[int, ...]:
+    """Return the integer parameters carried by an indexed cvc5 operator.
+
+    Operator indices are semantic identity, not presentation metadata.  For
+    example ``extract[7:0](x)`` and ``extract[15:8](x)`` share a Kind, arity,
+    and result sort but are different terms.
+    """
     if not term.hasOp():
         return ()
     op = term.getOp()
@@ -412,6 +440,8 @@ def _term_payload(term: Term, kind_name: str):
         return int(term.getIntegerValue()), ""
     if kind_name == "CONST_BOOLEAN":
         return bool(term.getBooleanValue()), ""
+    if kind_name == "CONST_RATIONAL":
+        return str(term.getRealValue()), ""
     if kind_name == "CONST_STRING":
         return term.getStringValue(), ""
     return None, ""
@@ -444,7 +474,7 @@ def _serialize_uncached(term: Term) -> SerializedCvc5TermV2:
         node = SerializedNode(
             kind=kind_name,
             sort=_sort_signature(parent.getSort()),
-            op_indices=_term_op_indices(parent),
+            op_indices=term_op_indices(parent),
             value=value,
             symbol=symbol,
             children=tuple(done[parent[i]] for i in range(n)),
@@ -485,10 +515,17 @@ serialize_cvc5_term.cache_info = _serialize_cvc5_term_cached.cache_info  # type:
 
 
 def _ensure_term_cache(state_cache):
+    # Solver-identity guard: cached Terms belong to the solver (term manager)
+    # that built them. Handing a stale-manager Term to a new solver is the
+    # documented cvc5 footgun (wrong results / native crash), so the cache
+    # dies with the solver instead of relying on manual clears.
+    solver = getattr(state_cache, "solver", None)
     cache = getattr(state_cache, "cvc5_term_cache", None)
-    if cache is None:
+    bound = getattr(state_cache, "_cvc5_term_cache_solver", None)
+    if cache is None or bound is not solver:
         cache = LRUCache(maxsize=50000)
         state_cache.cvc5_term_cache = cache
+        state_cache._cvc5_term_cache_solver = solver
     return cache
 
 
@@ -504,17 +541,29 @@ def _subterm_cache_keys(root_term: SerializedCvc5TermV2):
             node.symbol,
             tuple(digests[child] for child in node.children),
         )
-        digest = hashlib.sha256(msgpack.packb(payload, use_bin_type=True)).hexdigest()
+        packed = _pack_msgpack_obj(
+            payload,
+            context=(
+                f"subterm cache key idx={idx} kind={node.kind} "
+                f"sort={node.sort} value={node.value!r}"
+            ),
+        )
+        digest = hashlib.sha256(packed).hexdigest()
         digests[idx] = digest
         keys[idx] = ("hollow-v2-subterm", digest)
     return keys
 
 
 def _ensure_sort_cache(state_cache):
+    # Same solver-identity guard as the term cache: Sorts are also bound to
+    # their term manager.
+    solver = getattr(state_cache, "solver", None)
     cache = getattr(state_cache, "cvc5_sort_cache", None)
-    if cache is None:
+    bound = getattr(state_cache, "_cvc5_sort_cache_solver", None)
+    if cache is None or bound is not solver:
         cache = {}
         state_cache.cvc5_sort_cache = cache
+        state_cache._cvc5_sort_cache_solver = solver
     return cache
 
 
@@ -580,7 +629,19 @@ def _remember_bound_var(state_cache, name: str, term: Term):
         cache[name] = term
 
 
-def deserialize_cvc5_term(state_cache, root_term: SerializedCvc5TermV2 | Term) -> Term:
+def deserialize_cvc5_term(
+    state_cache,
+    root_term: SerializedCvc5TermV2 | Term,
+    *,
+    free_const_lookup_exclusions: frozenset[str] = frozenset(),
+) -> Term:
+    """Rebuild ``root_term`` in ``state_cache``'s solver.
+
+    ``free_const_lookup_exclusions`` is used when the lookup itself is the
+    source of the serialized term. In particular, a cold worker reading a
+    runtime-overlay constant must rebuild that constant instead of recursively
+    looking up the same overlay key.
+    """
     if isinstance(root_term, Term):
         return root_term
     if not isinstance(root_term, SerializedCvc5TermV2):
@@ -590,7 +651,13 @@ def deserialize_cvc5_term(state_cache, root_term: SerializedCvc5TermV2 | Term) -
     _SERDE_STATS["deserialize_nodes"] += len(root_term.nodes)
     t0 = time.perf_counter()
     global_cache = _ensure_term_cache(state_cache)
-    cache_keys = _subterm_cache_keys(root_term)
+    try:
+        cache_keys = _subterm_cache_keys(root_term)
+    except Cvc5SerdeError as exc:
+        raise Cvc5SerdeError(
+            "failed to compute cvc5 deserialize cache keys "
+            f"root={root_term.root} nodes={len(root_term.nodes)}"
+        ) from exc
     root_cache_key = cache_keys[root_term.root]
     if root_cache_key in global_cache:
         _SERDE_STATS["deserialize_cache_hits"] += 1
@@ -621,7 +688,9 @@ def deserialize_cvc5_term(state_cache, root_term: SerializedCvc5TermV2 | Term) -
             kind = Kind[node.kind]
 
             if node.kind == "CONSTANT":
-                res = _lookup_free_const(state_cache, node)
+                res = None
+                if node.symbol not in free_const_lookup_exclusions:
+                    res = _lookup_free_const(state_cache, node)
                 if res is None:
                     res = solver.mkConst(_sort_from_signature_cached(state_cache, node.sort), node.symbol)
                     _remember_free_const(state_cache, node.symbol, res)
@@ -646,6 +715,10 @@ def deserialize_cvc5_term(state_cache, root_term: SerializedCvc5TermV2 | Term) -
                 res = solver.mkBoolean(bool(node.value))
             elif node.kind == "CONST_INTEGER":
                 res = solver.mkInteger(str(int(node.value)))
+            elif node.kind == "CONST_RATIONAL":
+                res = solver.mkReal(str(node.value))
+            elif node.kind == "CONST_STRING":
+                res = solver.mkString(str(node.value))
             elif node.kind == "SET_EMPTY":
                 res = solver.mkEmptySet(_sort_from_signature_cached(state_cache, node.sort))
             elif node.kind in {"BITVECTOR_EXTRACT", "BITVECTOR_SIGN_EXTEND", "BITVECTOR_ZERO_EXTEND", "INT_TO_BITVECTOR"}:
@@ -675,6 +748,10 @@ def _const_node_obj(node: SerializedNode):
         return ("int", node.value)
     if node.kind == "CONST_BOOLEAN":
         return ("bool", bool(node.value))
+    if node.kind == "CONST_RATIONAL":
+        return ("real", str(node.value))
+    if node.kind == "CONST_STRING":
+        return ("string", str(node.value))
     if node.kind in {"CONSTANT", "VARIABLE"}:
         return (node.kind.lower(), node.symbol, _sort_to_obj(node.sort))
     return None
@@ -705,6 +782,81 @@ def _canonical_node_obj(term: SerializedCvc5TermV2, idx: int):
     if node.kind in _COMMUTATIVE_KINDS:
         children = tuple(sorted(children, key=repr))
     return (node.kind, _sort_to_obj(node.sort), node.op_indices, children)
+
+
+def canonical_wire(term) -> SerializedCvc5TermV2:
+    """Return deterministic wire bytes for an *already canonicalized* term.
+
+    This is the final representation step of the predicate canonicalizer
+    (``src.solver.predicate.canonicalize_predicate``), not another semantic
+    canonicalizer.  It does not simplify, rewrite, or decide equivalence.  It
+    only removes cvc5's process-local DAG numbering and commutative-child-
+    order nondeterminism from the canonicalizer's result.
+
+    Lives HERE (beside ``_canonical_node_obj``) so both canonical projections
+    — the fingerprint object and the wire — share the ONE
+    ``_COMMUTATIVE_KINDS`` set; a second independently-maintained set was the
+    identity-drift footgun this fold removes.
+    """
+    serialized = serialize_cvc5_term(term)
+    records: dict = {}
+
+    def visit(idx):
+        hit = records.get(idx)
+        if hit is not None:
+            return hit
+        node = serialized.nodes[idx]
+        children = [visit(child) for child in node.children]
+        if node.kind in _COMMUTATIVE_KINDS:
+            children.sort(key=lambda child: repr(child[0]))
+
+        if node.kind == "CONST_BITVECTOR":
+            identity = ("bv", node.value, node.sort.args[0])
+        elif node.kind == "CONST_INTEGER":
+            identity = ("int", node.value)
+        elif node.kind == "CONST_BOOLEAN":
+            identity = ("bool", bool(node.value))
+        elif node.kind in {"CONSTANT", "VARIABLE"}:
+            identity = (node.kind.lower(), node.symbol,
+                        _sort_to_obj(node.sort))
+        else:
+            identity = (
+                node.kind,
+                _sort_to_obj(node.sort),
+                node.op_indices,
+                node.value,
+                node.symbol,
+                tuple(child[0] for child in children),
+            )
+        record = (identity, node, tuple(children))
+        records[idx] = record
+        return record
+
+    root_record = visit(serialized.root)
+    emitted: dict = {}
+    nodes: list = []
+
+    def emit(record):
+        identity, node, children = record
+        hit = emitted.get(identity)
+        if hit is not None:
+            return hit
+        child_indices = tuple(emit(child) for child in children)
+        out = SerializedNode(
+            kind=node.kind,
+            sort=node.sort,
+            op_indices=node.op_indices,
+            value=node.value,
+            symbol=node.symbol,
+            children=child_indices,
+        )
+        index = len(nodes)
+        nodes.append(out)
+        emitted[identity] = index
+        return index
+
+    root = emit(root_record)
+    return SerializedCvc5TermV2(2, root, tuple(nodes))
 
 
 @lru_cache(maxsize=200000)
@@ -738,6 +890,13 @@ def hollow_to_str(term: SerializedCvc5TermV2 | None, max_depth: int = 8) -> str:
         return "<None>"
     if max_depth <= 0:
         return "..."
+    # Accept a LIVE cvc5.Term as well as the serialized form: callers render
+    # ``predicate.predicate``, which may not have round-tripped through pickle
+    # (an in-process Predicate holds a live Term). ``serialize_cvc5_term`` is an
+    # identity no-op on an already-serialized term, so the hollow path is
+    # unchanged; only a live term is normalized before the ``.node`` walk.
+    if isinstance(term, Term):
+        term = serialize_cvc5_term(term)
     node = term.node
     if node.kind in {"CONSTANT", "VARIABLE"}:
         return node.symbol or f"<{node.kind}>"
@@ -747,6 +906,10 @@ def hollow_to_str(term: SerializedCvc5TermV2 | None, max_depth: int = 8) -> str:
         return str(node.value)
     if node.kind == "CONST_BOOLEAN":
         return "true" if node.value else "false"
+    if node.kind == "CONST_RATIONAL":
+        return str(node.value)
+    if node.kind == "CONST_STRING":
+        return repr(str(node.value))
     if node.kind == "SET_EMPTY":
         return "{}"
 
@@ -795,6 +958,17 @@ def classify_hollow(predicate) -> str:
     hollow = getattr(predicate, "predicate", None)
     if hollow is None:
         return "non-mem"
+    # ``predicate.predicate`` may be either the serialized form (a pickle-loaded
+    # Predicate) OR a LIVE ``cvc5.Term`` (an in-process Predicate that never
+    # round-tripped — e.g. a metrics hotspot key held live in the driver). This
+    # classifier walks ``.node`` (serialized-only), so normalize a live term to
+    # the serialized form first. ``serialize_cvc5_term`` is an identity no-op on
+    # an already-serialized term, so the pickle-loaded path is unchanged.
+    if isinstance(hollow, Term):
+        try:
+            hollow = serialize_cvc5_term(hollow)
+        except Exception:
+            return "non-mem"
 
     def has_kind(t: SerializedCvc5TermV2, kinds: set[str], depth: int = 12) -> bool:
         if depth <= 0:
@@ -818,17 +992,8 @@ def classify_hollow(predicate) -> str:
 
 
 def term_from_bytes(data: bytes) -> SerializedCvc5TermV2:
-    version, root, raw_nodes = msgpack.unpackb(data, raw=False)
-    nodes = []
-    for kind, sort_obj, op_indices, value, symbol, children in raw_nodes:
-        nodes.append(
-            SerializedNode(
-                kind,
-                _sort_from_obj(sort_obj),
-                tuple(op_indices),
-                value,
-                symbol,
-                tuple(children),
-            )
-        )
-    return SerializedCvc5TermV2(int(version), int(root), tuple(nodes))
+    value = _unpack_msgpack_obj(
+        data,
+        context="serialized cvc5 term bytes",
+    )
+    return term_from_obj(value)

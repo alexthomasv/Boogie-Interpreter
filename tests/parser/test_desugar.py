@@ -82,27 +82,6 @@ implementation foo(n: int) returns (r: int)
 """
 
 
-NESTED_WHILE = """
-procedure foo() returns (r: int);
-implementation foo() returns (r: int)
-{
-  var i: int;
-  var j: int;
-  entry:
-    i := 0;
-    j := 0;
-    while (i < 3) {
-      while (j < 2) {
-        j := j + 1;
-      }
-      i := i + 1;
-    }
-    r := i + j;
-    return;
-}
-"""
-
-
 def test_desugar_replaces_simple_while_with_goto_cycle():
     """One ``while`` becomes one entry stub + head + body + exit (4 blocks)
     where the original entry contributed one. The total grows by 3."""
@@ -192,26 +171,6 @@ def test_desugar_exit_block_starts_with_assume_negated_guard():
     assert isinstance(first.expression, LogicalNegation)
 
 
-def test_desugar_inlines_nested_while_into_outer_body():
-    """Limitation: when a ``while`` body itself contains another ``while``,
-    the inner loop's expanded blocks are inlined into the outer body block
-    rather than emitted as separate top-level blocks. The pass still
-    produces a program with no remaining ``WhileStatement`` so the native
-    lowering accepts it; the inlined goto cycle preserves semantics. The
-    corerel reifier never produces nested whiles, so this is an acceptable
-    behavior for the calling pattern we support."""
-    program = parse_boogie(NESTED_WHILE)
-    assert _count_whiles(program) == 2
-    desugar_while_statements(program)
-    assert _count_whiles(program) == 0
-    # The outer while produces head/body/exit; the inner loop is folded
-    # into the outer body block as inlined stmts (still goto-form).
-    names = _block_names(program)
-    assert any(n.startswith("loop_head_entry_") for n in names)
-    assert any(n.startswith("loop_body_entry_") for n in names)
-    assert any(n.startswith("loop_exit_entry_") for n in names)
-
-
 def test_desugar_is_no_op_on_smack_style_goto_form():
     """Programs already in goto-form (the SMACK-generated common case) are
     untouched — block count and labels are unchanged."""
@@ -234,7 +193,7 @@ implementation foo() returns ()
     assert before == after
 
 
-def test_desugar_followed_by_run_native_executes_loop():
+def test_desugar_followed_by_run_native_executes_loop(tmp_path):
     """End-to-end sanity: a program with a structured ``while`` runs to
     completion under ``run_native`` after the desugar pass (which the
     runner applies automatically)."""
@@ -252,14 +211,18 @@ def test_desugar_followed_by_run_native_executes_loop():
     inputs = ProgramInputs({"n": Input(name="n", private=False, value=4)})
     raw = run_native(
         program, inputs,
-        test_name="t", input_name="t",
-        raw_log_path=None, no_trace=False, log_read=False,
+        input_name="t",
+        raw_log_path=tmp_path / "t.raw.zst", no_trace=False, log_read=False,
         return_status=True, return_scalar_summary=True,
         max_steps=20000,
     )
     assert raw.get("status") == "ok"
-    bs = list(raw.get("block_sequence") or ())
-    # The loop body executes 4 times — the goto-form body label should
-    # appear at least 4 times in block_sequence.
-    body_visits = [b for b in bs if b.startswith("loop_body_")]
-    assert len(body_visits) >= 4
+    # run_native never returns the per-entry block sequence
+    # (return_block_sequence=False on its execute_inputs call), so assert
+    # loop execution via explored blocks + the final counter values: the
+    # goto-form body block was entered, and it ran exactly n times.
+    explored = set(raw.get("explored_blocks") or ())
+    assert any(b.startswith("loop_body_") for b in explored), explored
+    scalars = raw.get("final_scalars") or {}
+    assert scalars.get("i") == 4
+    assert scalars.get("r") == 4

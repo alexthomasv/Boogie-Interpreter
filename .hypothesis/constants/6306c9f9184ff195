@@ -1,0 +1,4 @@
+# file: /home/ubuntu/boogie-parser/interpreter/utils/input_parser.py
+# hypothesis_version: 6.151.9
+
+['"', ',', '.shadow', '//', '00', '0x', ':', ';', '@private', '_pkg', 'buffer', 'contents', 'entrypoint', 'error', 'field', 'name', 'rb', 'scalar', 'size', 'value', 'warning', '{', '}', '};']

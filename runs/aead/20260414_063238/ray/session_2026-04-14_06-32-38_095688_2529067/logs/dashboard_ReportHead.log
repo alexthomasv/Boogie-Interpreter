@@ -1,0 +1,14 @@
+2026-04-14 06:32:39,951	INFO module.py:210 -- Starting module ReportHead with incarnation 0 and config SubprocessModuleConfig(cluster_id_hex='133fc513f7cff6e49bf995799499925123c0ca331080052a7741a504', gcs_address='172.31.1.230:57646', session_name='session_2026-04-14_06-32-38_095688_2529067', temp_dir='/tmp/_sr_2529067', session_dir='/tmp/_sr_2529067/session_2026-04-14_06-32-38_095688_2529067', logging_level=20, logging_format='%(asctime)s\t%(levelname)s %(filename)s:%(lineno)s -- %(message)s', log_dir='/tmp/_sr_2529067/session_2026-04-14_06-32-38_095688_2529067/logs', logging_filename='dashboard.log', logging_rotate_bytes=536870912, logging_rotate_backup_count=5, socket_dir='/tmp/_sr_2529067/session_2026-04-14_06-32-38_095688_2529067/sockets')
+2026-04-14 06:32:39,955	WARNING __init__.py:161 -- DeprecationWarning: `ray.ray_constants.DASHBOARD_CLIENT_MAX_SIZE` is a private attribute and access will be removed in a future Ray version.
+2026-04-14 06:32:39,957	INFO module.py:142 -- Started aiohttp server over /tmp/_sr_2529067/session_2026-04-14_06-32-38_095688_2529067/sockets/dash_ReportHead.
+2026-04-14 06:32:39,959	INFO module.py:225 -- Module ReportHead initialized, receiving messages...
+2026-04-14 06:32:44,964	WARNING module.py:82 -- Parent process 2529226 died. Exiting...
+2026-04-14 06:32:44,968	WARNING metrics_agent.py:842 -- Writing a service discovery file, /tmp/_sr_2529067/prom_metrics_service_discovery.json,failed.
+2026-04-14 06:32:44,968	WARNING metrics_agent.py:846 -- Traceback (most recent call last):
+  File "/home/ubuntu/boogie-parser/venv/lib/python3.10/site-packages/ray/_private/metrics_agent.py", line 840, in run
+    self.write()
+  File "/home/ubuntu/boogie-parser/venv/lib/python3.10/site-packages/ray/_private/metrics_agent.py", line 817, in write
+    with open(temp_file_name, "w") as json_file:
+FileNotFoundError: [Errno 2] No such file or directory: '/tmp/_sr_2529067/tmp_prom_metrics_service_discovery.json'
+
+2026-04-14 06:32:44,968	WARNING metrics_agent.py:847 -- Error message: [Errno 2] No such file or directory: '/tmp/_sr_2529067/tmp_prom_metrics_service_discovery.json'

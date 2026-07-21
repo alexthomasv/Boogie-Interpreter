@@ -1,0 +1,4 @@
+# file: /home/ubuntu/boogie-parser/interpreter/parser/boogie_parser.py
+# hypothesis_version: 6.151.9
+
+['!=', '%', '&&', '*', '+', '-', '/', '<', '<=', '<==>', '==', '==>', '>', '>=', '[^<:]:[^:]', '\\A\\s*\\w+:.*;', 'arguments', 'attributes', 'blocks', 'body', 'boogie.lark', 'bool', 'break', 'bv', 'condition', 'decl', 'else_', 'enss', 'expr', 'false', 'finite', 'free_invariant', 'int', 'invariant', 'lalr', 'name', 'names', 'order_spec', 'param', 'r', 'rets', 'spec', 'specs', 'start', 'statements', 'stmt', 'then', 'true', 'type', 'unique', 'where', '||']

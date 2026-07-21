@@ -1,0 +1,12 @@
+2026-04-14 06:31:25,255 swoosh.cache INFO Initializing Redis with URL: redis://:password@172.31.1.230:6443
+2026-04-14 06:31:25,258 swoosh.cache DEBUG Preloaded cfg_nx entries
+2026-04-14 06:31:25,258 swoosh.cache DEBUG Preloaded 301 label_to_pc entries
+2026-04-14 06:31:25,259 swoosh.cache DEBUG Preloaded 301 label_to_block_size entries
+2026-04-14 06:31:25,259 swoosh.cache DEBUG Preloaded 301 acyclic_control_dependence_nl entries
+2026-04-14 06:31:25,262 swoosh.cache DEBUG Preloaded 29572 pc_to_block_name_bulk entries
+2026-04-14 06:31:25,262 swoosh.cache DEBUG Preloaded 301 pc_to_label_bulk entries
+2026-04-14 06:31:25,270 swoosh.cache DEBUG Preloaded 29513 pc_next_map_bulk entries
+2026-04-14 06:31:25,340 swoosh.cache DEBUG Preloaded 13863 defines_bulk entries
+2026-04-14 06:31:25,341 swoosh.cache DEBUG Preloaded 189 assumes_bulk entries
+2026-04-14 06:31:25,874 swoosh.cache DEBUG Preloaded 29572 pc_to_stmt_bulk entries
+2026-04-14 06:31:27,069 swoosh.cache DEBUG Preloaded 301 label_to_block_bulk entries

@@ -87,7 +87,7 @@ def _parse_value_expr(expr):
 # Matches: type name = expr;  or  type name[size] = expr;
 _DECL_RE = re.compile(
     r'^(?:[\w\s\*]+?)\s+'       # type (e.g., "unsigned char", "size_t", "const unsigned char *")
-    r'([\w$]+)'                  # name (allow $ for Boogie names like $u0)
+    r'([\w.$]+)'                 # name (allow Boogie $ and .shadow lanes)
     r'(?:\[(\d+)\])?'           # optional [size]
     r'\s*=\s*'                   # =
     r'(.+);'                     # value expression + semicolon
@@ -101,7 +101,7 @@ _DECL_RE = re.compile(
 # inline-variable suffixes like inline$__VERIFIER_nondet_int$0$$i0).
 _HAVOC_SEQ_RE = re.compile(
     r'^int_seq\s+'
-    r'([\w$]+)'                  # name
+    r'([\w.$]+)'                 # name (including explicit .shadow lanes)
     r'\s*=\s*'                   # =
     r'\{\s*([^}]*)\s*\}\s*;\s*$' # { value-list }
 )
@@ -178,7 +178,6 @@ def parse_input_file(path, field_sizes=None):
         # Struct declaration (multi-line)
         m = _STRUCT_START_RE.match(line)
         if m:
-            struct_type = m.group(1)
             c_name = m.group(2)
             bpl_name = name_map.get(c_name, c_name)
             bpl_sizes = (field_sizes or {}).get(bpl_name, [])
@@ -445,5 +444,6 @@ def get_bpl_field_sizes(pkg_path, program=None):
                 sizes.append(fi.size)
         if sizes:
             result[param_name] = sizes
+            result[f"{param_name}.shadow"] = list(sizes)
 
     return result

@@ -10,10 +10,13 @@ import tempfile
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJECT_ROOT)
 
-from interpreter.utils.utils import parse_inputs
-from interpreter.python.Environment import Environment
-from interpreter.python.MemoryMap import MemoryMap
-from interpreter.python.interpreter import BoogieInterpreter, find_entry_point
+from interpreter.utils.inputs import parse_inputs
+from interpreter.archive.legacy_python.runtime.python.Environment import Environment
+from interpreter.archive.legacy_python.runtime.python.MemoryMap import MemoryMap
+from interpreter.archive.legacy_python.runtime.python.interpreter import (
+    BoogieInterpreter,
+    find_entry_point,
+)
 
 # Paths
 PKG_PATH = os.path.join(PROJECT_ROOT, 'test_packages', 'bearssl_test_pkcs1_i31_pkg', 'bearssl_test_pkcs1_i31.pkl')

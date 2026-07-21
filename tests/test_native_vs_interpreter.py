@@ -14,12 +14,13 @@ from pathlib import Path
 
 import pytest
 
+from swoosh_cli.workspace import Workspace
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 BEARSSL_DIR = PROJECT_ROOT / "examples" / "bearssl"
 BEARSSL_SRC = BEARSSL_DIR / "src"
 BEARSSL_INC = BEARSSL_DIR / "inc"
-TEST_INPUT_DIR = PROJECT_ROOT / "test_input"
-TEST_PACKAGES_DIR = PROJECT_ROOT / "test_packages"
+WORKSPACE = Workspace.from_env(repo_root=PROJECT_ROOT)
 
 # Stub C file providing all SMACK/ct-verif symbols as no-ops.
 # Compiled as a separate translation unit so all source files can link against it.
@@ -256,18 +257,18 @@ def _compile_and_run_native(harness_code, sources, build_dir, name):
 
 def _run_interpreter_subprocess(pkg_name):
     """Run the Rust interpreter subprocess. Returns True if a raw trace exists."""
-    pkg_dir = TEST_PACKAGES_DIR / f"{pkg_name}_pkg"
+    pkg_dir = WORKSPACE.target_paths(pkg_name).package
     if not pkg_dir.exists():
         return None
 
-    trace_dir = Path(f"positive_examples/{pkg_name}")
+    trace_dir = Workspace.from_env().target_paths(pkg_name).traces
     compact_files = list(trace_dir.glob("*.trace.raw.zst")) if trace_dir.exists() else []
     if compact_files:
         # Already have traces, no need to re-run
         return {"exists": True, "path": compact_files[0]}
 
     r = subprocess.run(
-        [sys.executable, "-m", "interpreter.runner", str(pkg_dir), "--engine", "native"],
+        [sys.executable, "-m", "interpreter.runner", str(pkg_dir)],
         capture_output=True, text=True, timeout=600,
         cwd=str(PROJECT_ROOT),
     )
@@ -287,7 +288,8 @@ class TestPkcsI15Native:
 
     @pytest.fixture(scope="class")
     def native_result(self, tmp_path_factory):
-        json_path = TEST_INPUT_DIR / "bearssl_test_pkcs1_i15" / "test_06_custom_vector.json"
+        json_path = (WORKSPACE.target_paths("bearssl_test_pkcs1_i15").inputs
+                     / "test_06_custom_vector.json")
         if not json_path.exists():
             pytest.skip("Test input not found")
         input_data = _parse_test_input(json_path)
@@ -326,7 +328,7 @@ class TestPkcsI15Interpreter:
             f"Interpreter should produce a raw trace (rc={result.get('returncode')})"
 
     def test_raw_trace_has_data(self):
-        trace_dir = Path("positive_examples/bearssl_test_pkcs1_i15")
+        trace_dir = Workspace.from_env().target_paths("bearssl_test_pkcs1_i15").traces
         trace_files = list(trace_dir.glob("*.trace.raw.zst")) if trace_dir.exists() else []
         if not trace_files:
             pytest.skip("No raw trace available")
@@ -340,7 +342,8 @@ class TestPkcsI15Consistency:
 
     @pytest.fixture(scope="class")
     def native_output(self, tmp_path_factory):
-        json_path = TEST_INPUT_DIR / "bearssl_test_pkcs1_i15" / "test_06_custom_vector.json"
+        json_path = (WORKSPACE.target_paths("bearssl_test_pkcs1_i15").inputs
+                     / "test_06_custom_vector.json")
         if not json_path.exists():
             pytest.skip("Test input not found")
         input_data = _parse_test_input(json_path)
@@ -359,7 +362,8 @@ class TestPkcsI15Consistency:
 
     def test_output_is_deterministic(self, tmp_path_factory):
         """Running native twice with same input produces same output."""
-        json_path = TEST_INPUT_DIR / "bearssl_test_pkcs1_i15" / "test_06_custom_vector.json"
+        json_path = (WORKSPACE.target_paths("bearssl_test_pkcs1_i15").inputs
+                     / "test_06_custom_vector.json")
         if not json_path.exists():
             pytest.skip("Test input not found")
         input_data = _parse_test_input(json_path)

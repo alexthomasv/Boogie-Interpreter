@@ -1,3 +1,5 @@
+import copy
+
 import pytest
 
 from interpreter.tests.helpers.boogie_cases import (
@@ -16,25 +18,37 @@ pytestmark = [pytest.mark.symbolic, pytest.mark.native]
 
 
 def _buffer_inputs(contents: str, size: int) -> ProgramInputs:
+    buffers = [{"contents": contents, "size": size}]
     return ProgramInputs(
         {
             "$p0": Input(
                 name="$p0",
                 private=False,
-                buffers=[{"contents": contents, "size": size}],
-            )
+                buffers=copy.deepcopy(buffers),
+            ),
+            "$p0.shadow": Input(
+                name="$p0.shadow",
+                private=False,
+                buffers=copy.deepcopy(buffers),
+            ),
         }
     )
 
 
 def _struct_inputs(value: str) -> ProgramInputs:
+    fields = [{"name": "tag", "size": 4, "value": value}]
     return ProgramInputs(
         {
             "$s": Input(
                 name="$s",
                 private=False,
-                struct=[{"name": "tag", "size": 4, "value": value}],
-            )
+                struct=copy.deepcopy(fields),
+            ),
+            "$s.shadow": Input(
+                name="$s.shadow",
+                private=False,
+                struct=copy.deepcopy(fields),
+            ),
         }
     )
 

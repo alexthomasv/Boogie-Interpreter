@@ -21,7 +21,8 @@ def write_input_file(program_inputs: ProgramInputs, params_line: str = "") -> st
     Args:
         program_inputs: the inputs to serialize
         params_line: the original '// @params ...' line from the seed;
-                     if empty, one is auto-generated from the variable names.
+                     if present, its Boogie-name order is preserved and the
+                     C-name side is regenerated to match emitted declarations.
     """
     lines: list[str] = []
 
@@ -45,10 +46,10 @@ def write_input_file(program_inputs: ProgramInputs, params_line: str = "") -> st
     for name, inp in public:
         lines.extend(_format_input(_c_name(name), inp))
 
-    if private:
+    for name, inp in private:
+        # The parser consumes @private for exactly one declaration.
         lines.append("// @private")
-        for name, inp in private:
-            lines.extend(_format_input(_c_name(name), inp))
+        lines.extend(_format_input(_c_name(name), inp))
 
     return "\n".join(lines) + "\n"
 
@@ -59,16 +60,18 @@ def _c_name(bpl_name: str) -> str:
 
 
 def _params_with_missing(params_line: str, variables: dict[str, Input]) -> str:
-    mapped = set()
+    ordered: list[str] = []
+    seen = set()
     for pair in params_line.removeprefix("//").split():
         if ":" in pair:
             _c_name_part, bpl_name = pair.split(":", 1)
-            mapped.add(bpl_name.strip())
-    missing = [name for name in variables if name not in mapped]
-    if not missing:
-        return params_line
-    suffix = " ".join(f"{_c_name(name)}:{name}" for name in missing)
-    return f"{params_line.rstrip()} {suffix}"
+            name = bpl_name.strip()
+            if name in variables and name not in seen:
+                ordered.append(name)
+                seen.add(name)
+    ordered.extend(name for name in variables if name not in seen)
+    pairs = " ".join(f"{_c_name(name)}:{name}" for name in ordered)
+    return f"// @params {pairs}"
 
 
 def _format_input(c_name: str, inp: Input) -> list[str]:

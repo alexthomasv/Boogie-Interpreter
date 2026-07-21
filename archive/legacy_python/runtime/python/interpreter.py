@@ -17,10 +17,14 @@ from interpreter.parser.declaration import (
 )
 from interpreter.parser.type import MapType
 from collections import defaultdict
-from interpreter.python.Environment import Environment
-from interpreter.python.MemoryMap import MemoryMap
-from interpreter.python.Buffer import ReadBuffer
-from interpreter.utils.utils import *
+from .Environment import Environment
+from .MemoryMap import MemoryMap
+from .Buffer import ReadBuffer
+from interpreter.utils.bitops import *
+from interpreter.utils.inputs import *
+from interpreter.utils.program import *
+from interpreter.utils.state_io import *
+from interpreter.utils.indent_log import *
 from interpreter.utils.inputs import ProgramInputs
 from interpreter.utils.debug_log import DebugLogger
 import pickle

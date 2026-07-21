@@ -1,0 +1,4 @@
+# file: /home/ubuntu/boogie-parser/interpreter/parser/scope.py
+# hypothesis_version: 6.151.9
+
+['_lookup_table', 'function', 'label', 'procedure', 'storage', 'type']

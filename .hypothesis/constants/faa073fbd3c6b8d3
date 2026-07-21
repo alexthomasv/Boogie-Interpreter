@@ -1,0 +1,4 @@
+# file: /home/ubuntu/boogie-parser/interpreter/utils/debug_log.py
+# hypothesis_version: 6.151.9
+
+[4096, '%Y%m%d_%H%M%S', ',', ':', 'DebugLogger', 'SWOOSH_DEBUG_LOG', 'SWOOSH_DEBUG_RUN_ID', '__truncated_items__', 'a', 'all', 'branch', 'candidate', 'category', 'debug', 'event', 'exec', 'input', 'mem', 'pid', 'run', 'run_id', 'schema_version', 'solver', 'trace', 'ts_ns', 'unsupported', 'utf-8']

@@ -1,34 +1,50 @@
 """Redis state serialization: get/put for State, COI, and DataFlow objects."""
 
 import pickle
-import hashlib
 import zlib
 from functools import lru_cache
 
+
+def _key_mints():
+    """The wire-frozen proof-state key mints, resolved lazily.
+
+    Minted ONCE in ``src.state.state_store`` so the spelling cannot fork
+    between this hot path and the driver/StateCache deleters/maskers.
+    Lazy for the same reason ``cached_proof_obligation_id`` lazily imports
+    persistence: ``src.state`` package init reaches back into
+    ``interpreter.utils`` (cvc5 serde), so a module-level import here is a
+    cycle. The module is cached after the first call — per-call cost is a
+    dict lookup, noise against the Redis round-trip these keys gate.
+    """
+    from src.state.state_store import (
+        coi_key_name, state_key_from_id, state_serialized_key_name)
+    return state_key_from_id, coi_key_name, state_serialized_key_name
+
 __all__ = [
-    '_cached_sha256',
-    'get_state', 'get_state_batch', 'get_state_only', 'get_state_raw',
-    'put_state', 'create_df_key', 'put_df', 'get_df',
-    'find_unpicklable',
+    'cached_proof_obligation_id',
+    'get_state', 'get_state_batch', 'get_state_only', 'put_state',
 ]
 
 
 @lru_cache(maxsize=10000)
-def _cached_sha256(data: bytes) -> str:
-    try:
-        from src.state.persistence import obligation_fingerprint
+def cached_proof_obligation_id(data: bytes) -> str:
+    """proof_obligation_id for already-serialized obligation bytes (cached).
 
-        return obligation_fingerprint(data)
-    except Exception:
-        pass
-    return hashlib.sha256(data).hexdigest()
+    This is THE state-key digest — a term-canonical hash over (pc, predicate).
+    No raw-sha256 fallback: it would diverge from the canonical key for the
+    same obligation (RISK B). Malformed bytes raise.
+    """
+    from src.state.persistence import proof_obligation_id
+
+    return proof_obligation_id(data)
 
 
 def get_state(serialized_state_key: bytes, state_cache):
-    sha256_hex = _cached_sha256(serialized_state_key)
+    state_key_from_id, coi_key_name, _ = _key_mints()
+    proof_obligation_id = cached_proof_obligation_id(serialized_state_key)
     pipe = state_cache.redis_runtime.pipeline()
-    pipe.get(f"state_key_{sha256_hex}")
-    pipe.get(f"coi_key_{sha256_hex}")
+    pipe.get(state_key_from_id(proof_obligation_id))
+    pipe.get(coi_key_name(proof_obligation_id))
     serialized_state, serialized_coi = pipe.execute()
     if serialized_state:
         state = pickle.loads(zlib.decompress(serialized_state))
@@ -51,12 +67,13 @@ def get_state_batch(serialized_keys, state_cache):
     """
     if not serialized_keys:
         return {}
+    state_key_from_id, coi_key_name, _ = _key_mints()
     keys = list(serialized_keys)
-    hashes = [_cached_sha256(k) for k in keys]
+    proof_obligation_ids = [cached_proof_obligation_id(k) for k in keys]
     pipe = state_cache.redis_runtime.pipeline()
-    for h in hashes:
-        pipe.get(f"state_key_{h}")
-        pipe.get(f"coi_key_{h}")
+    for h in proof_obligation_ids:
+        pipe.get(state_key_from_id(h))
+        pipe.get(coi_key_name(h))
     raw = pipe.execute()
     out = {}
     for i, key in enumerate(keys):
@@ -75,21 +92,11 @@ def get_state_batch(serialized_keys, state_cache):
 
 
 def get_state_only(serialized_state_key: bytes, state_cache):
-    sha256_hex = _cached_sha256(serialized_state_key)
-    serialized_state = state_cache.redis_runtime.get(f"state_key_{sha256_hex}")
+    state_key_from_id, _, _ = _key_mints()
+    proof_obligation_id = cached_proof_obligation_id(serialized_state_key)
+    serialized_state = state_cache.redis_runtime.get(state_key_from_id(proof_obligation_id))
     if serialized_state:
         state = pickle.loads(zlib.decompress(serialized_state))
-        return state
-    else:
-        return None
-
-
-def get_state_raw(redis_key: str, state_cache):
-    serialized_state = state_cache.redis_runtime.get(redis_key)
-    if serialized_state:
-        state = pickle.loads(zlib.decompress(serialized_state))
-        if state.iterator:
-            state.iterator.deserialize(state_cache)
         return state
     else:
         return None
@@ -103,40 +110,20 @@ def put_state(serialized_state_key: bytes, state, state_cache):
         import traceback
         print(f"Error serializing COI: {e}")
         traceback.print_exc()
-        find_unpicklable(state.iterator)
+        _find_unpicklable(state.iterator)
         raise
-    sha256_hex = _cached_sha256(serialized_state_key)
+    state_key_from_id, coi_key_name, state_serialized_key_name = _key_mints()
+    proof_obligation_id = cached_proof_obligation_id(serialized_state_key)
     compressed_state = zlib.compress(serialized_state)
     compressed_coi = zlib.compress(serialized_coi)
     pipe = state_cache.redis_runtime.pipeline()
-    pipe.set(f"state_key_{sha256_hex}", compressed_state)
-    pipe.set(f"coi_key_{sha256_hex}", compressed_coi)
+    pipe.set(state_key_from_id(proof_obligation_id), compressed_state)
+    pipe.set(state_serialized_key_name(proof_obligation_id), serialized_state_key)
+    pipe.set(coi_key_name(proof_obligation_id), compressed_coi)
     pipe.execute()
 
 
-def create_df_key(target_serialized, serialized_key):
-    sha256_hex_target = _cached_sha256(target_serialized)
-    sha256_hex_key = _cached_sha256(serialized_key)
-    return f"df_key_{sha256_hex_target}_{sha256_hex_key}"
-
-
-def put_df(df, df_serialized_key, state_cache):
-    serialized_df = pickle.dumps(df)
-    compressed_df = zlib.compress(serialized_df)
-    state_cache.redis_runtime.set(df_serialized_key, compressed_df)
-
-
-def get_df(df_serialized_key, state_cache):
-    compressed_df = state_cache.redis_runtime.get(df_serialized_key)
-    if compressed_df:
-        df = pickle.loads(zlib.decompress(compressed_df))
-        df.deserialize(state_cache)
-        return df
-    else:
-        return None
-
-
-def find_unpicklable(obj, path="root", _visited=None, _depth=0):
+def _find_unpicklable(obj, path="root", _visited=None, _depth=0):
     """Recursively search for unpicklable objects (e.g. live cvc5 Terms)."""
     if _depth > 30:
         return
@@ -147,8 +134,8 @@ def find_unpicklable(obj, path="root", _visited=None, _depth=0):
         return
     _visited.add(obj_id)
 
-    from interpreter.utils.utils_cvc5 import HollowCvc5Term
-    if isinstance(obj, HollowCvc5Term):
+    from interpreter.utils.cvc5_serde import SerializedCvc5TermV2
+    if isinstance(obj, SerializedCvc5TermV2):
         print(f"FOUND CULPRIT at {path}: {type(obj)} -> {obj}")
         return
 
@@ -161,10 +148,10 @@ def find_unpicklable(obj, path="root", _visited=None, _depth=0):
 
     if isinstance(obj, dict):
         for k, v in obj.items():
-            find_unpicklable(v, f"{path}['{k}']", _visited, _depth + 1)
+            _find_unpicklable(v, f"{path}['{k}']", _visited, _depth + 1)
     elif isinstance(obj, (list, tuple)):
         for i, v in enumerate(obj):
-            find_unpicklable(v, f"{path}[{i}]", _visited, _depth + 1)
+            _find_unpicklable(v, f"{path}[{i}]", _visited, _depth + 1)
     elif hasattr(obj, "__dict__"):
         for k, v in obj.__dict__.items():
-            find_unpicklable(v, f"{path}.{k}", _visited, _depth + 1)
+            _find_unpicklable(v, f"{path}.{k}", _visited, _depth + 1)

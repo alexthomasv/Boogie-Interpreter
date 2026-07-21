@@ -1,0 +1,4 @@
+# file: /home/ubuntu/boogie-parser/interpreter/parser/expression.py
+# hypothesis_version: 6.151.9
+
+['!=', '%', '&&', '*', '+', '++', ', ', '-', '/', '<', '<:', '<=', '<==>', '==', '==>', '>', '>=', 'Boolean', 'Integer', 'arguments', 'condition', 'else_', 'expression', 'expressions', 'function', 'indexes', 'lhs', 'map', 'name', 'op', 'quantifier', 'return_type', 'rhs', 'then', 'triggers', 'type', 'type_arguments', 'value', 'variables', '||']

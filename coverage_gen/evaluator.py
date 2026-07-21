@@ -36,12 +36,14 @@ def _alarm(seconds: int):
 class EvaluationResult:
     covered: set
     status: str = "ok"
+    covered_edges: tuple[tuple[str, str], ...] = ()
     block_sequence: tuple[str, ...] = ()
     violation_pc: Optional[int] = None
     violation_block: Optional[str] = None
     message: Optional[str] = None
     invalid_input: bool = False
     invalid_reason: Optional[str] = None
+    invalid_detail: Optional[str] = None
 
 
 DEFAULT_MAX_STEPS_PER_INPUT = 100_000_000
@@ -51,7 +53,6 @@ class Evaluator:
     """Run the Boogie interpreter on a ProgramInputs and return block coverage."""
 
     def __init__(self, program, test_name: str, timeout: int = 30,
-                 engine: str = "native",
                  max_steps_per_input: int = DEFAULT_MAX_STEPS_PER_INPUT,
                  debug_logger=None):
         self.program = program
@@ -60,9 +61,6 @@ class Evaluator:
             component="coverage-evaluator", test_name=test_name)
         self.timeout = timeout
         self.max_steps_per_input = max(0, int(max_steps_per_input or 0))
-        self.engine_requested = engine
-        self.engine = engine
-        self.native_fallback_reason = None
         self.runs = 0
         self.timeouts = 0
         self.errors = 0
@@ -79,10 +77,6 @@ class Evaluator:
             Path(tempfile.gettempdir()) / "swoosh-gen-input" / test_name
         )
 
-        if engine != "native":
-            raise ValueError(
-                "Coverage evaluator is Rust-only; the Python engine is archived."
-            )
         from interpreter.runner import prepare_native
 
         self._prepared = prepare_native(program)
@@ -106,7 +100,7 @@ class Evaluator:
         """Execute program_inputs and return coverage plus stop status."""
         self.runs += 1
         self.debug.event("candidate", "evaluation_start",
-                         input_name=input_name, engine=self.engine,
+                         input_name=input_name,
                          run_index=self.runs,
                          timeout=self.timeout,
                          max_steps=self.max_steps_per_input)
@@ -124,6 +118,7 @@ class Evaluator:
                     violation_pc=result.violation_pc,
                     violation_block=result.violation_block,
                     message=result.message,
+                    invalid_detail=result.invalid_detail,
                 )
                 return result
         except TimeoutError:
@@ -166,30 +161,28 @@ class Evaluator:
         explored = run_native(
             self.program,
             program_inputs,
-            self.test_name,
             input_name,
             raw_log_path=raw_log_path,
-            extra_data=program_inputs.extra_data,
             log_read=False,
-            compiled=self._compiled,
             prepared=self._prepared,
             no_trace=True,
             return_status=True,
             return_memory_summary=False,
-            validate_handoff=False,
             quiet=True,
             max_steps=self.max_steps_per_input,
-            debug_logger=self.debug.bind(input_name=input_name, engine="native"),
+            debug_logger=self.debug.bind(input_name=input_name),
         )
         return EvaluationResult(
             set(explored.get("explored_blocks") or []),
             status=explored.get("status", "ok"),
+            covered_edges=tuple(sorted(explored.get("explored_edges") or ())),
             block_sequence=tuple(explored.get("block_sequence") or ()),
             violation_pc=explored.get("violation_pc"),
             violation_block=explored.get("violation_block"),
             message=explored.get("message"),
             invalid_input=bool(explored.get("invalid_input", False)),
             invalid_reason=explored.get("invalid_reason"),
+            invalid_detail=explored.get("invalid_detail"),
         )
 
     def concolic_suggest(self, program_inputs: ProgramInputs, input_name: str,

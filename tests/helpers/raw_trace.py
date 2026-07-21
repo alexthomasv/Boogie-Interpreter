@@ -14,13 +14,14 @@ def raw_trace_summary(path: Path) -> dict:
         data = reader.read()
 
     assert data[:4] == b"SWRL"
-    assert data[4] in (1, 2)
+    assert data[4] in (1, 2, 3)
     offset = 5
     var_names, offset = _read_name_table(data, offset)
     block_names, offset = _read_name_table(data, offset)
     records = data[offset:]
     assert len(records) % RAW_TRACE_RECORD_SIZE == 0
     return {
+        "version": data[4],
         "var_names": var_names,
         "block_names": block_names,
         "record_count": len(records) // RAW_TRACE_RECORD_SIZE,

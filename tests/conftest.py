@@ -48,7 +48,9 @@ def project_root():
 
 def available_benchmarks():
     """Return list of available benchmark names that have compiled packages."""
-    pkg_dir = PARENT / "test_packages"
+    from swoosh_cli.workspace import Workspace
+    workspace = Workspace.from_env(repo_root=PARENT)
+    pkg_dir = workspace.package_root
     if not pkg_dir.exists():
         return []
     benchmarks = []
@@ -56,7 +58,7 @@ def available_benchmarks():
         if pkg.is_dir() and pkg.name.endswith("_pkg"):
             name = pkg.name.removesuffix("_pkg")
             pkl = pkg / f"{name}.pkl"
-            input_dir = PARENT / "test_input" / name
+            input_dir = workspace.target_paths(name).inputs
             if pkl.exists() and input_dir.exists() and list(input_dir.glob("*.input")):
                 benchmarks.append(name)
     return benchmarks
@@ -70,9 +72,11 @@ def benchmark_name(request):
 @pytest.fixture
 def benchmark_data(benchmark_name):
     """Load program and first input for a benchmark."""
-    pkg_dir = PARENT / "test_packages" / f"{benchmark_name}_pkg"
+    from swoosh_cli.workspace import Workspace
+    paths = Workspace.from_env(repo_root=PARENT).target_paths(benchmark_name)
+    pkg_dir = paths.package
     pkl_path = pkg_dir / f"{benchmark_name}.pkl"
-    input_dir = PARENT / "test_input" / benchmark_name
+    input_dir = paths.inputs
     input_file = sorted(input_dir.glob("*.input"))[0]
 
     with open(pkl_path, "rb") as f:

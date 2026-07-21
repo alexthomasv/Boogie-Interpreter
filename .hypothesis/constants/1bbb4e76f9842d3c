@@ -1,0 +1,4 @@
+# file: /home/ubuntu/boogie-parser/swoosh_logging.py
+# hypothesis_version: 6.151.9
+
+['%(message)s', '%Y%m%d_%H%M%S', 'INFO', 'SWOOSH_LOG_LEVEL', 'SWOOSH_RUN_DIR', 'a', 'driver.log', 'error_logs', 'error_tree.log', 'latest', 'runs', 'swoosh', 'w']

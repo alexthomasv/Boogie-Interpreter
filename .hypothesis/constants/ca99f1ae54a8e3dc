@@ -1,0 +1,4 @@
+# file: /home/ubuntu/boogie-parser/interpreter/python/Buffer.py
+# hypothesis_version: 6.151.9
+
+['_buf', '_pos']

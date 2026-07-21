@@ -1,0 +1,522 @@
+feature:
+  name: boogie-interpreter-audit
+  description: "Bug fixes and optimizations for Rust native Boogie interpreter bitvector operations"
+
+specifications:
+  # ============================================================================
+  # TIER 1: FEATURE-LEVEL SPECIFICATION
+  # ============================================================================
+  - annotation:
+      type: feature
+      tag: feature.boogie_interpreter_audit
+      text: "Verify and fix Boogie interpreter bitvector operations against SMT-LIB 2.6 specification"
+      acceptance_criteria:
+        - "Given division by zero in Udiv, when executed, then return all-ones (mask)"
+        - "Given division by zero in Sdiv, when executed, then return all-ones (mask)"
+        - "Given negative dividend in Sdiv, when divided, then use truncated division"
+        - "Given any bit width in Ashr, when shifting, then correctly sign-extend"
+        - "Given division by zero in Srem, when executed, then return dividend"
+        - "Given variable lookup in execute(), when called, then O(1) HashMap"
+      scope:
+        in:
+          - "native/src/builtins.rs"
+          - "native/src/lib.rs"
+        out:
+          - "utils/bitops.py"
+          - "trace accumulation"
+          - "lowering/AST parsing"
+      examples:
+        success:
+          - description: "Udiv by zero returns all-ones"
+            input: { a: 0x12345678, b: 0, bits: 32 }
+            output: { result: 0xFFFFFFFF }
+          - description: "Sdiv truncates toward zero"
+            input: { a: -8, b: 3, bits: 32 }
+            output: { result: -2 }
+          - description: "Ashr sign extends correctly"
+            input: { a: 0x80, b: 1, bits: 8 }
+            output: { result: 0xC0 }
+        failure:
+          - description: "Division by zero panic"
+            input: { a: 5, b: 0, operation: "udiv" }
+            error: { type: "panic", message: "division by zero" }
+      performance:
+        lookup_complexity: "O(1)"
+    status: implemented
+
+  # ============================================================================
+  # TIER 3: FUNCTION-LEVEL SPECIFICATIONS
+  # ============================================================================
+
+  # --------------------------------------------------------------------------
+  # Bug 1: Udiv Division by Zero
+  # --------------------------------------------------------------------------
+  - annotation:
+      type: function_signature
+      tag: builtins.udiv
+      signature:
+        name: "exec_binary::Udiv"
+        params:
+          - name: a
+            type: i64
+            description: "Dividend"
+          - name: b
+            type: i64
+            description: "Divisor"
+          - name: bits
+            type: u8
+            description: "Bit width (8, 16, 32, or 64)"
+        returns:
+          type: "(i64, bool)"
+          description: "Result masked to bit width, false for non-bool"
+      location:
+        file: native/src/builtins.rs
+        line: 187
+    status: implemented
+
+  - annotation:
+      type: requires
+      tag: udiv.valid_width
+      text: "bits must be in {8, 16, 32, 64}"
+      target: builtins.udiv
+      examples:
+        valid:
+          - value: 32
+            why: "Standard 32-bit width"
+        invalid:
+          - value: 7
+            why: "Not a supported bit width"
+            error: "unreachable"
+      location:
+        file: native/src/builtins.rs
+    status: implemented
+
+  - annotation:
+      type: ensures
+      tag: udiv.zero_divisor
+      text: "When divisor is zero, returns all-ones (mask for bit width)"
+      expr: "b == 0 => result == mask(bits)"
+      target: builtins.udiv
+      location:
+        file: native/src/builtins.rs
+    status: implemented
+
+  - annotation:
+      type: never
+      tag: udiv.panic_on_zero
+      text: "NEVER panic on division by zero"
+      category: silent_failure
+      rationale: "SMT-LIB defines bvudiv(x, 0) = all-ones, not undefined"
+      target: builtins.udiv
+      violation_examples:
+        - code: "(a as u64 & m) / (b as u64 & m)"
+          problem: "Panics when b == 0 without guard"
+      location:
+        file: native/src/builtins.rs
+    status: implemented
+
+  # --------------------------------------------------------------------------
+  # Bug 2: Sdiv Division Semantics
+  # --------------------------------------------------------------------------
+  - annotation:
+      type: function_signature
+      tag: builtins.sdiv
+      signature:
+        name: "exec_binary::Sdiv"
+        params:
+          - name: a
+            type: i64
+            description: "Signed dividend"
+          - name: b
+            type: i64
+            description: "Signed divisor"
+          - name: bits
+            type: u8
+            description: "Bit width"
+        returns:
+          type: "(i64, bool)"
+          description: "Signed result masked to bit width"
+      location:
+        file: native/src/builtins.rs
+        line: 194
+    status: implemented
+
+  - annotation:
+      type: ensures
+      tag: sdiv.zero_divisor
+      text: "When divisor is zero, returns all-ones (as signed: -1)"
+      expr: "sy == 0 => result == mask(bits)"
+      target: builtins.sdiv
+      location:
+        file: native/src/builtins.rs
+    status: implemented
+
+  - annotation:
+      type: ensures
+      tag: sdiv.truncated_division
+      text: "Uses truncated division (toward zero), not floor division"
+      expr: "sdiv(-8, 3) == -2, not -3"
+      target: builtins.sdiv
+      location:
+        file: native/src/builtins.rs
+    status: implemented
+
+  - annotation:
+      type: never
+      tag: sdiv.floor_division
+      text: "NEVER use floor division semantics"
+      category: state_corruption
+      rationale: "SMT-LIB bvsdiv uses truncated division; floor division gives different results for negative dividends"
+      target: builtins.sdiv
+      violation_examples:
+        - code: "sx.div_floor(sy)"
+          problem: "Floor division rounds toward -infinity, not zero"
+      location:
+        file: native/src/builtins.rs
+    status: implemented
+
+  - annotation:
+      type: never
+      tag: sdiv.panic_on_zero
+      text: "NEVER panic on division by zero"
+      category: silent_failure
+      rationale: "SMT-LIB defines bvsdiv(x, 0) = all-ones"
+      target: builtins.sdiv
+      violation_examples:
+        - code: "sx / sy"
+          problem: "Panics when sy == 0 without guard"
+      location:
+        file: native/src/builtins.rs
+    status: implemented
+
+  # --------------------------------------------------------------------------
+  # Bug 3: Ashr Generalization
+  # --------------------------------------------------------------------------
+  - annotation:
+      type: function_signature
+      tag: builtins.ashr
+      signature:
+        name: "exec_binary::Ashr"
+        params:
+          - name: a
+            type: i64
+            description: "Value to shift"
+          - name: b
+            type: i64
+            description: "Shift amount"
+          - name: bits
+            type: u8
+            description: "Bit width"
+        returns:
+          type: "(i64, bool)"
+          description: "Arithmetically shifted result"
+      location:
+        file: native/src/builtins.rs
+        line: 93
+    status: implemented
+
+  - annotation:
+      type: ensures
+      tag: ashr.sign_extension
+      text: "For negative values, high bits filled with 1s (sign extension)"
+      target: builtins.ashr
+      location:
+        file: native/src/builtins.rs
+    status: implemented
+
+  - annotation:
+      type: ensures
+      tag: ashr.generic_width
+      text: "Works correctly for all bit widths (8, 16, 32, 64), not just 32 and 64"
+      target: builtins.ashr
+      location:
+        file: native/src/builtins.rs
+    status: implemented
+
+  - annotation:
+      type: never
+      tag: ashr.hardcoded_widths
+      text: "NEVER have separate code paths only for 32 and 64 bit widths"
+      category: state_corruption
+      rationale: "8-bit and 16-bit ashr would fail silently with incorrect results"
+      target: builtins.ashr
+      violation_examples:
+        - code: "if bits == 32 { ... } else { /* assume 64 */ ... }"
+          problem: "8-bit and 16-bit widths take 64-bit path, giving wrong sign extension"
+      location:
+        file: native/src/builtins.rs
+    status: implemented
+
+  # --------------------------------------------------------------------------
+  # Bug 4: Shift Amount Masking (Note: Not actually a bug for power-of-2)
+  # --------------------------------------------------------------------------
+  - annotation:
+      type: ensures
+      tag: shift.amount_mask
+      text: "Shift amount is reduced modulo bit width"
+      expr: "actual_shift = b % bits"
+      target: builtins.shl
+      location:
+        file: native/src/builtins.rs
+    status: implemented
+
+  - annotation:
+      type: compatibility
+      tag: shift.bits_minus_one_equivalence
+      text: "For power-of-2 bit widths, (b & (bits-1)) == (b % bits)"
+      existing_spec: shift.amount_mask
+      new_spec: shift.current_implementation
+      relationship: independent
+      breaking_changes: []
+      migration: []
+    status: verified
+
+  # --------------------------------------------------------------------------
+  # Bug 5: Srem Division by Zero
+  # --------------------------------------------------------------------------
+  - annotation:
+      type: ensures
+      tag: urem.zero_divisor
+      text: "When divisor is zero, returns the dividend unchanged"
+      expr: "b == 0 => result == a"
+      target: builtins.urem
+      location:
+        file: native/src/builtins.rs
+    status: implemented
+
+  - annotation:
+      type: function_signature
+      tag: builtins.srem
+      signature:
+        name: "exec_binary::Srem"
+        params:
+          - name: a
+            type: i64
+            description: "Dividend"
+          - name: b
+            type: i64
+            description: "Divisor"
+          - name: bits
+            type: u8
+            description: "Bit width"
+        returns:
+          type: "(i64, bool)"
+          description: "Signed remainder"
+      location:
+        file: native/src/builtins.rs
+        line: 207
+    status: implemented
+
+  - annotation:
+      type: ensures
+      tag: srem.zero_divisor
+      text: "When divisor is zero, returns the dividend unchanged"
+      expr: "sy == 0 => result == sx"
+      target: builtins.srem
+      location:
+        file: native/src/builtins.rs
+    status: implemented
+
+  - annotation:
+      type: never
+      tag: srem.return_zero_on_zero_divisor
+      text: "NEVER return 0 when divisor is zero"
+      category: state_corruption
+      rationale: "SMT-LIB bvsrem(x, 0) = x, not 0"
+      target: builtins.srem
+      violation_examples:
+        - code: "let q = if sy == 0 { 0 } else { sx / sy };"
+          problem: "When sy == 0, q = 0, so r = sx - 0 * 0 = sx, but current code returns 0"
+      location:
+        file: native/src/builtins.rs
+    status: implemented
+
+  # --------------------------------------------------------------------------
+  # Optimization 1: Variable Lookup
+  # --------------------------------------------------------------------------
+  - annotation:
+      type: function_signature
+      tag: lib.var_lookup
+      signature:
+        name: "execute::var_lookup"
+        params:
+          - name: name
+            type: String
+            description: "Variable name to look up"
+        returns:
+          type: "Option<VarId>"
+          description: "Variable ID if found"
+      location:
+        file: native/src/lib.rs
+        line: 77
+    status: implemented
+
+  - annotation:
+      type: ensures
+      tag: var_lookup.constant_time
+      text: "Lookup is O(1) via HashMap, not O(n) linear scan"
+      target: lib.var_lookup
+      location:
+        file: native/src/lib.rs
+    status: implemented
+
+  - annotation:
+      type: never
+      tag: var_lookup.linear_scan
+      text: "NEVER use linear scan through var_names"
+      category: side_effect
+      rationale: "O(n) lookup for each variable access causes quadratic slowdown"
+      target: lib.var_lookup
+      violation_examples:
+        - code: "program.var_names.iter().position(|n| n == &name)"
+          problem: "Linear scan is O(n), should be O(1) HashMap lookup"
+      location:
+        file: native/src/lib.rs
+    status: implemented
+
+  # --------------------------------------------------------------------------
+  # Optimization 2: Block Lookup
+  # --------------------------------------------------------------------------
+  - annotation:
+      type: function_signature
+      tag: lib.block_lookup
+      signature:
+        name: "execute::block_lookup"
+        params:
+          - name: name
+            type: String
+            description: "Block name to look up"
+        returns:
+          type: "Option<BlockId>"
+          description: "Block ID if found"
+      location:
+        file: native/src/lib.rs
+        line: 114
+    status: implemented
+
+  - annotation:
+      type: ensures
+      tag: block_lookup.constant_time
+      text: "Lookup is O(1) via HashMap"
+      target: lib.block_lookup
+      location:
+        file: native/src/lib.rs
+    status: implemented
+
+  - annotation:
+      type: never
+      tag: block_lookup.linear_scan
+      text: "NEVER iterate through blocks list to find by name"
+      category: side_effect
+      rationale: "O(n) lookup per block access"
+      target: lib.block_lookup
+      violation_examples:
+        - code: "program.blocks.iter().map(|b| b.name.clone()).collect()"
+          problem: "Collects all names just to find one"
+      location:
+        file: native/src/lib.rs
+    status: implemented
+
+  # ============================================================================
+  # TIER 4: COMPOSITIONAL SPECIFICATIONS
+  # ============================================================================
+  - annotation:
+      type: composition
+      tag: bitvector_ops_composition
+      text: "All bitvector operations comply with SMT-LIB 2.6 FixedSizeBitVectors theory"
+      composes:
+        - udiv.zero_divisor
+        - sdiv.zero_divisor
+        - sdiv.truncated_division
+        - ashr.sign_extension
+        - ashr.generic_width
+        - srem.zero_divisor
+      achieves: feature.boogie_interpreter_audit
+      data_flow: |
+        1. Boogie source parsed to AST
+        2. AST lowered to bytecode via lowering.rs
+        3. Bytecode executed by VM (vm.rs)
+        4. Bitvector ops dispatched to builtins.rs
+        5. Results must match SMT-LIB semantics
+    status: implemented
+
+  # ============================================================================
+  # TEST SPECIFICATIONS
+  # ============================================================================
+  - annotation:
+      type: test_spec
+      tag: test.udiv_zero
+      category: unit
+      given:
+        - "Udiv operation with divisor = 0"
+      when: "exec_binary(Udiv{bits: 32}, 0x12345678, 0)"
+      then:
+        - "Returns (0xFFFFFFFF, false)"
+        - "Does not panic"
+      verifies:
+        - udiv.zero_divisor
+        - udiv.panic_on_zero
+    status: implemented
+
+  - annotation:
+      type: test_spec
+      tag: test.sdiv_truncation
+      category: unit
+      given:
+        - "Sdiv with negative dividend and positive divisor"
+      when: "exec_binary(Sdiv{bits: 32}, -8, 3)"
+      then:
+        - "Returns (-2, false)"
+        - "NOT (-3, false) which would be floor division"
+      verifies:
+        - sdiv.truncated_division
+    status: implemented
+
+  - annotation:
+      type: test_spec
+      tag: test.ashr_8bit
+      category: unit
+      given:
+        - "Ashr with 8-bit negative value"
+      when: "exec_binary(Ashr{bits: 8}, 0x80, 1)"
+      then:
+        - "Returns (0xC0, false)"
+        - "Sign bit is extended"
+      verifies:
+        - ashr.sign_extension
+        - ashr.generic_width
+    status: implemented
+
+  - annotation:
+      type: test_spec
+      tag: test.srem_zero
+      category: unit
+      given:
+        - "Srem with divisor = 0"
+      when: "exec_binary(Srem{bits: 32}, 5, 0)"
+      then:
+        - "Returns (5, false)"
+        - "Returns dividend, not 0"
+      verifies:
+        - srem.zero_divisor
+        - srem.return_zero_on_zero_divisor
+    status: implemented
+
+compositionality:
+  vertical:
+    status: pass
+    gaps: []
+  horizontal:
+    status: pass
+    issues: []
+  compatibility:
+    status: pass
+    conflicts: []
+
+metadata:
+  generated_by: aretta-plan
+  timestamp: "2026-03-08T00:00:00Z"
+  user_confirmed: true
+  references:
+    - "SMT-LIB 2.6 Theory of FixedSizeBitVectors"
+    - "http://smtlib.cs.uiowa.edu/theories-FixedSizeBitVectors.shtml"

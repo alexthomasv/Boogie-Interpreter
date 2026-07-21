@@ -37,6 +37,29 @@ _SIG_RE = re.compile(
 )
 
 
+def _benchmark_path_score(path, benchmark_name):
+    """Rank same-entrypoint harnesses using stable target-name fragments."""
+    if not benchmark_name:
+        return 0
+    path_text = str(path).lower()
+    tokens = {
+        token
+        for token in re.split(r"[^a-z0-9]+", benchmark_name.lower())
+        if len(token) >= 2 and token not in {"bearssl", "test"}
+    }
+    return sum(len(token) for token in tokens if token in path_text)
+
+
+def _examples_dir_for_package(pkg_path):
+    """Resolve the repository examples directory from legacy or v2 packages."""
+    path = Path(pkg_path).resolve()
+    for parent in (path, *path.parents):
+        candidate = parent / "examples"
+        if candidate.is_dir():
+            return candidate
+    return path.parent.parent / "examples"
+
+
 def _find_c_harness(entry_point_name, examples_dir, benchmark_name=None):
     """Find the C file containing the entry point wrapper function.
 
@@ -56,6 +79,7 @@ def _find_c_harness(entry_point_name, examples_dir, benchmark_name=None):
     roots.append(examples)
 
     seen = set()
+    matches = []
     for root in roots:
         for c_file in sorted(root.rglob("*.c")):
             if c_file in seen:
@@ -67,8 +91,29 @@ def _find_c_harness(entry_point_name, examples_dir, benchmark_name=None):
                 continue
             # Look for the function definition
             if re.search(rf'\b{re.escape(entry_point_name)}\s*\(', text):
-                return c_file
-    return None
+                matches.append(c_file)
+    if not matches:
+        return None
+    return min(
+        matches,
+        key=lambda path: (
+            -_benchmark_path_score(path, benchmark_name),
+            str(path),
+        ),
+    )
+
+
+def _find_package_harness(
+    pkg_path, entry_point_name, benchmark_name, *, source_root=None
+):
+    """Find a harness using an exact manifest root or legacy package layout."""
+    if source_root is not None:
+        return _find_c_harness(entry_point_name, Path(source_root))
+    return _find_c_harness(
+        entry_point_name,
+        _examples_dir_for_package(pkg_path),
+        benchmark_name=benchmark_name,
+    )
 
 def _parse_c_harness(c_file, entry_point_name):
     """Parse a C harness file to extract parameter info and SMACK annotations.
@@ -367,6 +412,25 @@ def _safe_c_name(name):
     return out
 
 
+def _template_params_map(json_template, c_name_order):
+    """Map rendered identifiers to BPL inputs without comment-derived aliases."""
+    params = []
+    used = set()
+    for index, entry in enumerate(json_template):
+        bpl_name = entry['var']
+        preferred = (
+            c_name_order[index]
+            if index < len(c_name_order)
+            else _safe_c_name(bpl_name)
+        )
+        c_name = _safe_c_name(preferred)
+        if c_name in used:
+            c_name = f"{c_name}_{index}"
+        used.add(c_name)
+        params.append((c_name, bpl_name))
+    return params
+
+
 def _find_havoc_vars(program):
     """Find source-level nondet vars that can be driven by int_seq inputs.
 
@@ -393,7 +457,15 @@ def _find_havoc_vars(program):
                         name = str(getattr(ident, "name", ident))
                         if ".shadow" in name or name in seen:
                             continue
-                        if "__VERIFIER_nondet" not in name and "__SMACK_nondet" not in name:
+                        # The enclosing call is already confirmed nondet by
+                        # proc_name above. Under LLVM 12 the assignee carried
+                        # the nondet name (inline$__VERIFIER_nondet_int$...);
+                        # under LLVM 22's new pass manager it is a plain SSA
+                        # temp ($i12). Accept both so uninitialized-variable
+                        # nondets remain seedable via int_seq.
+                        if not (re.match(r"\$i\d+$", name)
+                                or "__VERIFIER_nondet" in name
+                                or "__SMACK_nondet" in name):
                             continue
                         seen.add(name)
                         names.append(name)
@@ -491,7 +563,7 @@ def _private_inputs_from_requires(proc_decl, bpl_param_names):
 # Public API
 # ---------------------------------------------------------------------------
 
-def generate_template(pkg_path):
+def generate_template(pkg_path, *, program=None, source_root=None):
     """Generate a JSON-serializable template list from a compiled package.
 
     Tries to find and parse the C harness file for accurate names/sizes.
@@ -499,15 +571,17 @@ def generate_template(pkg_path):
 
     Args:
         pkg_path: Path to test_packages/<name>_pkg/
+        source_root: Exact CMake source root from the target manifest. Legacy
+            callers may omit it to discover a harness from the package path.
     Returns:
         list of dicts suitable for json.dump
     """
     pkg_path = Path(pkg_path)
     name = pkg_path.name.removesuffix("_pkg")
-    program_pkl = pkg_path / f"{name}.pkl"
-
-    with open(program_pkl, 'rb') as f:
-        program = pickle.load(f)
+    if program is None:
+        program_pkl = pkg_path / f"{name}.pkl"
+        with open(program_pkl, 'rb') as f:
+            program = pickle.load(f)
 
     bpl_param_names, impl_decl, proc_decl = _get_bpl_param_names(program)
     assert impl_decl is not None, "No {:entrypoint} implementation found in program"
@@ -516,8 +590,9 @@ def generate_template(pkg_path):
     entry_name = impl_decl.name.rsplit('.cross_product', 1)[0]
 
     # Try to find the C harness
-    examples_dir = pkg_path.parent.parent / "examples"
-    c_file = _find_c_harness(entry_name, examples_dir, benchmark_name=name)
+    c_file = _find_package_harness(
+        pkg_path, entry_name, name, source_root=source_root
+    )
 
     if c_file:
         params, annotations = _parse_c_harness(c_file, entry_name)
@@ -531,20 +606,23 @@ def generate_template(pkg_path):
     return _generate_bpl_fallback(program, bpl_param_names, impl_decl, proc_decl)
 
 
-def _load_template_context(pkg_path):
+def _load_template_context(pkg_path, *, program=None, source_root=None):
     """Load template plus enough metadata to render C-style .input files."""
     pkg_path = Path(pkg_path)
     name = pkg_path.name.removesuffix("_pkg")
-    json_template = generate_template(pkg_path)
-
-    program_pkl = pkg_path / f"{name}.pkl"
-    with open(program_pkl, 'rb') as f:
-        program = pickle.load(f)
+    if program is None:
+        program_pkl = pkg_path / f"{name}.pkl"
+        with open(program_pkl, 'rb') as f:
+            program = pickle.load(f)
+    json_template = generate_template(
+        pkg_path, program=program, source_root=source_root
+    )
     _bpl_param_names, impl_decl, _proc_decl = _get_bpl_param_names(program)
     entry_name = impl_decl.name.rsplit('.cross_product', 1)[0]
 
-    examples_dir = pkg_path.parent.parent / "examples"
-    c_file = _find_c_harness(entry_name, examples_dir, benchmark_name=name)
+    c_file = _find_package_harness(
+        pkg_path, entry_name, name, source_root=source_root
+    )
     c_params = {}
     c_name_order = []
     if c_file:
@@ -553,19 +631,8 @@ def _load_template_context(pkg_path):
             c_params[c_name] = c_type
             c_name_order.append(c_name)
 
-    params_map = []
-    seen_bpl = set()
-    for i, entry in enumerate(json_template):
-        bpl_name = entry['var']
-        comment = entry.get('_comment', '')
-        if '—' in comment:
-            c_name = comment.split('—', 1)[0].strip().split(' ')[0]
-        elif ' - ' in comment:
-            c_name = comment.split(' - ', 1)[0].strip().split(' ')[0]
-        else:
-            c_name = c_name_order[i] if i < len(c_name_order) else bpl_name
-        params_map.append((c_name, bpl_name))
-        seen_bpl.add(bpl_name)
+    params_map = _template_params_map(json_template, c_name_order)
+    seen_bpl = {entry['var'] for entry in json_template}
 
     havoc_vars = [v for v in _find_havoc_vars(program) if v not in seen_bpl]
     for var in havoc_vars:
@@ -723,7 +790,10 @@ def _set_scalar(container, key, variant, index, size=None):
         "ones": 1,
         "boundaries": [0, 1, 127, 128, 255, 256, 65535][index % 7],
         "alternating": 0xaa if index % 2 == 0 else 0x55,
-        "random": random.Random(index + 0x51A7).randrange(0, 1 << 32),
+        # Seed execution must stay bounded: unconstrained 32-bit values are
+        # commonly loop lengths and make canonical tracing non-terminating.
+        # Later coverage phases still probe wide integer boundaries directly.
+        "random": random.Random(index + 0x51A7).randrange(0, 257),
     }
     value = values.get(variant, 0)
     if size is not None and size > 0:
@@ -761,9 +831,11 @@ def _apply_seed_variant(entries, variant):
             scalar_idx += 1
 
 
-def generate_seed_inputs(pkg_path):
+def generate_seed_inputs(pkg_path, *, program=None, source_root=None):
     """Return deterministic seed .input contents keyed by filename."""
-    ctx = _load_template_context(pkg_path)
+    ctx = _load_template_context(
+        pkg_path, program=program, source_root=source_root
+    )
     base_entries = _with_havoc_entries(
         ctx["json_template"], ctx["havoc_vars"])
 

@@ -1,0 +1,4 @@
+# file: /home/ubuntu/boogie-parser/interpreter/coverage_gen/evaluator.py
+# hypothesis_version: 6.151.9
+
+[0.0, 100, 128, 256, 512, 10000, 100000000, '_cov_eval', 'assert_violation', 'assume_violation', 'auto', 'bindings', 'block_sequence', 'candidate', 'candidate_count', 'candidates', 'coverage-directed', 'coverage-evaluator', 'evaluation_end', 'evaluation_error', 'evaluation_start', 'evaluation_timeout', 'explored_blocks', 'internal_error', 'invalid_input', 'invalid_reason', 'late', 'lazy_candidate_count', 'mem_map_info', 'memory_maps', 'message', 'native', 'ok', 'raw_candidates', 'state_ms', 'stats', 'status', 'step_limit', 'swoosh-gen-input', 'symbol_count', 'symbolic_state_ms', 'symbols', 'timeout', 'updates', 'var_store', 'violation_block', 'violation_pc']

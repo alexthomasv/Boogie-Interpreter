@@ -1,0 +1,4 @@
+# file: /home/ubuntu/boogie-parser/interpreter/coverage_gen/corpus.py
+# hypothesis_version: 6.151.9
+
+[0.0, 1.0, 128, '*.input', '// @params', '<entry>', 'assertion-feedback', 'block', 'branch', 'context-edge', 'context_edges', 'coverage', 'edge', 'edges', 'existing', 'initial', 'sequence', 'trace', 'unknown']
