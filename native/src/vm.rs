@@ -4,6 +4,8 @@ use crate::memory_map::MemoryMap;
 use crate::opcodes::*;
 use crate::trace::{TraceAccumulator, OP_READ, OP_WRITE, UNKNOWN_REASON_BIG_INT};
 use num_bigint::BigInt;
+use rustc_hash::{FxHashMap, FxHashSet};
+use std::sync::Arc;
 
 const MASK_64: i64 = -1i64; // all bits set = u64::MAX as i64
 
@@ -23,6 +25,8 @@ fn binop_symbol(op: &BinOp) -> &'static str {
         BinOp::Sub => "-",
         BinOp::Mul => "*",
         BinOp::Add => "+",
+        BinOp::Div => "/",
+        BinOp::Mod => "%",
     }
 }
 
@@ -71,11 +75,11 @@ pub struct VM {
     /// Variable store: VarId → Value
     pub vars: Vec<Value>,
     /// Variable names for trace output
-    pub var_names: Vec<String>,
+    pub var_names: Arc<NameTable>,
     /// Memory maps, indexed by map_index in Value::Map
     pub memory_maps: Vec<MemoryMap>,
     /// Which VarId is a memory map? VarId → Some(map_index)
-    pub var_to_map: Vec<Option<usize>>,
+    pub var_to_map: FxHashMap<VarId, usize>,
     /// Current PC
     pub pc: u32,
     /// Current block ID (names are materialized only on error paths and at
@@ -85,6 +89,14 @@ pub struct VM {
     pub explored_blocks: Vec<bool>,
     /// Number of distinct blocks explored (popcount of `explored_blocks`).
     pub explored_count: usize,
+    /// Distinct dynamic CFG transitions observed during this execution.
+    /// This stays bounded by the compiled CFG even when loops execute for
+    /// millions of iterations.
+    pub explored_edges: FxHashSet<(BlockId, BlockId)>,
+    /// Whether to retain the explored-block bitset/count and edge set. Result
+    /// consumers that need only concrete outputs can disable this before
+    /// execution and avoid a potentially large edge-set allocation.
+    pub record_coverage: bool,
     /// Ordered block entries for lightweight path/edge coverage. Only
     /// recorded when `record_block_trace` is set; `block_entries` keeps the
     /// total count either way.
@@ -121,8 +133,8 @@ pub struct VM {
     pub m0_id: Option<VarId>,
     pub m0_shadow_id: Option<VarId>,
     /// Per-variable nondet schedules loaded from .input int_seq entries.
-    pub havoc_sequences: Vec<Option<Vec<i64>>>,
-    pub havoc_counts: Vec<usize>,
+    pub havoc_sequences: FxHashMap<VarId, Vec<i64>>,
+    pub havoc_counts: FxHashMap<VarId, usize>,
     /// Reusable RHS-evaluation buffer for AssignN (avoids a per-statement Vec).
     scratch_evals: Vec<EvalResult>,
     /// Trace records SKIPPED because the value was an out-of-i64 exact
@@ -164,7 +176,7 @@ impl VM {
     fn new_with_trace(program: &CompiledProgram, trace_enabled: bool) -> Self {
         let n = program.num_vars as usize;
         let vars = vec![Value::Scalar(0); n];
-        let var_to_map = vec![None; n];
+        let var_to_map = FxHashMap::default();
         let mut trace = TraceAccumulator::new();
         if trace_enabled {
             // Install loop metadata so packed iter_id emission works.  The
@@ -179,13 +191,15 @@ impl VM {
         }
         Self {
             vars,
-            var_names: program.var_names.clone(),
+            var_names: Arc::clone(&program.var_names),
             memory_maps: Vec::new(),
             var_to_map,
             pc: 0,
             curr_block_id: 0,
             explored_blocks: vec![false; program.blocks.len()],
             explored_count: 0,
+            explored_edges: FxHashSet::default(),
+            record_coverage: true,
             block_trace: Vec::new(),
             record_block_trace: true,
             block_entries: 0,
@@ -203,8 +217,8 @@ impl VM {
             m0_id: program.m0_id,
             m0_shadow_id: program.m0_shadow_id,
             no_trace: !trace_enabled,
-            havoc_sequences: vec![None; n],
-            havoc_counts: vec![0; n],
+            havoc_sequences: FxHashMap::default(),
+            havoc_counts: FxHashMap::default(),
             scratch_evals: Vec::new(),
             big_trace_skips: 0,
             mem_big_folds: 0,
@@ -236,42 +250,30 @@ impl VM {
     }
 
     pub fn set_havoc_sequence(&mut self, var_id: VarId, seq: Vec<i64>) {
-        let vid = var_id as usize;
-        if vid >= self.havoc_sequences.len() {
-            return;
-        }
-        self.havoc_sequences[vid] = Some(seq);
-        self.havoc_counts[vid] = 0;
+        self.havoc_sequences.insert(var_id, seq);
+        self.havoc_counts.insert(var_id, 0);
     }
 
     #[inline]
     pub fn havoc_count(&self, var_id: VarId) -> usize {
-        self.havoc_counts.get(var_id as usize).copied().unwrap_or(0)
+        self.havoc_counts.get(&var_id).copied().unwrap_or(0)
     }
 
     pub fn set_havoc_value_at(&mut self, var_id: VarId, idx: usize, value: i64) {
-        let vid = var_id as usize;
-        if vid >= self.havoc_sequences.len() {
-            return;
-        }
-        let seq = self.havoc_sequences[vid].get_or_insert_with(Vec::new);
+        let seq = self.havoc_sequences.entry(var_id).or_default();
         if seq.len() <= idx {
             seq.resize(idx + 1, 0);
         }
         seq[idx] = value;
-        self.havoc_counts[vid] = 0;
+        self.havoc_counts.insert(var_id, 0);
     }
 
     #[inline]
     pub fn next_havoc_value(&mut self, var_id: VarId) -> i64 {
-        let vid = var_id as usize;
-        let Some(count) = self.havoc_counts.get_mut(vid) else {
-            return 0;
-        };
+        let count = self.havoc_counts.entry(var_id).or_insert(0);
         let value = self
             .havoc_sequences
-            .get(vid)
-            .and_then(|seq| seq.as_ref())
+            .get(&var_id)
             .and_then(|seq| seq.get(*count).copied())
             .unwrap_or(0);
         *count += 1;
@@ -283,7 +285,7 @@ impl VM {
         let map = MemoryMap::new(name, index_bw, element_bw);
         let idx = self.memory_maps.len();
         self.memory_maps.push(map);
-        self.var_to_map[var_id as usize] = Some(idx);
+        self.var_to_map.insert(var_id, idx);
         self.vars[var_id as usize] = Value::Map(idx);
     }
 
@@ -341,7 +343,7 @@ impl VM {
         if Some(var_id) == self.curr_addr_id || Some(var_id) == self.curr_addr_shadow_id {
             panic!(
                 "exact-int overflow escape: allocation cursor {} left i64 range ({})",
-                self.var_names[var_id as usize], value
+                &self.var_names[var_id as usize], value
             );
         }
         if !self.no_trace {
@@ -386,11 +388,11 @@ impl VM {
             Value::Big(b) => panic!(
                 "exact-int overflow escape: {} = {} is outside i64 in an \
                  i64-only context (memory/handoff)",
-                self.var_names[vid], b
+                &self.var_names[vid], b
             ),
             Value::Map(_) => panic!(
                 "get_scalar called on memory map variable: {}",
-                self.var_names[vid]
+                &self.var_names[vid]
             ),
         }
     }
@@ -403,11 +405,11 @@ impl VM {
             Value::Big(b) => panic!(
                 "exact-int overflow escape: {} = {} is outside i64 in an \
                  i64-only context (memory/handoff)",
-                self.var_names[var_id as usize], b
+                &self.var_names[var_id as usize], b
             ),
             Value::Map(_) => panic!(
                 "get_scalar_silent called on memory map variable: {}",
-                self.var_names[var_id as usize]
+                &self.var_names[var_id as usize]
             ),
         }
     }
@@ -419,7 +421,7 @@ impl VM {
             Value::Map(idx) => *idx,
             _ => panic!(
                 "get_map_idx called on non-map variable: {}",
-                self.var_names[var_id as usize]
+                &self.var_names[var_id as usize]
             ),
         }
     }
@@ -427,7 +429,7 @@ impl VM {
     /// Clear a variable (remove from store or clear its map).
     pub fn clear_var(&mut self, var_id: VarId) {
         let vid = var_id as usize;
-        if let Some(map_idx) = self.var_to_map[vid] {
+        if let Some(&map_idx) = self.var_to_map.get(&var_id) {
             self.memory_maps[map_idx].clear();
         } else {
             // Do not route this through set_scalar: clearing $CurrAddr's
@@ -478,6 +480,7 @@ impl VM {
         max_steps: usize,
     ) -> ExecutionStatus {
         let mut block_id = program.entry_block;
+        let mut previous_block_id = None;
         let mut steps = 0usize;
         // Concrete inputs/static state are fully installed before execution
         // enters here.  Seed them before preconditions and, critically, before
@@ -489,7 +492,13 @@ impl VM {
 
         loop {
             let block = &program.blocks[block_id as usize];
-            self.mark_explored(block_id);
+            if self.record_coverage {
+                if let Some(source_id) = previous_block_id {
+                    self.explored_edges.insert((source_id, block_id));
+                }
+                previous_block_id = Some(block_id);
+                self.mark_explored(block_id);
+            }
             self.block_entries += 1;
             if self.record_block_trace {
                 self.block_trace.push(block_id);
@@ -511,8 +520,15 @@ impl VM {
             // per top-level dispatch. Re-establishing pc from the top-level
             // index also prevents nested execution from shifting a later real
             // statement onto a fake verifier PC.
-            for (stmt_index, stmt) in block.body.iter().enumerate() {
-                self.pc = block.start_pc + stmt_index as u32;
+            let mut stmt_pc = block.start_pc;
+            for stmt in &block.body {
+                if stmt.is_internal_maintenance() {
+                    if let Err(status) = self.execute_stmt(stmt, program) {
+                        return status;
+                    }
+                    continue;
+                }
+                self.pc = stmt_pc;
                 if let Some(status) = self.consume_step(&mut steps, max_steps, program) {
                     return status;
                 }
@@ -522,8 +538,9 @@ impl VM {
                 if let Err(status) = self.execute_stmt(stmt, program) {
                     return status;
                 }
+                stmt_pc += 1;
             }
-            self.pc = block.start_pc + block.body.len() as u32;
+            self.pc = stmt_pc;
 
             // The terminator is also a verifier-addressable statement. Its P
             // must precede branch-resolution reads, and a def-free Return still
@@ -687,6 +704,17 @@ impl VM {
                 }
             }
             Stmt::AssumeTrue => {}
+            Stmt::ReleaseMaps { vars } => {
+                for var_id in vars {
+                    let map_idx = self.var_to_map.get(var_id).copied().unwrap_or_else(|| {
+                        panic!(
+                            "ReleaseMaps references non-map variable: {}",
+                            &self.var_names[*var_id as usize]
+                        )
+                    });
+                    self.memory_maps[map_idx].clear();
+                }
+            }
             Stmt::LoopHeaderSnap { live_vars } => {
                 if !self.no_trace {
                     for &vid in live_vars {
@@ -730,7 +758,7 @@ impl VM {
                 assert!(
                     *alloc_size_var != u32::MAX,
                     "HavocCurrAddr alloc_size_var not resolved for {}",
-                    self.var_names[*var_id as usize]
+                    &self.var_names[*var_id as usize]
                 );
                 let alloc_size = self.get_scalar_silent(*alloc_size_var);
                 let is_shadow = Some(*var_id) == self.curr_addr_shadow_id;
@@ -821,22 +849,54 @@ impl VM {
             }
             Stmt::CallMemmove { args } => {
                 let vals: Vec<i64> = args.iter().map(|a| self.eval_mem_i64(a, program)).collect();
-                if vals.len() >= 6 {
-                    let len = vals[4];
-                    let len_shadow = vals[5];
-                    if len != len_shadow || len < 0 {
+                match vals.as_slice() {
+                    // Unshadowed LLVM ABI: (dst, src, len, is_volatile).
+                    // Every byte map represents the same address space here,
+                    // so use the concrete bases for both map families.
+                    [dst, src, len, _is_volatile] => {
+                        if *len < 0 {
+                            return Err(ExecutionStatus::AssumeViolation {
+                                pc: self.pc,
+                                block: self.block_name(program),
+                                reason: "invalid_memmove",
+                                detail: format!(
+                                    "memmove length check failed: len={} (requires len >= 0)",
+                                    len
+                                ),
+                            });
+                        }
+                        self.memmove_i8_maps(*dst, *dst, *src, *src, *len);
+                    }
+                    // Shadow ABI: (dst, dst.shadow, src, src.shadow,
+                    // len, len.shadow, ...). Volatility operands, when
+                    // present, have no effect on concrete memory contents.
+                    [dst, dst_shadow, src, src_shadow, len, len_shadow, ..] => {
+                        if len != len_shadow || *len < 0 {
+                            return Err(ExecutionStatus::AssumeViolation {
+                                pc: self.pc,
+                                block: self.block_name(program),
+                                reason: "invalid_memmove",
+                                detail: format!(
+                                    "memmove length check failed: len={} len_shadow={} \
+                                     (requires len == len_shadow && len >= 0)",
+                                    len, len_shadow
+                                ),
+                            });
+                        }
+                        self.memmove_i8_maps(*dst, *dst_shadow, *src, *src_shadow, *len);
+                    }
+                    _ => {
                         return Err(ExecutionStatus::AssumeViolation {
                             pc: self.pc,
                             block: self.block_name(program),
                             reason: "invalid_memmove",
                             detail: format!(
-                                "memmove length check failed: len={} len_shadow={} \
-                                 (requires len == len_shadow && len >= 0)",
-                                len, len_shadow
+                                "memmove arity check failed: got {} arguments \
+                                 (requires 4 unshadowed or at least 6 shadow arguments)",
+                                vals.len()
                             ),
                         });
                     }
-                    self.memmove_i8_maps(vals[0], vals[1], vals[2], vals[3], len);
                 }
             }
             // Quantified assumes for memset/memcpy
@@ -962,11 +1022,11 @@ impl VM {
             EvalResult::MapRef(map_idx) => {
                 // Assignment of a map — the store.iN returns the modified map
                 let vid = var_id as usize;
-                let existing_map = self.var_to_map[vid];
+                let existing_map = self.var_to_map.get(&var_id).copied();
                 if let Some(existing_idx) = existing_map {
                     if existing_idx != map_idx {
                         // Copy map contents
-                        let new_name = self.var_names[vid].clone();
+                        let new_name = self.var_names[vid].to_string();
                         let src = &self.memory_maps[map_idx];
                         let copied = src.copy_with_name(new_name);
                         self.memory_maps[existing_idx] = copied;
@@ -974,12 +1034,12 @@ impl VM {
                     // If same index, the map was modified in-place
                 } else {
                     // New map variable — copy
-                    let new_name = self.var_names[vid].clone();
+                    let new_name = self.var_names[vid].to_string();
                     let src = &self.memory_maps[map_idx];
                     let copied = src.copy_with_name(new_name);
                     let new_idx = self.memory_maps.len();
                     self.memory_maps.push(copied);
-                    self.var_to_map[vid] = Some(new_idx);
+                    self.var_to_map.insert(var_id, new_idx);
                     self.vars[vid] = Value::Map(new_idx);
                 }
             }
@@ -1002,7 +1062,7 @@ impl VM {
             let name = program
                 .var_names
                 .get(*vid as usize)
-                .map(|s| s.as_str())
+                .map(|s| s)
                 .unwrap_or("?");
             match self.vars.get(*vid as usize) {
                 Some(Value::Scalar(v)) => vals.push_str(&format!("{}={}", name, v)),
@@ -1039,7 +1099,7 @@ impl VM {
                 let name = program
                     .var_names
                     .get(*id as usize)
-                    .map(|s| s.as_str())
+                    .map(|s| s)
                     .unwrap_or("?");
                 out.push_str(name);
                 if !vars.contains(id) {
@@ -1173,6 +1233,19 @@ impl VM {
                         BinOp::Sub => EvalResult::Scalar((l.wrapping_sub(r)) & MASK_64),
                         BinOp::Mul => EvalResult::Scalar((l.wrapping_mul(r)) & MASK_64),
                         BinOp::Add => EvalResult::Scalar((l.wrapping_add(r)) & MASK_64),
+                        // Generic Boogie `/` over BV-mode scalar operands is
+                        // translated to bvudiv by the verifier model. Match
+                        // SMT-LIB's total zero-divisor values exactly.
+                        BinOp::Div => EvalResult::Scalar(if r == 0 {
+                            -1
+                        } else {
+                            ((l as u64) / (r as u64)) as i64
+                        }),
+                        BinOp::Mod => EvalResult::Scalar(if r == 0 {
+                            l
+                        } else {
+                            ((l as u64) % (r as u64)) as i64
+                        }),
                     }
                 } else {
                     // Int mode: exact-ℤ core. Arithmetic uses checked ops with
@@ -1205,6 +1278,12 @@ impl VM {
                                 Some(v) => EvalResult::Scalar(v),
                                 None => z_to_eval(crate::builtins::int::add(&Z::S(l), &Z::S(r))),
                             },
+                            BinOp::Div => {
+                                z_to_eval(crate::builtins::int::euclid_div(&Z::S(l), &Z::S(r)))
+                            }
+                            BinOp::Mod => {
+                                z_to_eval(crate::builtins::int::euclid_mod(&Z::S(l), &Z::S(r)))
+                            }
                         };
                     }
                     let l = eval_result_to_z(le);
@@ -1225,6 +1304,8 @@ impl VM {
                         BinOp::Sub => z_to_eval(crate::builtins::int::sub(&l, &r)),
                         BinOp::Mul => z_to_eval(crate::builtins::int::mul(&l, &r)),
                         BinOp::Add => z_to_eval(crate::builtins::int::add(&l, &r)),
+                        BinOp::Div => z_to_eval(crate::builtins::int::euclid_div(&l, &r)),
+                        BinOp::Mod => z_to_eval(crate::builtins::int::euclid_mod(&l, &r)),
                     }
                 }
             }
@@ -1317,8 +1398,8 @@ impl VM {
                 };
                 let idx_val = self.eval_mem_i64(index, program);
                 let val = self.eval_mem_i64(value, program);
-                let bw = *bit_width as u8;
                 let ew = self.memory_maps[map_idx].element_bit_width;
+                let bw = if *bit_width == 0 { ew } else { *bit_width };
                 if bw <= ew {
                     // Single cell. bw == ew is the common byte store; bw < ew is a
                     // sub-element store (e.g. $store.i1 of a bool into a byte-addressed
@@ -1345,8 +1426,8 @@ impl VM {
                     _ => panic!("load: expected map"),
                 };
                 let idx_val = self.eval_mem_i64(index, program);
-                let bw = *bit_width as u8;
                 let ew = self.memory_maps[map_idx].element_bit_width;
+                let bw = if *bit_width == 0 { ew } else { *bit_width };
                 if bw <= ew {
                     // Single cell; mask to bw bits for a sub-element load ($load.i1).
                     let raw = self.memory_maps[map_idx].get(idx_val);
@@ -1771,8 +1852,8 @@ mod tests {
                 assume_cond: None,
             }],
             label_to_block: FxHashMap::default(),
-            var_names: vec!["$x".to_string(), "$y".to_string()],
-            name_to_var: FxHashMap::default(),
+            var_names: Arc::new(NameTable::from(vec!["$x".to_string(), "$y".to_string()])),
+            name_index: NameIndex::default(),
             entry_block: 0,
             entry_preconditions: vec![],
             mem_maps: vec![],
@@ -1788,7 +1869,7 @@ mod tests {
             static_scalars: vec![],
             mode: SemanticsMode::Int,
         };
-        program.rebuild_lookup_maps();
+        program.rebuild_runtime_name_index();
         program
     }
 
@@ -1822,6 +1903,34 @@ mod tests {
             })
             .collect();
         (version, records)
+    }
+
+    #[test]
+    fn execution_can_skip_coverage_bookkeeping() {
+        let mut program = test_program();
+        program.blocks[0].terminator = Stmt::Goto { targets: vec![1] };
+        program.blocks.push(Block {
+            name: "exit".to_string(),
+            id: 1,
+            body: vec![],
+            terminator: Stmt::Return,
+            start_pc: 15,
+            assume_cond: None,
+        });
+        program.is_loop_header.push(false);
+        program.block_innermost_header.push(None);
+        program.loop_parent_header.push(None);
+
+        let mut vm = VM::new_no_trace(&program);
+        vm.record_coverage = false;
+        vm.record_block_trace = false;
+        let status = vm.execute_with_limit(&program, 100);
+
+        assert!(matches!(status, ExecutionStatus::Completed));
+        assert_eq!(vm.block_entries, 2);
+        assert_eq!(vm.explored_count, 0);
+        assert!(vm.explored_blocks.iter().all(|explored| !explored));
+        assert!(vm.explored_edges.is_empty());
     }
 
     #[test]

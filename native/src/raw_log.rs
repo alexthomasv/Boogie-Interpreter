@@ -44,6 +44,7 @@
 //! carry records. The writer closes a frame every ~64 MiB
 //! uncompressed, giving ~50 frames for a pkcs1-sized trace.
 
+use crate::opcodes::NameTable;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::Path;
@@ -180,14 +181,18 @@ impl RawLogWriter {
     /// prefix of the file.
     pub fn write_header(
         &mut self,
-        var_names: &[String],
+        var_names: &NameTable,
         block_names: &[String],
     ) -> std::io::Result<()> {
         let enc = self.enc.as_mut().expect("writer uninitialised");
         enc.write_all(MAGIC)?;
         enc.write_all(&[VERSION])?;
-        write_name_table(enc, var_names)?;
-        write_name_table(enc, block_names)?;
+        write_name_table(enc, var_names.len(), var_names.iter())?;
+        write_name_table(
+            enc,
+            block_names.len(),
+            block_names.iter().map(String::as_str),
+        )?;
         self.roll_frame()?;
         Ok(())
     }
@@ -238,8 +243,12 @@ impl RawLogWriter {
     }
 }
 
-fn write_name_table<W: Write>(w: &mut W, names: &[String]) -> std::io::Result<()> {
-    w.write_all(&(names.len() as u32).to_le_bytes())?;
+fn write_name_table<'a, W, I>(w: &mut W, len: usize, names: I) -> std::io::Result<()>
+where
+    W: Write,
+    I: IntoIterator<Item = &'a str>,
+{
+    w.write_all(&(len as u32).to_le_bytes())?;
     for name in names {
         let bytes = name.as_bytes();
         // Cap at u16::MAX — Boogie identifiers are always tiny so this is

@@ -821,7 +821,9 @@ impl<'a> Engine<'a> {
                 if !self.execute_stmt(stmt) {
                     return;
                 }
-                self.vm.pc += 1;
+                if !stmt.is_internal_maintenance() {
+                    self.vm.pc += 1;
+                }
             }
 
             match &block.terminator {
@@ -1601,6 +1603,16 @@ impl<'a> Engine<'a> {
                 }
             }
             Stmt::AssumeTrue | Stmt::LoopHeaderSnap { .. } | Stmt::CallIgnored => {}
+            Stmt::ReleaseMaps { vars } => {
+                for var_id in vars {
+                    let Some(map_idx) = self.vm.var_to_map.get(var_id).copied() else {
+                        self.unsupported("release_non_map", &[("var_id", var_id.to_string())]);
+                        return false;
+                    };
+                    self.vm.memory_maps[map_idx].clear();
+                    self.sym_maps[map_idx] = FxHashMap::default();
+                }
+            }
             Stmt::Havoc { vars } => {
                 for &var_id in vars {
                     self.vm.clear_var(var_id);
@@ -1691,17 +1703,52 @@ impl<'a> Engine<'a> {
             }
             Stmt::CallMemmove { args } => {
                 let vals: Vec<CEval> = args.iter().map(|a| self.eval_i64(a)).collect();
-                if vals.len() >= 6 {
-                    let dst = scalar_value(&vals[0].value).unwrap_or(0);
-                    let dst_shadow = scalar_value(&vals[1].value).unwrap_or(0);
-                    let src = scalar_value(&vals[2].value).unwrap_or(0);
-                    let src_shadow = scalar_value(&vals[3].value).unwrap_or(0);
-                    let len = scalar_value(&vals[4].value).unwrap_or(0);
-                    let len_shadow = scalar_value(&vals[5].value).unwrap_or(0);
-                    if len != len_shadow || len < 0 {
+                match vals.as_slice() {
+                    // Unshadowed LLVM ABI: (dst, src, len, is_volatile).
+                    [dst, src, len, _is_volatile] => {
+                        let Some(dst) = scalar_value(&dst.value) else {
+                            return false;
+                        };
+                        let Some(src) = scalar_value(&src.value) else {
+                            return false;
+                        };
+                        let Some(len) = scalar_value(&len.value) else {
+                            return false;
+                        };
+                        if len < 0 {
+                            return false;
+                        }
+                        self.memmove_i8_maps(dst, dst, src, src, len);
+                    }
+                    // Retain the shadow ABI, including the historical
+                    // acceptance of optional trailing volatility operands.
+                    [dst, dst_shadow, src, src_shadow, len, len_shadow, ..] => {
+                        let Some(dst) = scalar_value(&dst.value) else {
+                            return false;
+                        };
+                        let Some(dst_shadow) = scalar_value(&dst_shadow.value) else {
+                            return false;
+                        };
+                        let Some(src) = scalar_value(&src.value) else {
+                            return false;
+                        };
+                        let Some(src_shadow) = scalar_value(&src_shadow.value) else {
+                            return false;
+                        };
+                        let Some(len) = scalar_value(&len.value) else {
+                            return false;
+                        };
+                        let Some(len_shadow) = scalar_value(&len_shadow.value) else {
+                            return false;
+                        };
+                        if len != len_shadow || len < 0 {
+                            return false;
+                        }
+                        self.memmove_i8_maps(dst, dst_shadow, src, src_shadow, len);
+                    }
+                    _ => {
                         return false;
                     }
-                    self.memmove_i8_maps(dst, dst_shadow, src, src_shadow, len);
                 }
             }
             Stmt::QuantMemsetWrite {
@@ -1958,20 +2005,20 @@ impl<'a> Engine<'a> {
             EvalResult::Bool(b) => self.vm.set_scalar(var_id, b as i64, false),
             EvalResult::MapRef(map_idx) => {
                 let vid = var_id as usize;
-                if let Some(existing_idx) = self.vm.var_to_map[vid] {
+                if let Some(existing_idx) = self.vm.var_to_map.get(&var_id).copied() {
                     if existing_idx != map_idx {
-                        let new_name = self.vm.var_names[vid].clone();
+                        let new_name = self.vm.var_names[vid].to_string();
                         let copied = self.vm.memory_maps[map_idx].copy_with_name(new_name);
                         self.vm.memory_maps[existing_idx] = copied;
                         self.sym_maps[existing_idx] = self.sym_maps[map_idx].clone();
                     }
                 } else {
-                    let new_name = self.vm.var_names[vid].clone();
+                    let new_name = self.vm.var_names[vid].to_string();
                     let copied = self.vm.memory_maps[map_idx].copy_with_name(new_name);
                     let new_idx = self.vm.memory_maps.len();
                     self.vm.memory_maps.push(copied);
                     self.sym_maps.push(self.sym_maps[map_idx].clone());
-                    self.vm.var_to_map[vid] = Some(new_idx);
+                    self.vm.var_to_map.insert(var_id, new_idx);
                     self.vm.vars[vid] = Value::Map(new_idx);
                 }
             }
@@ -2097,6 +2144,16 @@ impl<'a> Engine<'a> {
             BinOp::Sub => EvalResult::Scalar((lv.wrapping_sub(rv)) & MASK_64),
             BinOp::Mul => EvalResult::Scalar((lv.wrapping_mul(rv)) & MASK_64),
             BinOp::Add => EvalResult::Scalar((lv.wrapping_add(rv)) & MASK_64),
+            BinOp::Div => EvalResult::Scalar(if rv == 0 {
+                -1
+            } else {
+                ((lv as u64) / (rv as u64)) as i64
+            }),
+            BinOp::Mod => EvalResult::Scalar(if rv == 0 {
+                lv
+            } else {
+                ((lv as u64) % (rv as u64)) as i64
+            }),
         };
         CEval { value, sym }
     }
@@ -2161,6 +2218,7 @@ impl<'a> Engine<'a> {
         let val_ev = self.eval_i64(value);
         let val = eval_to_i64(&val_ev.value);
         let ew = self.vm.memory_maps[map_idx].element_bit_width;
+        let bit_width = if bit_width == 0 { ew } else { bit_width };
         if bit_width == ew {
             self.vm.memory_maps[map_idx].set(idx_val, val);
             if let Some(sym) = val_ev.sym {
@@ -2212,6 +2270,7 @@ impl<'a> Engine<'a> {
         }
         let idx_val = eval_to_i64(&idx_ev.value);
         let ew = self.vm.memory_maps[map_idx].element_bit_width;
+        let bit_width = if bit_width == 0 { ew } else { bit_width };
         if bit_width == ew {
             CEval {
                 value: EvalResult::Scalar(self.vm.memory_maps[map_idx].get(idx_val)),
@@ -2545,6 +2604,16 @@ fn sym_binop(op: BinOp, lhs: Sym, rhs: Sym) -> Sym {
         },
         BinOp::Add => Sym::Bv {
             text: format!("(bvadd {} {})", lhs.bv_text(64), rhs.bv_text(64)),
+            bits: 64,
+            provenance,
+        },
+        BinOp::Div => Sym::Bv {
+            text: format!("(bvudiv {} {})", lhs.bv_text(64), rhs.bv_text(64)),
+            bits: 64,
+            provenance,
+        },
+        BinOp::Mod => Sym::Bv {
+            text: format!("(bvurem {} {})", lhs.bv_text(64), rhs.bv_text(64)),
             bits: 64,
             provenance,
         },
@@ -3119,7 +3188,7 @@ fn parse_symbols(
         let name: String = required(d, "name")?.extract()?;
         let bits: u32 = required(d, "bits")?.extract()?;
         let value: u64 = required(d, "value")?.extract()?;
-        let var_id = optional_string(d, "var")?.and_then(|v| program.name_to_var.get(&v).copied());
+        let var_id = optional_string(d, "var")?.and_then(|v| program.lookup_var(&v));
         let map_key = match (optional_string(d, "map")?, optional_i64(d, "addr")?) {
             (Some(m), Some(a)) => Some((m, a)),
             _ => None,
@@ -3129,7 +3198,7 @@ fn parse_symbols(
             optional_string(d, "havoc_var")?,
             optional_usize(d, "havoc_index")?,
         ) {
-            (Some(v), Some(i)) => program.name_to_var.get(&v).copied().map(|vid| (vid, i)),
+            (Some(v), Some(i)) => program.lookup_var(&v).map(|vid| (vid, i)),
             _ => None,
         };
         out.push(InputSymbol {
@@ -3178,22 +3247,22 @@ fn build_vm(
         let name: String = tuple.get_item(0)?.extract()?;
         let index_bw: u8 = tuple.get_item(1)?.extract()?;
         let element_bw: u8 = tuple.get_item(2)?.extract()?;
-        if let Some(&vid) = program.name_to_var.get(&name) {
+        if let Some(vid) = program.lookup_var(&name) {
             vm.init_memory_map(vid, name, index_bw, element_bw);
         }
     }
     for (key, val) in var_store.iter() {
         let name: String = key.extract()?;
         let value: i64 = val.extract()?;
-        if let Some(&vid) = program.name_to_var.get(&name) {
+        if let Some(vid) = program.lookup_var(&name) {
             vm.set_scalar(vid, value, true);
         }
     }
     for (key, val) in memory_maps.iter() {
         let name: String = key.extract()?;
         let contents: &Bound<'_, PyDict> = val.downcast()?;
-        if let Some(&vid) = program.name_to_var.get(&name) {
-            if let Some(map_idx) = vm.var_to_map[vid as usize] {
+        if let Some(vid) = program.lookup_var(&name) {
+            if let Some(map_idx) = vm.var_to_map.get(&vid).copied() {
                 for (addr, value) in contents.iter() {
                     vm.memory_maps[map_idx].set(addr.extract()?, value.extract()?);
                 }

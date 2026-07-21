@@ -1,15 +1,23 @@
 """Program input parsing and array/field metadata extraction."""
 
+import copy
 import os
 import re
 from collections import defaultdict
 from dataclasses import dataclass
 
-from interpreter.parser.declaration import ImplementationDeclaration
+from interpreter.parser.declaration import (
+    ImplementationDeclaration,
+    ProcedureDeclaration,
+)
 from interpreter.parser.statement import CallStatement
 from interpreter.parser.specifications import RequiresClause
 
-from interpreter.utils.program import extract_boogie_variables, RE_SMACK
+from interpreter.utils.program import (
+    RE_SMACK,
+    extract_boogie_variables,
+    find_entry_point,
+)
 
 # ---------------------------------------------------------------------------
 # Value helpers — expand shorthand in buffer contents / struct field values
@@ -127,6 +135,74 @@ class ProgramInputs:
         self.extra_data = extra_data
 
 
+def complete_declared_shadow_inputs(
+    program,
+    program_inputs: ProgramInputs,
+) -> ProgramInputs:
+    """Materialize omitted entrypoint shadow lanes at a pipeline boundary.
+
+    Input files may compactly specify only a base lane.  Coverage and trace
+    preparation call this helper before the strict native boundary so the
+    executed payload still contains every shadow formal declared by the
+    cross-product entrypoint.  An explicitly supplied shadow remains
+    authoritative.
+    """
+    shadow_names = _entry_shadow_parameter_names(program)
+    if not shadow_names:
+        return program_inputs
+    if type(program_inputs) is not ProgramInputs:
+        raise TypeError("shadow completion requires ProgramInputs")
+
+    missing = []
+    for shadow_name in sorted(shadow_names):
+        if shadow_name in program_inputs.variables:
+            continue
+        base_name = shadow_name.removesuffix(".shadow")
+        if base_name in program_inputs.variables:
+            missing.append((shadow_name, base_name))
+
+    if not missing:
+        return program_inputs
+
+    variables = copy.deepcopy(program_inputs.variables)
+    for shadow_name, base_name in missing:
+        clone = copy.deepcopy(variables[base_name])
+        clone.name = shadow_name
+        variables[shadow_name] = clone
+    return ProgramInputs(variables, extra_data=program_inputs.extra_data)
+
+
+def _entry_shadow_parameter_names(program) -> frozenset[str]:
+    """Return the shadow formals from the entrypoint's procedure contract."""
+    try:
+        entry = find_entry_point(program)
+    except Exception:
+        return frozenset()
+    if entry is None:
+        return frozenset()
+
+    source = entry
+    for declaration in getattr(program, "declarations", ()) or ():
+        if (
+            isinstance(declaration, ProcedureDeclaration)
+            and not isinstance(declaration, ImplementationDeclaration)
+            and getattr(declaration, "name", None) == getattr(entry, "name", None)
+            and getattr(declaration, "parameters", None)
+        ):
+            source = declaration
+            break
+
+    names = []
+    for parameter in getattr(source, "parameters", ()) or ():
+        raw_names = getattr(parameter, "names", ()) or ()
+        if len(raw_names) != 1:
+            continue
+        name = str(raw_names[0])
+        if name.endswith(".shadow"):
+            names.append(name)
+    return frozenset(names)
+
+
 def input_contract_from_requires(proc_decl, input_names=None) -> tuple[set[str], set[str]]:
     """Extract annotation privacy metadata for input-template rendering.
 
@@ -197,11 +273,12 @@ class ArrayInfo:
 
 
 class FieldInfo:
-    def __init__(self, var_name, mem_map, base_ptr, size):
+    def __init__(self, var_name, mem_map, base_ptr, size, kind):
         self.var_name = var_name
         self.mem_map = mem_map
         self.base_ptr = base_ptr
         self.size = size
+        self.kind = kind
 
     def __str__(self):
         return f"FieldInfo(var_name={self.var_name}, mem_map={self.mem_map}, base_ptr={self.base_ptr}, size={self.size})"
@@ -220,7 +297,8 @@ def process_field_stmt(stmt, is_shadow):
     else:
         mem_map = field_info[1].name
     size = int(field_info[3].value)
-    return FieldInfo(var_name, mem_map, base_ptr, size)
+    kind = "buffer" if stmt.has_attribute("array") else "value"
+    return FieldInfo(var_name, mem_map, base_ptr, size, kind)
 
 
 def process_array_stmt(stmt, is_shadow):
@@ -242,7 +320,9 @@ def process_array_stmt(stmt, is_shadow):
 
 
 def gather_field_info_stmts(proc):
-    assert isinstance(proc, ImplementationDeclaration), f"{type(proc)}"
+    assert isinstance(proc, ProcedureDeclaration) and proc.body is not None, (
+        f"expected a procedure with a body, got {type(proc)}"
+    )
     field_info_stmts = []
     seen_offsets = set()
     for block in proc.body.blocks:
@@ -260,7 +340,9 @@ def gather_field_info_stmts(proc):
 
 
 def gather_array_info_stmts(proc):
-    assert isinstance(proc, ImplementationDeclaration), f"{type(proc)}"
+    assert isinstance(proc, ProcedureDeclaration) and proc.body is not None, (
+        f"expected a procedure with a body, got {type(proc)}"
+    )
     array_info_stmts = []
     for block in proc.body.blocks:
         for stmt in block.statements:

@@ -279,6 +279,7 @@ struct StackFrame {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::opcodes::NameTable;
 
     fn acc_with(meta: (Vec<bool>, Vec<Option<BlockId>>, Vec<Option<BlockId>>)) -> TraceAccumulator {
         let mut a = TraceAccumulator::new();
@@ -391,8 +392,9 @@ mod tests {
             1
         ));
         let mut writer = RawLogWriter::create(&path).unwrap();
+        let var_names = NameTable::from(vec!["$x".to_string()]);
         writer
-            .write_header(&["$x".to_string()], &["b0".to_string()])
+            .write_header(&var_names, &["b0".to_string()])
             .unwrap();
         a.raw_log = Some(writer);
 

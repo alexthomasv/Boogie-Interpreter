@@ -9,8 +9,8 @@ use std::sync::Arc;
 /// (arithmetic shift — negative addresses get negative page keys).
 ///
 /// Pages are `Arc`-shared: `copy_with_name` (Boogie map-to-map assignment)
-/// and concolic per-state VM clones are O(pages) refcount bumps, and writes
-/// diverge per page via `Arc::make_mut`.
+/// and concolic per-state VM clones copy the page table and bump each page
+/// reference count, while writes diverge only the touched page.
 ///
 /// Each page carries an occupancy bitmap. The *exact* set of initialized
 /// (addr, value) entries is observable downstream (memory_summary hashing,
@@ -140,11 +140,11 @@ impl MemoryMap {
     }
 
     pub fn clear(&mut self) {
-        self.pages.clear();
+        self.pages = FxHashMap::default();
     }
 
-    /// O(pages) copy: the page table is cloned, pages themselves are shared
-    /// until either side writes (Arc::make_mut).
+    /// O(pages) copy: the page table is cloned, while pages remain shared until
+    /// either side writes.
     pub fn copy_with_name(&self, new_name: String) -> Self {
         let is_shadow = new_name.ends_with(".shadow");
         Self {
@@ -725,6 +725,23 @@ mod tests {
         assert_eq!(b.get(20), 20);
         assert_eq!(a.get(520), 520);
         assert_eq!(b.get(520), 0);
+    }
+
+    #[test]
+    fn clear_drops_only_this_snapshot() {
+        let mut retained = MemoryMap::new("retained".into(), 64, 8);
+        retained.set(7, 11);
+        retained.set(513, 22);
+        let mut dead_frame = retained.copy_with_name("dead_frame".into());
+
+        let retained_page = Arc::clone(retained.pages.get(&0).unwrap());
+        assert_eq!(Arc::strong_count(&retained_page), 3);
+        dead_frame.clear();
+
+        assert_eq!(retained.get(7), 11);
+        assert_eq!(retained.get(513), 22);
+        assert!(dead_frame.is_init_empty());
+        assert_eq!(Arc::strong_count(&retained_page), 2);
     }
 
     #[test]

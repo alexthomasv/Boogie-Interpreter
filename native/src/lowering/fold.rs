@@ -38,6 +38,16 @@ pub(crate) fn fold_expr(e: Expr, mode: SemanticsMode) -> Expr {
                         BinOp::Sub => Expr::Const(l.wrapping_sub(r)),
                         BinOp::Mul => Expr::Const(l.wrapping_mul(r)),
                         BinOp::Add => Expr::Const(l.wrapping_add(r)),
+                        BinOp::Div if r != 0 => Expr::Const(((l as u64) / (r as u64)) as i64),
+                        BinOp::Mod if r != 0 => Expr::Const(((l as u64) % (r as u64)) as i64),
+                        // Preserve zero-divisor expressions for the same
+                        // reason as Int mode below: dead branches must not be
+                        // evaluated during lowering.
+                        BinOp::Div | BinOp::Mod => Expr::BinOp {
+                            op,
+                            lhs: Box::new(lhs),
+                            rhs: Box::new(rhs),
+                        },
                     },
                     _ => Expr::BinOp {
                         op,
@@ -63,6 +73,17 @@ pub(crate) fn fold_expr(e: Expr, mode: SemanticsMode) -> Expr {
                             BinOp::Sub => z_to_expr(crate::builtins::int::sub(&l, &r)),
                             BinOp::Mul => z_to_expr(crate::builtins::int::mul(&l, &r)),
                             BinOp::Add => z_to_expr(crate::builtins::int::add(&l, &r)),
+                            BinOp::Div if !r.is_zero() => {
+                                z_to_expr(crate::builtins::int::euclid_div(&l, &r))
+                            }
+                            BinOp::Mod if !r.is_zero() => {
+                                z_to_expr(crate::builtins::int::euclid_mod(&l, &r))
+                            }
+                            BinOp::Div | BinOp::Mod => Expr::BinOp {
+                                op,
+                                lhs: Box::new(lhs),
+                                rhs: Box::new(rhs),
+                            },
                         }
                     }
                     _ => Expr::BinOp {

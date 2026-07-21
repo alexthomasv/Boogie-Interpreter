@@ -36,12 +36,14 @@ def _alarm(seconds: int):
 class EvaluationResult:
     covered: set
     status: str = "ok"
+    covered_edges: tuple[tuple[str, str], ...] = ()
     block_sequence: tuple[str, ...] = ()
     violation_pc: Optional[int] = None
     violation_block: Optional[str] = None
     message: Optional[str] = None
     invalid_input: bool = False
     invalid_reason: Optional[str] = None
+    invalid_detail: Optional[str] = None
 
 
 DEFAULT_MAX_STEPS_PER_INPUT = 100_000_000
@@ -116,6 +118,7 @@ class Evaluator:
                     violation_pc=result.violation_pc,
                     violation_block=result.violation_block,
                     message=result.message,
+                    invalid_detail=result.invalid_detail,
                 )
                 return result
         except TimeoutError:
@@ -172,12 +175,14 @@ class Evaluator:
         return EvaluationResult(
             set(explored.get("explored_blocks") or []),
             status=explored.get("status", "ok"),
+            covered_edges=tuple(sorted(explored.get("explored_edges") or ())),
             block_sequence=tuple(explored.get("block_sequence") or ()),
             violation_pc=explored.get("violation_pc"),
             violation_block=explored.get("violation_block"),
             message=explored.get("message"),
             invalid_input=bool(explored.get("invalid_input", False)),
             invalid_reason=explored.get("invalid_reason"),
+            invalid_detail=explored.get("invalid_detail"),
         )
 
     def concolic_suggest(self, program_inputs: ProgramInputs, input_name: str,

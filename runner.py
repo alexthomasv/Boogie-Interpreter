@@ -34,12 +34,7 @@ from interpreter.errors import AssertViolation, AssumeViolation
 from interpreter.utils.debug_log import DebugLogger
 from interpreter.utils.program import find_entry_point
 from interpreter.utils.support_matrix import support_matrix_summary
-from interpreter.utils.static_eval import (
-    compute_static_scalars,
-    compute_static_values,
-    expr_base_ptr,
-    offset_delta,
-)
+from interpreter.utils.swcp_metadata import build_native_input_meta
 
 
 def _normalize_engine_result(result: dict, *, input_name: str) -> dict:
@@ -53,7 +48,7 @@ def _normalize_engine_result(result: dict, *, input_name: str) -> dict:
         raise TypeError(
             f"native result must be a dict, got {type(result).__name__}")
     required = {
-        "status", "explored_blocks", "trace_records", "memory_summary",
+        "status", "explored_blocks", "explored_edges", "trace_records", "memory_summary",
         "external_consumed", "exec_ns", "exec_ms", "blocks_explored",
         "block_sequence_len", "no_trace", "trace_big_skips",
         "mem_big_folds", "vars", "memory_map_count", "state_ns", "state_ms",
@@ -450,42 +445,7 @@ class PreparedNativeProgram:
 
     def _build_native_meta(self):
         """Build static metadata for Rust-side per-input concretization."""
-        static_scalars = compute_static_scalars(self.program)
-        static_values = compute_static_values(self.program)
-
-        arr_inputs = {}
-        for key, infos in self.arr_inputs.items():
-            arr_inputs[key] = [
-                {
-                    "mem_map": ai.mem_map,
-                    "base_ptr": ai.base_ptr,
-                    "offset_delta": offset_delta(ai.offset, ai.base_ptr, static_values),
-                    "elem_size": ai.elem_size,
-                    "num_elements": ai.num_elements,
-                }
-                for ai in infos
-            ]
-
-        field_inputs = {}
-        for key, infos in self.field_inputs.items():
-            items = []
-            for fi in infos:
-                base_ptr = expr_base_ptr(fi.base_ptr)
-                items.append({
-                    "var_name": fi.var_name,
-                    "mem_map": fi.mem_map,
-                    "base_ptr": base_ptr,
-                    "offset_delta": offset_delta(fi.base_ptr, base_ptr, static_values),
-                    "size": fi.size,
-                })
-            field_inputs[key] = items
-
-        return {
-            "static_scalars": static_scalars,
-            "arr_inputs": arr_inputs,
-            "field_inputs": field_inputs,
-            "ptr_aliases": dict(self.ptr_aliases),
-        }
+        return build_native_input_meta(self.program, self.impl_decl)
 
 
 def prepare_native(
@@ -1027,8 +987,20 @@ def run_native(program, program_inputs, input_name, raw_log_path, *,
 # Single-input processing
 # ---------------------------------------------------------------------------
 
+DIAGNOSTIC_STEP_LIMIT_EXIT_CODE = 75
+
+
+@dataclass(frozen=True)
+class InputStepLimit:
+    """Typed worker result for an execution that exhausted its step budget."""
+
+    input_name: str
+    max_steps: int
+
 def process_single_input(input_file, test_name, test_path, *,
                          no_read_trace=False,
+                         no_trace=False,
+                         max_steps=0,
                          program=None, field_sizes=None, compiled=None,
                          prepared=None, debug_logger=None,
                          trace_output_plan: TraceOutputPlan | None = None):
@@ -1050,9 +1022,11 @@ def process_single_input(input_file, test_name, test_path, *,
 
         print(f"Processing input file: {input_file}")
         from interpreter.utils.input_parser import parse_input_file, get_bpl_field_sizes
+        from interpreter.utils.inputs import complete_declared_shadow_inputs
         if field_sizes is None:
             field_sizes = get_bpl_field_sizes(test_path.parent, program=program)
         program_inputs = parse_input_file(input_file, field_sizes=field_sizes)
+        program_inputs = complete_declared_shadow_inputs(program, program_inputs)
 
         trace_dir = (
             trace_output_plan.trace_dir
@@ -1084,10 +1058,23 @@ def process_single_input(input_file, test_name, test_path, *,
                 program, program_inputs, input_name,
                 raw_log_path=raw_log_path,
                 log_read=not no_read_trace,
+                no_trace=no_trace,
+                max_steps=max_steps,
                 compiled=compiled if prepared is None else None,
                 debug_logger=debug,
                 prepared=prepared,
             )
+        except TimeoutError as exc:
+            # A semantic step bound is an inconclusive diagnostic execution,
+            # never a non-falsifying observation.  Keep the marker typed so
+            # try-violate can distinguish it from both a completed run and an
+            # infrastructure crash without parsing exception prose.
+            print(f"[STEP_LIMIT] input={input_name} max_steps={max_steps}")
+            debug.event(
+                "exec", "input_step_limit", max_steps=max_steps,
+                detail=str(exc),
+            )
+            return InputStepLimit(input_name=input_name, max_steps=max_steps)
         except AssertViolation as v:
             # Structured line for agent_loop's subprocess parser.  The
             # parent process reads child stdout to collect per-input
@@ -1153,11 +1140,15 @@ def process_single_input(input_file, test_name, test_path, *,
 
 def _process_input_shared(input_file, test_name, test_path, *,
                           no_read_trace=False,
+                          no_trace=False,
+                          max_steps=0,
                           debug_logger=None, trace_output_plan=None):
     """Worker function that uses fork-inherited _SHARED_* globals."""
     return process_single_input(
         input_file, test_name=test_name, test_path=test_path,
         no_read_trace=no_read_trace,
+        no_trace=no_trace,
+        max_steps=max_steps,
         program=_SHARED_PROGRAM, field_sizes=_SHARED_FIELD_SIZES,
         compiled=_SHARED_COMPILED,
         prepared=_SHARED_PREPARED,
@@ -1238,6 +1229,18 @@ def _main(publication_stack: ExitStack):
     parser.add_argument('--force', action='store_true', help='Force re-interpretation')
     parser.add_argument('--full-trace', action='store_true', help='Write full text trace')
     parser.add_argument('--no-read-trace', action='store_true', help='Skip read tracing')
+    parser.add_argument(
+        '--no-trace', action='store_true',
+        help=(
+            'Skip raw execution-trace creation for a diagnostic input. '
+            'Injected assertion and block-probe outcomes remain available.'),
+    )
+    parser.add_argument(
+        '--max-steps', type=int, default=0,
+        help=(
+            'Maximum native execution steps per input; 0 retains the '
+            'unbounded corpus-tracing default.'),
+    )
     parser.add_argument(
         '--expected-runtime-fingerprint',
         default=None,
@@ -1325,6 +1328,10 @@ def _main(publication_stack: ExitStack):
         parser.error(
             '--diagnostic-input requires an injected assertion or block probe'
         )
+    if args.no_trace and not args.diagnostic_input:
+        parser.error('--no-trace requires --diagnostic-input')
+    if args.max_steps < 0:
+        parser.error('--max-steps must be nonnegative')
     if instrumented_run:
         # Injection/probe runs must actually execute and never reuse stale
         # results. Assertions mutate the program; passive block probes need
@@ -1467,6 +1474,8 @@ def _main(publication_stack: ExitStack):
         test_name=test_name,
         test_path=test_path,
         no_read_trace=args.no_read_trace,
+        no_trace=args.no_trace,
+        max_steps=args.max_steps,
         debug_logger=debug_logger,
         trace_output_plan=worker_output_plan,
     )
@@ -1481,6 +1490,7 @@ def _main(publication_stack: ExitStack):
                        per_input_timeout=per_input_timeout)
     failed = False
     skipped = 0
+    step_limited = 0
     results = []
 
     pending = iter(input_files)
@@ -1503,7 +1513,7 @@ def _main(publication_stack: ExitStack):
         }
 
     def _finish_worker(task, status, payload):
-        nonlocal failed, skipped
+        nonlocal failed, skipped, step_limited
         input_file = task["input_file"]
         input_name = task["input_name"]
         p = task["process"]
@@ -1537,7 +1547,14 @@ def _main(publication_stack: ExitStack):
                                error="worker exited without result")
             failed = True
         elif status == "ok":
-            if payload is not None:
+            if isinstance(payload, InputStepLimit):
+                step_limited += 1
+                debug_logger.event(
+                    "exec", "input_step_limit",
+                    input_file=str(input_file),
+                    max_steps=payload.max_steps,
+                )
+            elif payload is not None:
                 results.append(payload)
         else:
             print(f"Worker failed on {input_name}: {payload}")
@@ -1598,7 +1615,7 @@ def _main(publication_stack: ExitStack):
 
     post_inspection = None
     publication_error = None
-    if instrumented_run or failed or skipped:
+    if instrumented_run or failed or skipped or step_limited:
         # Probe/assert injection changes program semantics but writes to the
         # same diagnostic output paths. Failed/timed-out workers likewise do
         # not own a complete generation. None of those outputs may certify the
@@ -1614,6 +1631,8 @@ def _main(publication_stack: ExitStack):
 
     if skipped:
         print(f"Skipped {skipped} non-terminating input(s)")
+    if step_limited:
+        print(f"Step-limited {step_limited} input(s)")
 
     # A partial resume dispatches only pending inputs.  Include contract-
     # validated outputs in the aggregate so coverage.json still describes the
@@ -1649,6 +1668,8 @@ def _main(publication_stack: ExitStack):
     if failed:
         print("Interpretation did not complete — run again to resume")
         raise SystemExit(1)
+    if step_limited:
+        raise SystemExit(DIAGNOSTIC_STEP_LIMIT_EXIT_CODE)
     if publication_error is not None:
         print(f"Interpretation did not produce a complete trace bundle — {publication_error}")
         raise SystemExit(1)

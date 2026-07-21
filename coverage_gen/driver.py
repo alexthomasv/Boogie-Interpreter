@@ -169,6 +169,7 @@ def _run_eval(evaluator, program_inputs, input_name):
     return {
         "covered": set(result.covered or []),
         "status": result.status,
+        "covered_edges": tuple(getattr(result, "covered_edges", ()) or ()),
         "block_sequence": tuple(result.block_sequence or ()),
         "violation_pc": result.violation_pc,
         "violation_block": result.violation_block,
@@ -518,9 +519,15 @@ def _sample_blocks(blocks: set, limit: int = 4) -> str:
 
 def _result_path_features(result: dict, covered: set | None = None) -> dict:
     sequence = tuple(result.get("block_sequence") or ())
-    if not sequence and covered:
+    compact_edges = result.get("covered_edges")
+    if not sequence and covered and compact_edges is None:
         sequence = tuple(sorted(covered))
-    return path_features_from_sequence(sequence)
+    features = path_features_from_sequence(sequence)
+    if compact_edges is not None:
+        features["edges"] = tuple(sorted(
+            set(features["edges"]) | set(compact_edges)
+        ))
+    return features
 
 
 def _record_candidate_result(corpus, out_dir: Path, candidate, covered: set,
@@ -1469,6 +1476,7 @@ def _load_seeds(seed_dir: Path, corpus, executor: CoverageExecutor,
                 *, debug_candidates: bool = False, debug_logger=None) -> int:
     from interpreter.coverage_gen.corpus import _extract_params_line
     from interpreter.utils.input_parser import parse_input_file
+    from interpreter.utils.inputs import complete_declared_shadow_inputs
 
     debug = debug_logger or DebugLogger.disabled()
     seed_dir = Path(seed_dir)
@@ -1480,7 +1488,12 @@ def _load_seeds(seed_dir: Path, corpus, executor: CoverageExecutor,
     parsed = []
     for p in sorted(seed_dir.glob("*.input")):
         try:
-            parsed.append((p, parse_input_file(p), _extract_params_line(p)))
+            inputs = parse_input_file(p)
+            inputs = complete_declared_shadow_inputs(
+                executor.evaluator.program,
+                inputs,
+            )
+            parsed.append((p, inputs, _extract_params_line(p)))
         except Exception as exc:
             corpus.invalid_inputs += 1
             print(f"[corpus] Warning: could not load seed {p.name}: {exc}")

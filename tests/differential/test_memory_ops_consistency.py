@@ -2,7 +2,13 @@ import textwrap
 
 import pytest
 
-from interpreter.tests.helpers.boogie_cases import run_native_case
+from interpreter.tests.helpers.boogie_cases import (
+    assert_replay_strictly_increases_coverage,
+    concolic_candidates,
+    replay_candidates,
+    run_native_case,
+    scalar_inputs,
+)
 
 
 pytestmark = [pytest.mark.differential, pytest.mark.native]
@@ -228,3 +234,126 @@ def test_native_llvm_memmove_call_updates_byte_maps_with_overlap(tmp_path):
     assert summary["$M.0.shadow"]["entries"] == 5
     assert summary["$M.0.shadow"]["min_addr"] == 200
     assert summary["$M.0.shadow"]["max_addr"] == 204
+
+
+def test_native_llvm_memmove_four_arg_call_preserves_overlap_snapshot(tmp_path):
+    source = textwrap.dedent(
+        """
+        procedure llvm.memmove.p0.p0.i64(
+          dst: ref, src: ref, len: i64, volatile: i1);
+
+        procedure main();
+        implementation {:entrypoint} main() {
+          var $M.0: [ref]i8;
+          var out0: i8;
+          var out1: i8;
+          var out2: i8;
+          var out3: i8;
+          var out4: i8;
+        entry:
+          $M.0 := $store.i8($M.0, 100, 1);
+          $M.0 := $store.i8($M.0, 101, 2);
+          $M.0 := $store.i8($M.0, 102, 3);
+          $M.0 := $store.i8($M.0, 103, 4);
+          $M.0 := $store.i8($M.0, 104, 5);
+          call llvm.memmove.p0.p0.i64(102, 100, 3, 0bv1);
+          out0 := $load.i8($M.0, 100);
+          out1 := $load.i8($M.0, 101);
+          out2 := $load.i8($M.0, 102);
+          out3 := $load.i8($M.0, 103);
+          out4 := $load.i8($M.0, 104);
+          return;
+        }
+        """
+    )
+
+    result = run_native_case(
+        source,
+        tmp_path=tmp_path,
+        test_name="llvm_memmove_four_arg",
+        return_scalar_summary=True,
+    )
+
+    assert result["status"] == "ok"
+    scalars = result["final_scalars"]
+    assert [scalars[f"out{i}"] for i in range(5)] == [1, 2, 1, 2, 3]
+
+
+def test_native_llvm_memmove_malformed_arity_fails_closed(tmp_path):
+    source = textwrap.dedent(
+        """
+        procedure llvm.memmove.p0.p0.i64.bad(
+          dst: ref, src: ref, len: i64, volatile: i1, extra: i1);
+
+        procedure main();
+        implementation {:entrypoint} main() {
+        entry:
+          call llvm.memmove.p0.p0.i64.bad(102, 100, 3, 0bv1, 0bv1);
+          return;
+        }
+        """
+    )
+
+    result = run_native_case(
+        source,
+        tmp_path=tmp_path,
+        test_name="llvm_memmove_bad_arity",
+    )
+
+    assert result["status"] == "assume_violation"
+    assert result["invalid_reason"] == "invalid_memmove"
+    assert "got 5 arguments" in result["invalid_detail"]
+
+
+def test_concolic_llvm_memmove_four_arg_propagates_symbolic_byte(tmp_path):
+    source = textwrap.dedent(
+        """
+        procedure llvm.memmove.p0.p0.i64(
+          dst: ref, src: ref, len: i64, volatile: i1);
+
+        procedure main($x: int);
+        implementation {:entrypoint} main($x: int) {
+          var $M.0: [ref]i8;
+        entry:
+          $M.0 := $store.i8($M.0, 100, $x);
+          $M.0 := $store.i8($M.0, 101, 0);
+          call llvm.memmove.p0.p0.i64(101, 100, 1, 0bv1);
+          goto seed, target;
+        seed:
+          assume $load.i8($M.0, 101) == 0;
+          return;
+        target:
+          assume $load.i8($M.0, 101) == 66;
+          return;
+        }
+        """
+    )
+    inputs = scalar_inputs({"$x": 0})
+    seed = run_native_case(
+        source,
+        inputs,
+        tmp_path=tmp_path,
+        test_name="llvm_memmove_concolic_seed",
+    )
+    assert seed["status"] == "ok"
+
+    candidates, stats = concolic_candidates(
+        source,
+        inputs,
+        set(seed["explored_blocks"]),
+        tmp_path=tmp_path,
+        test_name="llvm_memmove_concolic",
+        max_solver_queries=16,
+    )
+    assert candidates, stats
+    replayed = replay_candidates(
+        source,
+        candidates,
+        tmp_path=tmp_path,
+        test_name="llvm_memmove_concolic_replay",
+    )
+    assert_replay_strictly_increases_coverage(
+        set(seed["explored_blocks"]),
+        replayed,
+        expected_new_blocks={"target"},
+    )

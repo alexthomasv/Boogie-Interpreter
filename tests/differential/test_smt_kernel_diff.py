@@ -231,6 +231,16 @@ def _build_cases():
             add(f"core{op}/{tag}", "({a} %s {b})" % op, pair, 64, covers,
                 lanes=lanes)
 
+    # ---- Core BinOp: division / modulus ---------------------------------
+    # Generic Boogie `/` and `%` are Euclidean Int operations in the integer
+    # lane and unsigned bvudiv/bvurem in the BV lane. Zero divisors are total
+    # only in BV; Int follows SMT-LIB's undefined interpretation and the
+    # native engine refuses to fabricate a concrete value.
+    for op, covers in [("/", "BinOp::Div"), ("%", "BinOp::Mod")]:
+        for tag, pair in _div_pairs(64, rng):
+            add(f"core{op}/{tag}", "({a} %s {b})" % op, pair, 64, covers,
+                isolated=(tag == "by_zero"))
+
     # ---- Core BinOp: comparisons / equality ------------------------------
     # bv lane uses BV64 operand sorts, where the model maps < to UNSIGNED
     # bvult — so signed/unsigned-ambiguous operands (negatives) run int-lane
@@ -531,6 +541,7 @@ _OPCODES_RS_BINOPS = [
     "BinOp::Eq", "BinOp::Ne", "BinOp::Lt", "BinOp::Gt", "BinOp::Le",
     "BinOp::Ge", "BinOp::And", "BinOp::Or", "BinOp::Implies", "BinOp::Iff",
     "BinOp::Sub", "BinOp::Mul", "BinOp::Add",
+    "BinOp::Div", "BinOp::Mod",
 ]
 _OPCODES_RS_BUILTINS = [
     "Add", "Sub", "Mul", "And", "Or", "Xor", "Not{bits}", "Shl", "Lshr",

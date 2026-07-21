@@ -200,6 +200,7 @@ fn_to_cvc5_op = {
     "-": (Kind.SUB, 2, None, None),
     "*": (Kind.MULT, 2, None, None),
     "/": (Kind.DIVISION, 2, None, None),
+    "%": (Kind.INTS_MODULUS, 2, None, None),
 }
 
 # Reverse mapping: cvc5 Kind → SMACK function name (prefer i32 for BV32)
@@ -208,6 +209,17 @@ for _name, (_kind, _nargs, _width, _out) in fn_to_cvc5_op.items():
     if _name.startswith("$") and _width == 32 and _kind is not None:
         if _kind not in _CVC5_KIND_TO_BOOGIE:
             _CVC5_KIND_TO_BOOGIE[_kind] = _name
+
+
+class Cvc5ToBoogieLoweringUnavailable(ValueError):
+    """The host has no semantics-preserving Boogie lowering for a cvc5 term.
+
+    This is deliberately distinct from malformed caller input.  Native proof
+    obligations can contain well-formed cvc5 operators that this converter has
+    not implemented yet; concrete falsification must report that condition as
+    non-semantic infrastructure unavailability instead of blaming the model's
+    exact proof-obligation identifier.
+    """
 
 
 def cvc5_to_boogie(term) -> str:
@@ -227,7 +239,12 @@ def cvc5_to_boogie(term) -> str:
     return repr(cvc5_to_boogie_ast(term))
 
 
-def cvc5_to_boogie_ast(term, depth: int = 0):
+def cvc5_to_boogie_ast(
+    term,
+    depth: int = 0,
+    *,
+    preserve_ite_values: bool = False,
+):
     """Structurally lower a cvc5 ``Term`` into a Boogie expression AST — the
     SAME ``interpreter.parser.expression`` nodes the Boogie parser builds —
     WITHOUT round-tripping through an infix display string.
@@ -245,7 +262,8 @@ def cvc5_to_boogie_ast(term, depth: int = 0):
     deserialized and lowered here straight into the ``assert`` AST the native
     interpreter evaluates — no printed-text parse in the loop.
 
-    Raises ``ValueError`` on a ``Kind`` it cannot lower.
+    Raises :class:`Cvc5ToBoogieLoweringUnavailable` on a well-formed ``Kind``
+    for which this host has no semantics-preserving lowering.
     """
     from interpreter.parser.expression import (
         BinaryExpression, LogicalNegation, ArithmeticNegation,
@@ -274,7 +292,86 @@ def cvc5_to_boogie_ast(term, depth: int = 0):
         return StorageIdentifier(name=sym)
 
     kind = term.getKind()
-    rec = lambda i: cvc5_to_boogie_ast(term[i], depth + 1)
+    rec = lambda i: cvc5_to_boogie_ast(
+        term[i], depth + 1, preserve_ite_values=preserve_ite_values)
+
+    def _op_indices(value):
+        op = value.getOp()
+        return tuple(int(str(op[i])) for i in range(op.getNumIndices()))
+
+    def _unsigned_bv(value, value_depth):
+        """Lower a BV value to its exact unsigned mathematical integer.
+
+        Integer-encoding simplification routinely turns source intrinsics into
+        ``ubv_to_int(concat(extract(int_to_bv(x)), ...))``.  Reconstruct that
+        value with integer modulus/division/arithmetic, whose operands are
+        exact and non-negative at every extraction boundary.  Unsupported BV
+        operators retain a typed failure instead of receiving an approximate
+        source expression.
+        """
+        if value_depth > 60:
+            raise Cvc5ToBoogieLoweringUnavailable(
+                "cvc5_to_boogie_ast: bitvector nesting exceeds 60")
+        value_kind = value.getKind()
+        value_n = value.getNumChildren()
+        if value_n == 0 and value.isBitVectorValue():
+            return IntegerLiteral(int(value.getBitVectorValue(), 2))
+        if value_kind == Kind.INT_TO_BITVECTOR and value_n == 1:
+            width = value.getSort().getBitVectorSize()
+            source = cvc5_to_boogie_ast(
+                value[0], value_depth + 1,
+                preserve_ite_values=preserve_ite_values)
+            return BinaryExpression(
+                lhs=source, op="%", rhs=IntegerLiteral(1 << width))
+        if value_kind == Kind.BITVECTOR_EXTRACT and value_n == 1:
+            high, low = _op_indices(value)
+            source = _unsigned_bv(value[0], value_depth + 1)
+            shifted = source if low == 0 else BinaryExpression(
+                lhs=source, op="/", rhs=IntegerLiteral(1 << low))
+            extracted_width = high - low + 1
+            return BinaryExpression(
+                lhs=shifted, op="%",
+                rhs=IntegerLiteral(1 << extracted_width))
+        if value_kind == Kind.BITVECTOR_CONCAT and value_n >= 2:
+            result = _unsigned_bv(value[0], value_depth + 1)
+            for index in range(1, value_n):
+                child = value[index]
+                child_width = child.getSort().getBitVectorSize()
+                result = BinaryExpression(
+                    lhs=BinaryExpression(
+                        lhs=result, op="*",
+                        rhs=IntegerLiteral(1 << child_width)),
+                    op="+",
+                    rhs=_unsigned_bv(child, value_depth + 1),
+                )
+            return result
+        if value_kind == Kind.BITVECTOR_ZERO_EXTEND and value_n == 1:
+            return _unsigned_bv(value[0], value_depth + 1)
+        if value_kind in {
+                Kind.BITVECTOR_ADD, Kind.BITVECTOR_SUB,
+                Kind.BITVECTOR_MULT} and value_n == 2:
+            op = {
+                Kind.BITVECTOR_ADD: "+",
+                Kind.BITVECTOR_SUB: "-",
+                Kind.BITVECTOR_MULT: "*",
+            }[value_kind]
+            arithmetic = BinaryExpression(
+                lhs=_unsigned_bv(value[0], value_depth + 1), op=op,
+                rhs=_unsigned_bv(value[1], value_depth + 1))
+            return BinaryExpression(
+                lhs=arithmetic, op="%",
+                rhs=IntegerLiteral(
+                    1 << value.getSort().getBitVectorSize()))
+        if value_kind == Kind.BITVECTOR_NEG and value_n == 1:
+            arithmetic = ArithmeticNegation(
+                expression=_unsigned_bv(value[0], value_depth + 1))
+            return BinaryExpression(
+                lhs=arithmetic, op="%",
+                rhs=IntegerLiteral(
+                    1 << value.getSort().getBitVectorSize()))
+        raise Cvc5ToBoogieLoweringUnavailable(
+            "cvc5_to_boogie_ast: unsigned bitvector lowering unavailable for "
+            f"{value_kind} (nchildren={value_n})")
 
     # --- unary ---
     if kind == Kind.NOT:
@@ -286,6 +383,21 @@ def cvc5_to_boogie_ast(term, depth: int = 0):
         return FunctionApplication(
             function=FunctionIdentifier(name=f"$sub.i{w}"),
             arguments=[IntegerLiteral(0), rec(0)])
+    if kind == Kind.INT_TO_BITVECTOR:
+        return _unsigned_bv(term, depth)
+    if kind == Kind.BITVECTOR_UBV_TO_INT and n == 1:
+        return _unsigned_bv(term[0], depth + 1)
+    if kind == Kind.BITVECTOR_SBV_TO_INT and n == 1:
+        width = term[0].getSort().getBitVectorSize()
+        unsigned = _unsigned_bv(term[0], depth + 1)
+        return IfExpression(
+            condition=BinaryExpression(
+                lhs=unsigned.clone(), op=">=",
+                rhs=IntegerLiteral(1 << (width - 1))),
+            then=BinaryExpression(
+                lhs=unsigned.clone(), op="-", rhs=IntegerLiteral(1 << width)),
+            else_=unsigned,
+        )
 
     # --- n-ary connectives / arithmetic folded left into binary nodes ---
     _FOLD = {Kind.AND: "&&", Kind.OR: "||", Kind.ADD: "+", Kind.MULT: "*"}
@@ -301,6 +413,30 @@ def cvc5_to_boogie_ast(term, depth: int = 0):
             Kind.SUB: "-", Kind.INTS_DIVISION: "/", Kind.INTS_MODULUS: "%"}
     if kind in _BIN and n == 2:
         return BinaryExpression(lhs=rec(0), op=_BIN[kind], rhs=rec(1))
+
+    # cvc5's explicitly total integer operators have fixed zero-divisor
+    # values: div_total(x, 0) = 0 and mod_total(x, 0) = x.  Preserve those
+    # values explicitly instead of delegating the zero case to Boogie's
+    # backend-specific division/modulus interpretation.
+    if kind in {Kind.INTS_DIVISION_TOTAL, Kind.INTS_MODULUS_TOTAL} and n == 2:
+        numerator = rec(0)
+        denominator = rec(1)
+        condition = BinaryExpression(
+            lhs=denominator.clone(), op="==", rhs=IntegerLiteral(0))
+        arithmetic = BinaryExpression(
+            lhs=numerator.clone(),
+            op="/" if kind == Kind.INTS_DIVISION_TOTAL else "%",
+            rhs=denominator,
+        )
+        zero_value = (
+            IntegerLiteral(0)
+            if kind == Kind.INTS_DIVISION_TOTAL else numerator
+        )
+        return IfExpression(
+            condition=condition,
+            then=zero_value,
+            else_=arithmetic,
+        )
 
     # n-ary DISTINCT: all-pairwise !=  (rare; cvc5 usually binarizes)
     if kind == Kind.DISTINCT and n > 2:
@@ -325,7 +461,8 @@ def cvc5_to_boogie_ast(term, depth: int = 0):
                 return False
             return False
         # bool->bv cast ITE(c, 1, 0) is just the boolean c (matches cvc5_to_boogie)
-        if _leaf_val(term[1], 1) and _leaf_val(term[2], 0):
+        if (not preserve_ite_values
+                and _leaf_val(term[1], 1) and _leaf_val(term[2], 0)):
             return rec(0)
         return IfExpression(condition=rec(0), then=rec(1), else_=rec(2))
 
@@ -351,10 +488,14 @@ def cvc5_to_boogie_ast(term, depth: int = 0):
                 and hi.getKind() == Kind.BITVECTOR_EXTRACT):
             n_zeros = lo.getSort().getBitVectorSize()
             return _mul32(IntegerLiteral(1 << n_zeros),
-                          cvc5_to_boogie_ast(hi[0], depth + 1))
+                          cvc5_to_boogie_ast(
+                              hi[0], depth + 1,
+                              preserve_ite_values=preserve_ite_values))
         # CONCAT(#b0..0, x) -> x  (zero-extension, transparent in Boogie)
         if hi.isBitVectorValue() and int(hi.getBitVectorValue(), 2) == 0:
-            return cvc5_to_boogie_ast(lo, depth + 1)
+            return cvc5_to_boogie_ast(
+                lo, depth + 1,
+                preserve_ite_values=preserve_ite_values)
 
     if kind == Kind.BITVECTOR_ADD and n == 2:
         a, b = term[0], term[1]
@@ -363,20 +504,28 @@ def cvc5_to_boogie_ast(term, depth: int = 0):
                 and b.getKind() == Kind.BITVECTOR_NEG
                 and str(a[0]) == str(a[1]) == str(b[0])):
             w = term.getSort().getBitVectorSize()
-            return _mul32(cvc5_to_boogie_ast(a[0], depth + 1),
+            return _mul32(cvc5_to_boogie_ast(
+                              a[0], depth + 1,
+                              preserve_ite_values=preserve_ite_values),
                           FunctionApplication(
                               function=FunctionIdentifier(name=f"$sub.i{w}"),
-                              arguments=[cvc5_to_boogie_ast(a[0], depth + 1),
+                              arguments=[cvc5_to_boogie_ast(
+                                  a[0], depth + 1,
+                                  preserve_ite_values=preserve_ite_values),
                                          IntegerLiteral(1)]))
         # X^2 + X  ->  $mul.i32(X, $add.iW(X, 1))
         if (a.getKind() == Kind.BITVECTOR_MULT and a.getNumChildren() == 2
                 and b.getKind() == Kind.CONSTANT and b.getSort().isBitVector()
                 and str(a[0]) == str(a[1]) == str(b)):
             w = term.getSort().getBitVectorSize()
-            return _mul32(cvc5_to_boogie_ast(a[0], depth + 1),
+            return _mul32(cvc5_to_boogie_ast(
+                              a[0], depth + 1,
+                              preserve_ite_values=preserve_ite_values),
                           FunctionApplication(
                               function=FunctionIdentifier(name=f"$add.i{w}"),
-                              arguments=[cvc5_to_boogie_ast(a[0], depth + 1),
+                              arguments=[cvc5_to_boogie_ast(
+                                  a[0], depth + 1,
+                                  preserve_ite_values=preserve_ite_values),
                                          IntegerLiteral(1)]))
 
     # --- SMACK intrinsic / BV-op function calls ($add.i32, $sge.i32, ...) ---
@@ -385,7 +534,7 @@ def cvc5_to_boogie_ast(term, depth: int = 0):
             function=FunctionIdentifier(name=_CVC5_KIND_TO_BOOGIE[kind]),
             arguments=[rec(i) for i in range(n)])
 
-    raise ValueError(
+    raise Cvc5ToBoogieLoweringUnavailable(
         f"cvc5_to_boogie_ast: unhandled kind {kind} (nchildren={n})")
 
 
@@ -663,7 +812,8 @@ _INT_ENC_FN_MAP = {
     "+":  (Kind.ADD, 2, None, None),
     "-":  (Kind.SUB, 2, None, None),
     "*":  (Kind.MULT, 2, None, None),
-    "/":  (Kind.DIVISION, 2, None, None),
+    "/":  (Kind.INTS_DIVISION, 2, None, None),
+    "%":  (Kind.INTS_MODULUS, 2, None, None),
     "&&": (Kind.AND, 2, bool, bool),
     "||": (Kind.OR, 2, bool, bool),
     "==>": (Kind.IMPLIES, 2, None, None),
@@ -903,6 +1053,7 @@ def convert_expr_cvc5(cvc5_fn_map, state_cache, solver, expr, mono_mem: bool) ->
                     Kind.SUB: Kind.BITVECTOR_SUB,
                     Kind.MULT: Kind.BITVECTOR_MULT,
                     Kind.DIVISION: Kind.BITVECTOR_UDIV,
+                    Kind.INTS_MODULUS: Kind.BITVECTOR_UREM,
                     Kind.LT: Kind.BITVECTOR_ULT,
                     Kind.LEQ: Kind.BITVECTOR_ULE,
                     Kind.GT: Kind.BITVECTOR_UGT,
@@ -1191,8 +1342,13 @@ def deserialize_state_key(state_cache, state_key):
     predicate = obligation.predicate
     predicate.predicate = _deserialize_cvc5_term(
         state_cache, predicate.predicate)
-    return ProofObligation.from_predicate(
-        obligation.pc, predicate, solver=state_cache.solver)
+    # ``state_key`` already authenticates one canonical predicate wire.
+    # Materialization changes only its representation from solver-independent
+    # serde to a live cvc5 Term; running the semantic canonicalizer again can
+    # move a non-fixpoint legacy/current-run identity while leaving the native
+    # bytes unchanged.  The ordinary constructor recognizes the retained
+    # ``_canonical_serialized`` authority and makes an identity-only copy.
+    return ProofObligation(obligation.pc, predicate)
 
 
 def deserialize_predicate_pickle(state_cache, raw: bytes):

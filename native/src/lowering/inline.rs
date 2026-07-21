@@ -51,6 +51,21 @@ struct Inliner<'py> {
     inline_names: FxHashSet<String>,
     /// Global instance counter — unique per inline expansion.
     counter: u32,
+    /// Every future generated-frame prefix that would collide with a storage
+    /// name or block label already in scope. Indexing candidate prefixes
+    /// directly keeps the collision check O(1); scanning every generated name
+    /// at every call makes large inline expansions quadratic. Prefix numbers
+    /// below `counter` are omitted because the global counter never revisits
+    /// them, which keeps ordinary expansions out of this set entirely.
+    forbidden_frame_prefixes: FxHashSet<String>,
+    /// Source labels in the root procedure. These are the only labels that can
+    /// collide with a synthetic continuation: generated frame labels start
+    /// with `inline$`, while continuations start with `$inline_cont$`.
+    ///
+    /// Generated continuations are deliberately not retained here. Their
+    /// numeric component is the successful frame number from the monotonic
+    /// global counter, so two calls cannot generate the same base label.
+    root_labels: FxHashSet<String>,
     /// Procedures on the current DFS path (the recursion bound).
     active: FxHashSet<String>,
     /// Count of recursive call sites left as residual havoc (Boogie {:inline 1}).
@@ -60,6 +75,11 @@ struct Inliner<'py> {
     /// Empty label map for `lower_stmt` on plain statements (which never read
     /// it — gotos are handled here, and If/While bodies carry no gotos).
     empty_labels: FxHashMap<String, BlockId>,
+    /// Loaded/in-memory programs retain every name lookup for diagnostics.
+    /// File packages rebuild only the small external lookup they need at load
+    /// time, so completed inline frames can release their lowering-only index
+    /// entries immediately.
+    retain_runtime_name_lookup: bool,
 }
 
 /// Inline `{:inline}` procedures and lower to a `CompiledProgram`. The program
@@ -68,6 +88,7 @@ pub fn inline_lower_program<'py>(
     py: Python<'py>,
     program: &Bound<'py, PyAny>,
     static_scalars: Option<&Bound<'py, PyDict>>,
+    retain_runtime_name_lookup: bool,
     mode: crate::opcodes::SemanticsMode,
 ) -> PyResult<CompiledProgram> {
     let declarations = program.getattr("declarations")?;
@@ -147,10 +168,13 @@ pub fn inline_lower_program<'py>(
         body_by_name,
         inline_names,
         counter: 0,
+        forbidden_frame_prefixes: FxHashSet::default(),
+        root_labels: FxHashSet::default(),
         active: FxHashSet::default(),
         bounded_recursions: 0,
         dead_block_cutoffs: 0,
         empty_labels: FxHashMap::default(),
+        retain_runtime_name_lookup,
     };
 
     if std::env::var("INLINE_DEBUG").is_ok() {
@@ -168,6 +192,14 @@ pub fn inline_lower_program<'py>(
     inl.process_globals(decls)?;
     inl.process_impl_locals(&entry, /*frame*/ None)?;
     inl.process_impl_params(&entry, /*frame*/ None)?;
+    // Match `AstInliner._prepare_root`: only the entry implementation's
+    // storage and labels occupy the root procedure's local namespace.
+    let root_storage = inl.callee_local_set(&entry)?;
+    let root_labels = inl.impl_label_set(&entry)?;
+    for name in root_storage.iter().chain(root_labels.iter()) {
+        reserve_candidate_frame_prefixes(&mut inl.forbidden_frame_prefixes, name, 0);
+    }
+    inl.root_labels = root_labels;
 
     let entry_preconditions = lower_entry_preconditions(py, &entry, &mut inl.intern)?;
 
@@ -190,6 +222,33 @@ pub fn inline_lower_program<'py>(
             inl.dead_block_cutoffs
         );
     }
+
+    // Resolve every name-based datum while the lowering index is live. The
+    // index is not serialized, so file builds can release it before allocating
+    // the final block vector and avoid carrying the dominant interner table
+    // through assembly and compression.
+    let curr_addr_id = inl.intern.get("$CurrAddr");
+    let curr_addr_shadow_id = inl.intern.get("$CurrAddr.shadow");
+    let m0_id = inl.intern.get("$M.0");
+    let m0_shadow_id = inl.intern.get("$M.0.shadow");
+
+    let mut baked_scalars: Vec<(VarId, i64)> = Vec::new();
+    if let Some(d) = static_scalars {
+        for (k, v) in d.iter() {
+            let name: String = k.extract()?;
+            let value: i64 = v.extract()?;
+            if let Some(vid) = inl.intern.get(&name) {
+                baked_scalars.push((vid, value));
+            }
+        }
+    }
+    let name_index = if retain_runtime_name_lookup {
+        inl.intern.take_lookup()
+    } else {
+        inl.intern.clear_lookup();
+        NameIndex::default()
+    };
+    let num_vars = inl.intern.len();
 
     // Assign BlockIds and build label_to_block (last wins on duplicate labels,
     // matching the live build + Python's initialize_code_metadata).
@@ -226,12 +285,15 @@ pub fn inline_lower_program<'py>(
                     Stmt::Goto { targets: ids }
                 }
             };
+            let owns_pc = !stmt.is_internal_maintenance();
             if j + 1 < n {
                 body_stmts.push(stmt);
             } else {
                 terminator = stmt;
             }
-            pc += 1;
+            if owns_pc {
+                pc += 1;
+            }
         }
 
         // assume_cond: first non-trivial assume among the leading statements.
@@ -243,7 +305,7 @@ pub fn inline_lower_program<'py>(
                     assume_cond = Some(expr.clone());
                     break;
                 }
-                Stmt::AssumeTrue => continue,
+                Stmt::AssumeTrue | Stmt::ReleaseMaps { .. } => continue,
                 _ => break,
             }
         }
@@ -265,37 +327,20 @@ pub fn inline_lower_program<'py>(
     // Resolve $CurrAddr allocation sizes on the lowered IR.
     resolve_alloc_sizes(&mut blocks, inl.intern.names());
 
-    let curr_addr_id = inl.intern.get("$CurrAddr");
-    let curr_addr_shadow_id = inl.intern.get("$CurrAddr.shadow");
-    let m0_id = inl.intern.get("$M.0");
-    let m0_shadow_id = inl.intern.get("$M.0.shadow");
-
-    // Resolve the compile-time static-scalar seeds (name→value, computed in
-    // Python from the un-inlined program) to (VarId, value) and bake them in, so
-    // the serialized package seeds them at init with no Python-AST native_meta.
-    let mut baked_scalars: Vec<(VarId, i64)> = Vec::new();
-    if let Some(d) = static_scalars {
-        for (k, v) in d.iter() {
-            let name: String = k.extract()?;
-            let value: i64 = v.extract()?;
-            if let Some(vid) = inl.intern.get(&name) {
-                baked_scalars.push((vid, value));
-            }
-        }
-    }
-
     super::normalize_is_external_assumes(&mut blocks);
 
     let n_blocks = blocks.len();
+    let mode = inl.intern.mode;
+    let var_names = std::sync::Arc::new(inl.intern.take_names());
     Ok(CompiledProgram {
         blocks,
         label_to_block,
-        var_names: inl.intern.names().to_vec(),
-        name_to_var: std::mem::take(&mut inl.intern.map),
+        var_names,
+        name_index,
         entry_block: 0,
         entry_preconditions,
         mem_maps: inl.mem_maps,
-        num_vars: inl.intern.len(),
+        num_vars,
         curr_addr_id,
         curr_addr_shadow_id,
         m0_id,
@@ -307,7 +352,7 @@ pub fn inline_lower_program<'py>(
         block_innermost_header: vec![None; n_blocks],
         loop_parent_header: vec![None; n_blocks],
         static_scalars: baked_scalars,
-        mode: inl.intern.mode,
+        mode,
     })
 }
 
@@ -351,7 +396,7 @@ impl<'py> Inliner<'py> {
             for item in names_list.iter() {
                 let raw: String = item.extract()?;
                 let var_id = self.intern.intern(&raw); // frame-aware prefixing
-                let name = self.intern.names()[var_id as usize].clone();
+                let name = self.intern.names()[var_id as usize].to_string();
                 self.mem_maps.push(MemMapInfo {
                     name,
                     var_id,
@@ -579,17 +624,31 @@ impl<'py> Inliner<'py> {
     /// Splice an inlinable call: bind params, jump to the callee entry, inline
     /// the callee body, then bind returns in a fresh continuation block.
     fn inline_call(&mut self, stmt: &Bound<'py, PyAny>, callee: &str) -> PyResult<()> {
-        let n = self.counter;
-        self.counter += 1;
-        let prefix = format!("inline${}${}$", callee, n);
-        if std::env::var("INLINE_DEBUG").is_ok() {
-            eprintln!("[inline_lower] inlining call #{} to {}", n, callee);
-        }
-
         let impl_decl = self.body_by_name.get(callee).unwrap().clone();
         let params = flatten_names(&impl_decl, "parameters")?;
         let returns = flatten_names(&impl_decl, "returns")?;
         let callee_locals = self.callee_local_set(&impl_decl)?;
+        let callee_labels = self.impl_label_set(&impl_decl)?;
+        let (n, prefix) = self.fresh_frame_prefix(callee, &callee_locals, &callee_labels);
+        if std::env::var("INLINE_DEBUG").is_ok() {
+            eprintln!("[inline_lower] inlining call #{} to {}", n, callee);
+        }
+
+        // Boogie gives every out parameter and body local a fresh value on
+        // each dynamic procedure activation. A static inline frame may be
+        // re-entered by a loop, so reset those slots before binding inputs.
+        // Keep this as one statement to match AstInliner's one parallel havoc
+        // and therefore preserve proof/native PC alignment. In concrete mode
+        // Havoc selects zero; map-typed slots are cleared by VM::clear_var.
+        let local_names = flatten_body_local_names(&impl_decl)?;
+        let fresh_vars: Vec<VarId> = returns
+            .iter()
+            .chain(local_names.iter())
+            .map(|name| self.intern.intern_raw(&format!("{}{}", prefix, name)))
+            .collect();
+        if !fresh_vars.is_empty() {
+            self.push(ProtoStmt::Lowered(Stmt::Havoc { vars: fresh_vars }));
+        }
 
         // in-param bindings: `inline$Q$N$param := arg` (args under caller frame).
         let args = stmt.getattr("arguments")?;
@@ -617,17 +676,38 @@ impl<'py> Inliner<'py> {
             let raw: String = first.getattr("name")?.extract()?;
             format!("{}{}", prefix, raw)
         };
-        let cont_label = format!("$inline_cont${}", n);
+        let cont_label = continuation_label(&self.root_labels, n);
         self.push(ProtoStmt::Goto(vec![entry_label]));
         self.flush_block();
 
         // Inline the callee body under its frame; returns jump to cont_label.
         let frame = Frame {
             prefix: prefix.clone(),
-            locals: callee_locals,
+            locals: callee_locals.clone(),
         };
+        // Capture only this callee's direct frame maps. Nested inline frames
+        // are registered later by `inline_impl` and release themselves at
+        // their own continuations.
+        let direct_map_start = self.mem_maps.len();
         self.process_impl_locals(&impl_decl, Some(clone_frame(&frame)))?;
         self.process_impl_params(&impl_decl, Some(clone_frame(&frame)))?;
+        let completed_frame_vars: Vec<VarId> = if self.retain_runtime_name_lookup {
+            Vec::new()
+        } else {
+            callee_locals
+                .iter()
+                .map(|name| {
+                    let generated = format!("{}{}", prefix, name);
+                    self.intern.get(&generated).unwrap_or_else(|| {
+                        panic!("inline_lower: missing pre-interned frame name {generated}")
+                    })
+                })
+                .collect()
+        };
+        let direct_map_vars: Vec<VarId> = self.mem_maps[direct_map_start..]
+            .iter()
+            .map(|info| info.var_id)
+            .collect();
         self.active.insert(callee.to_string());
         self.inline_impl(&impl_decl, Some(frame), Some(cont_label.clone()))?;
         self.active.remove(callee);
@@ -650,8 +730,61 @@ impl<'py> Inliner<'py> {
             let rhs = Expr::Var(self.intern.intern_raw(&format!("{}{}", prefix, r)));
             self.push(ProtoStmt::Lowered(Stmt::Assign1 { lhs, rhs }));
         }
+        // All return maps now have caller-owned COW snapshots. The callee's
+        // local/parameter/return map slots are dead until this static call site
+        // is entered again, so release their page-table references. This is a
+        // zero-PC maintenance statement (see Stmt::ReleaseMaps).
+        if !direct_map_vars.is_empty() {
+            self.push(ProtoStmt::Lowered(Stmt::ReleaseMaps {
+                vars: direct_map_vars,
+            }));
+        }
+        // No future source expression can name this completed frame: its
+        // continuation has copied every return into the active caller frame,
+        // and all statements already carry numeric VarIds. Retaining these
+        // derived hash entries makes package memory grow with every static
+        // inline expansion even though NameTable itself remains authoritative.
+        for id in completed_frame_vars {
+            assert!(
+                self.intern.remove_lookup(id),
+                "inline_lower: completed frame lookup was already absent"
+            );
+        }
         // The caller's remaining statements accumulate into this continuation.
         Ok(())
+    }
+
+    /// Allocate the next proof-inliner-compatible frame prefix and reserve all
+    /// storage/label names that frame will introduce. Rejected candidates
+    /// still consume their number, matching `AstInliner._fresh_prefix`.
+    fn fresh_frame_prefix(
+        &mut self,
+        callee: &str,
+        storage: &FxHashSet<String>,
+        labels: &FxHashSet<String>,
+    ) -> (u32, String) {
+        loop {
+            let n = self.counter;
+            self.counter += 1;
+            let prefix = format!("inline${}${}$", callee, n);
+            if self.forbidden_frame_prefixes.contains(&prefix) {
+                continue;
+            }
+
+            // Register every candidate prefix represented by the generated
+            // names, not only `prefix` itself. This preserves the exact
+            // starts-with rule even for unusual identifiers containing `$N$`
+            // (e.g. callee `a$1` followed by callee `a`).
+            for name in storage.iter().chain(labels.iter()) {
+                let generated = format!("{}{}", prefix, name);
+                reserve_candidate_frame_prefixes(
+                    &mut self.forbidden_frame_prefixes,
+                    &generated,
+                    self.counter,
+                );
+            }
+            return (n, prefix);
+        }
     }
 
     /// The set of a callee's local + param + return names (the names a frame
@@ -677,12 +810,125 @@ impl<'py> Inliner<'py> {
         }
         Ok(set)
     }
+
+    /// Every source label spelling owned by an implementation, including
+    /// aliases, matching `AstInliner._prepare_root`/`_new_frame`.
+    fn impl_label_set(&self, impl_decl: &Bound<'py, PyAny>) -> PyResult<FxHashSet<String>> {
+        let body = impl_decl.getattr("body")?;
+        let blocks = body.getattr("blocks")?;
+        let blocks_list: &Bound<'_, PyList> = blocks.downcast()?;
+        let mut labels = FxHashSet::default();
+        for block in blocks_list.iter() {
+            let names = block.getattr("names")?;
+            let names_list: &Bound<'_, PyList> = names.downcast()?;
+            for name in names_list.iter() {
+                labels.insert(name.extract()?);
+            }
+        }
+        Ok(labels)
+    }
 }
 
 fn clone_frame(f: &Frame) -> Frame {
     Frame {
         prefix: f.prefix.clone(),
         locals: f.locals.clone(),
+    }
+}
+
+/// Return the proof-inliner-compatible continuation for one successful frame
+/// number. Only root source labels can collide: frame labels have an `inline$`
+/// prefix, and every earlier/later continuation has a different number because
+/// `fresh_frame_prefix` consumes the global counter monotonically.
+///
+/// Keeping generated continuations out of `root_labels` is important for large
+/// programs: there can be millions of calls, while the root source label set is
+/// fixed and small.
+fn continuation_label(root_labels: &FxHashSet<String>, frame_number: u32) -> String {
+    let mut continuation = format!("$inline_cont${frame_number}");
+    while root_labels.contains(&continuation) {
+        continuation.push('$');
+    }
+    continuation
+}
+
+#[cfg(test)]
+mod continuation_label_tests {
+    use super::{continuation_label, FxHashSet};
+
+    /// The proof/Python inliner retains each generated continuation in its
+    /// all-label set. For monotonically increasing frame numbers, consulting
+    /// only the immutable root labels must produce the exact same spellings.
+    #[test]
+    fn root_only_lookup_matches_retaining_algorithm_with_collisions() {
+        let root_labels: FxHashSet<String> = [
+            "entry",
+            "$inline_cont$0",
+            "$inline_cont$0$",
+            "$inline_cont$7",
+            "$inline_cont$19",
+            "$inline_cont$19$",
+            "$inline_cont$19$$",
+            "inline$callee$4$entry",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        let root_len = root_labels.len();
+        let mut retaining_labels = root_labels.clone();
+
+        for frame_number in 0..10_000 {
+            let mut retaining = format!("$inline_cont${frame_number}");
+            while retaining_labels.contains(&retaining) {
+                retaining.push('$');
+            }
+            retaining_labels.insert(retaining.clone());
+
+            assert_eq!(
+                continuation_label(&root_labels, frame_number),
+                retaining,
+                "continuation mismatch at monotonic frame {frame_number}"
+            );
+        }
+
+        assert_eq!(root_labels.len(), root_len, "generation retains no labels");
+        assert_eq!(continuation_label(&root_labels, 0), "$inline_cont$0$$");
+        assert_eq!(continuation_label(&root_labels, 19), "$inline_cont$19$$$");
+    }
+}
+
+/// Add all still-reachable native-inliner frame prefixes that prefix `name`.
+///
+/// A generated prefix has the form `inline$<callee>$<canonical-u32>$`.  A
+/// single name can represent more than one candidate when a callee itself
+/// contains `$N$`, so scan every dollar-delimited canonical integer segment.
+/// Prefix numbers below `minimum_number` cannot be queried by the monotonic
+/// global counter. The resulting hash set is exactly the future predicate
+/// queried by `fresh_frame_prefix`, without retaining or repeatedly scanning
+/// full names.
+fn reserve_candidate_frame_prefixes(out: &mut FxHashSet<String>, name: &str, minimum_number: u32) {
+    const MARKER: &str = "inline$";
+    if !name.starts_with(MARKER) {
+        return;
+    }
+
+    let mut previous_dollar = None;
+    for (index, byte) in name.bytes().enumerate().skip(MARKER.len()) {
+        if byte != b'$' {
+            continue;
+        }
+        if let Some(previous) = previous_dollar {
+            let digits = &name[previous + 1..index];
+            let parsed = digits.parse::<u32>();
+            let canonical = !digits.is_empty()
+                && digits.bytes().all(|digit| digit.is_ascii_digit())
+                && (digits == "0" || !digits.starts_with('0'))
+                && parsed.is_ok();
+            if canonical && parsed.unwrap() >= minimum_number {
+                out.insert(name[..=index].to_string());
+            }
+        }
+        previous_dollar = Some(index);
     }
 }
 
@@ -701,11 +947,27 @@ fn flatten_names(impl_decl: &Bound<'_, PyAny>, attr: &str) -> PyResult<Vec<Strin
     Ok(out)
 }
 
+/// Flatten an implementation body's local declaration names in source order.
+fn flatten_body_local_names(impl_decl: &Bound<'_, PyAny>) -> PyResult<Vec<String>> {
+    let body = impl_decl.getattr("body")?;
+    let locals = body.getattr("locals")?;
+    let locals_list: &Bound<'_, PyList> = locals.downcast()?;
+    let mut out = Vec::new();
+    for declaration in locals_list.iter() {
+        let names = declaration.getattr("names")?;
+        let names_list: &Bound<'_, PyList> = names.downcast()?;
+        for name in names_list.iter() {
+            out.push(name.extract()?);
+        }
+    }
+    Ok(out)
+}
+
 /// Resolve `HavocCurrAddr { alloc_size_var: MAX }` placeholders by scanning each
 /// block for the following `assume` that ties the havoc'd `$CurrAddr` to the
 /// allocation size variable (a `$n…` var). Mirrors the post-pass in
 /// `lower_program_full`, but on the lowered IR.
-fn resolve_alloc_sizes(blocks: &mut [Block], var_names: &[String]) {
+fn resolve_alloc_sizes(blocks: &mut [Block], var_names: &NameTable) {
     for block in blocks.iter_mut() {
         resolve_alloc_in_stmts(&mut block.body, var_names);
     }
@@ -714,7 +976,7 @@ fn resolve_alloc_sizes(blocks: &mut [Block], var_names: &[String]) {
 /// Resolve `HavocCurrAddr` placeholders in one statement list, then recurse into
 /// nested `If`/`While` bodies — allocations from an inlined `$$alloc` live inside
 /// a structured `If`, not at block top-level.
-fn resolve_alloc_in_stmts(stmts: &mut Vec<Stmt>, var_names: &[String]) {
+fn resolve_alloc_in_stmts(stmts: &mut Vec<Stmt>, var_names: &NameTable) {
     let havocs: Vec<(usize, VarId)> = stmts
         .iter()
         .enumerate()
@@ -787,7 +1049,7 @@ fn expr_refs_var(expr: &Expr, target: VarId) -> bool {
     }
 }
 
-fn expr_find_var_named(expr: &Expr, var_names: &[String], substr: &str) -> Option<VarId> {
+fn expr_find_var_named(expr: &Expr, var_names: &NameTable, substr: &str) -> Option<VarId> {
     match expr {
         Expr::Var(v) => {
             if var_names

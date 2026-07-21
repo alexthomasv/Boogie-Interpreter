@@ -56,6 +56,42 @@ def test_selected_worker_replaces_output_pair_without_local_skip(
 
 
 @pytest.mark.unit
+def test_diagnostic_resource_controls_reach_native_execution(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("SWOOSH_OUT_DIR", str(tmp_path))
+    monkeypatch.setattr(
+        "interpreter.utils.input_parser.parse_input_file",
+        lambda *_args, **_kwargs: SimpleNamespace(extra_data=None),
+    )
+    monkeypatch.setattr(runner, "compute_coverage", lambda *_args: {})
+
+    observed = {}
+
+    def _run_native(*_args, **kwargs):
+        observed.update(kwargs)
+        return {"entry"}
+
+    monkeypatch.setattr(runner, "run_native", _run_native)
+    input_file = tmp_path / "diagnostic.input"
+    input_file.write_text("input")
+
+    result = runner.process_single_input(
+        input_file,
+        test_name="demo",
+        test_path=tmp_path / "demo.pkl",
+        no_trace=True,
+        max_steps=123,
+        program=object(),
+        field_sizes={},
+    )
+
+    assert observed["no_trace"] is True
+    assert observed["max_steps"] == 123
+    assert result == ("diagnostic", {}, {"entry"})
+
+
+@pytest.mark.unit
 def test_native_preparation_uses_pinned_package_metadata_bytes(tmp_path):
     test_path = tmp_path / "demo_pkg" / "demo.pkl"
     outputs = {

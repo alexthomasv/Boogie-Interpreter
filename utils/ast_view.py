@@ -154,7 +154,47 @@ def _capture_name(term, captures: dict) -> str:
     return name
 
 
-def _symbol_capture_pattern(term, captures: dict) -> dict[str, Any]:
+def _match_type_from_native_sort(sort) -> dict[str, Any] | None:
+    """Translate one cvc5 sort to the executable match-sort vocabulary.
+
+    The result contains only the semantic type axis.  Callers add the leaf's
+    syntactic class independently, so a native program symbol can become the
+    product sort ``{class: var, type: ...}`` without changing capture identity.
+    Unsupported theories remain untyped instead of being guessed from text.
+    """
+    try:
+        if sort.isInteger():
+            return {"type": "int"}
+        if sort.isReal():
+            return {"type": "real"}
+        if sort.isString():
+            return {"type": "string"}
+        if sort.isBoolean():
+            return {"type": "bool"}
+        if sort.isBitVector():
+            return {
+                "type": "bv",
+                "width": int(sort.getBitVectorSize()),
+            }
+        if sort.isArray():
+            domain = _match_type_from_native_sort(sort.getArrayIndexSort())
+            element = _match_type_from_native_sort(
+                sort.getArrayElementSort())
+            out: dict[str, Any] = {"type": "mem"}
+            if domain is not None:
+                out["domain"] = domain
+            if element is not None:
+                out["element"] = element
+            return out
+    except Exception:
+        return None
+    return None
+
+
+def _symbol_capture_pattern(
+        term, captures: dict, *, include_native_type: bool = False,
+        zero_one_flag_vars: frozenset[str] = frozenset(),
+        ) -> dict[str, Any]:
     """Canonical executable pattern for one non-literal symbolic leaf.
 
     cvc5 represents free program symbols with ``Kind.CONSTANT``.  Preserve that
@@ -167,10 +207,28 @@ def _symbol_capture_pattern(term, captures: dict) -> dict[str, Any]:
         domain = "var" if term.getKind() == Kind.CONSTANT else "subterm"
     except Exception:
         domain = "subterm"
-    return {
+    out: dict[str, Any] = {
         "capture": _capture_name(term, captures),
         "sort": domain,
     }
+    if include_native_type:
+        try:
+            native_type = _match_type_from_native_sort(term.getSort())
+        except Exception:
+            native_type = None
+        if native_type is not None:
+            typed_sort = dict(native_type)
+            if domain == "var":
+                typed_sort["class"] = "var"
+            try:
+                symbol = str(term.getSymbol() or "")
+            except Exception:
+                symbol = ""
+            if (domain == "var" and native_type.get("type") == "int"
+                    and symbol in zero_one_flag_vars):
+                typed_sort["value_domain"] = "zero_one"
+            out["sort"] = typed_sort
+    return out
 
 
 def exact_nullary_literal_pattern(term) -> dict[str, Any]:
@@ -193,7 +251,10 @@ def exact_nullary_literal_pattern(term) -> dict[str, Any]:
 
 
 def term_to_pattern(term, captures: dict[str, str], *,
-                    max_depth: int = 64, _depth: int = 0) -> dict[str, Any]:
+                    max_depth: int = 64, _depth: int = 0,
+                    include_native_types: bool = False,
+                    zero_one_flag_vars: frozenset[str] = frozenset(),
+                    ) -> dict[str, Any]:
     """cvc5 ``Term`` → structural ``pattern`` dict (records leaf captures).
 
     Interior nodes use the raw cvc5 ``Kind`` name (uppercase), which the matcher
@@ -205,7 +266,9 @@ def term_to_pattern(term, captures: dict[str, str], *,
         return {"const": c}
     if term.getNumChildren() == 0:
         if term.getKind() in (Kind.CONSTANT, Kind.VARIABLE):
-            return _symbol_capture_pattern(term, captures)
+            return _symbol_capture_pattern(
+                term, captures, include_native_type=include_native_types,
+                zero_one_flag_vars=zero_one_flag_vars)
         return exact_nullary_literal_pattern(term)
     if _depth >= max_depth:
         return {"elided": term.getKind().name,
@@ -213,13 +276,48 @@ def term_to_pattern(term, captures: dict[str, str], *,
     pattern = {
         "kind": term.getKind().name,
         "args": [term_to_pattern(term[i], captures,
-                                 max_depth=max_depth, _depth=_depth + 1)
+                                 max_depth=max_depth, _depth=_depth + 1,
+                                 include_native_types=include_native_types,
+                                 zero_one_flag_vars=zero_one_flag_vars)
                  for i in range(term.getNumChildren())],
     }
     indices = term_op_indices(term)
     if indices:
         pattern["indices"] = list(indices)
     return pattern
+
+
+def erase_capture_type_refinements(pattern: Any) -> Any:
+    """Project a typed authoring pattern to its class-only target skeleton.
+
+    Native type refinements are authoring facts, while the existing canonical
+    target pattern records structural identity.  This projection lets a phase
+    boundary verify that a typed seed is exactly the same tree and captures as
+    its target without putting authoring metadata into proof-obligation identity.
+    """
+    if isinstance(pattern, list):
+        return [erase_capture_type_refinements(value) for value in pattern]
+    if not isinstance(pattern, dict):
+        return pattern
+    if "capture" not in pattern and pattern.get("wildcard") is not True:
+        return {
+            key: erase_capture_type_refinements(value)
+            for key, value in pattern.items()
+        }
+    out = {
+        key: erase_capture_type_refinements(value)
+        for key, value in pattern.items()
+        if key != "sort"
+    }
+    if "sort" not in pattern:
+        return out
+    sort = pattern.get("sort")
+    if isinstance(sort, dict):
+        cls = sort.get("class")
+        out["sort"] = cls if cls in {"var", "const"} else "subterm"
+    else:
+        out["sort"] = erase_capture_type_refinements(sort)
+    return out
 
 
 def _pattern_contains_elision(value: Any) -> bool:
@@ -262,7 +360,36 @@ def target_pattern_fingerprint(pattern: dict[str, Any]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _serialized_target_pattern(root: Any) -> dict[str, Any]:
+def _match_type_from_serialized_sort(sort: Any) -> dict[str, Any] | None:
+    """Serialized-sort twin of :func:`_match_type_from_native_sort`."""
+    kind = str(getattr(sort, "kind", "") or "")
+    args = tuple(getattr(sort, "args", ()) or ())
+    if kind == "INTEGER_SORT":
+        return {"type": "int"}
+    if kind == "REAL_SORT":
+        return {"type": "real"}
+    if kind == "STRING_SORT":
+        return {"type": "string"}
+    if kind == "BOOLEAN_SORT":
+        return {"type": "bool"}
+    if kind == "BITVECTOR_SORT" and args:
+        return {"type": "bv", "width": int(args[0])}
+    if kind == "ARRAY_SORT" and len(args) == 2:
+        domain = _match_type_from_serialized_sort(args[0])
+        element = _match_type_from_serialized_sort(args[1])
+        out: dict[str, Any] = {"type": "mem"}
+        if domain is not None:
+            out["domain"] = domain
+        if element is not None:
+            out["element"] = element
+        return out
+    return None
+
+
+def _serialized_target_pattern(
+        root: Any, *, include_native_types: bool = False,
+        zero_one_flag_vars: frozenset[str] = frozenset(),
+        ) -> dict[str, Any]:
     """Derive the executable pattern directly from a serialized cvc5 term.
 
     ``Predicate.__getstate__`` replaces its live ``Term`` with a
@@ -307,12 +434,23 @@ def _serialized_target_pattern(root: Any) -> dict[str, Any]:
             return {"const": "str:" + str(node.value)}
         children = list(node.children or ())
         if not children and kind in (Kind.CONSTANT, Kind.VARIABLE):
-            return {
+            domain = "var" if kind == Kind.CONSTANT else "subterm"
+            symbol = str(node.node.symbol or "")
+            out: dict[str, Any] = {
                 "capture": capture_name(node, kind.name),
-                "sort": (
-                    "var" if kind == Kind.CONSTANT else "subterm"
-                ),
+                "sort": domain,
             }
+            if include_native_types:
+                native_type = _match_type_from_serialized_sort(node.node.sort)
+                if native_type is not None:
+                    typed_sort = dict(native_type)
+                    if domain == "var":
+                        typed_sort["class"] = "var"
+                    if (domain == "var" and native_type.get("type") == "int"
+                            and symbol in zero_one_flag_vars):
+                        typed_sort["value_domain"] = "zero_one"
+                    out["sort"] = typed_sort
+            return out
         if not children:
             if node.value is None:
                 raise ValueError(
@@ -341,7 +479,10 @@ def _serialized_target_pattern(root: Any) -> dict[str, Any]:
     return walk(root, 0)
 
 
-def native_predicate_pattern(value: Any) -> dict[str, Any]:
+def native_predicate_pattern(
+        value: Any, *, include_native_types: bool = False,
+        zero_one_flag_vars: frozenset[str] = frozenset(),
+        ) -> dict[str, Any]:
     """Return the exact structural pattern of a native predicate carrier.
 
     Accepts either a live cvc5 term/``Predicate`` or the serialized predicate
@@ -353,8 +494,16 @@ def native_predicate_pattern(value: Any) -> dict[str, Any]:
     from interpreter.utils.cvc5_serde import SerializedCvc5TermV2
 
     if isinstance(term, SerializedCvc5TermV2):
-        return _serialized_target_pattern(term)
-    return canonical_target_pattern(term)
+        return _serialized_target_pattern(
+            term, include_native_types=include_native_types,
+            zero_one_flag_vars=zero_one_flag_vars)
+    pattern = term_to_pattern(
+        term, {}, max_depth=64,
+        include_native_types=include_native_types,
+        zero_one_flag_vars=zero_one_flag_vars)
+    if _pattern_contains_elision(pattern):
+        raise UnsupportedShape("canonical_target_pattern_exceeds_depth_limit")
+    return pattern
 
 
 def validate_proposer_native_target_b64(
@@ -541,7 +690,9 @@ def _materialized_guard(term):
 
 
 def derive_structural_template(term, *, rule_id: str,
-                               candidate_term) -> dict[str, Any]:
+                               candidate_term,
+                               include_native_types: bool = False,
+                               ) -> dict[str, Any]:
     """Build a ``structural_template`` rule dict — ``pattern`` from the obligation
     ``term`` (so it matches real obligations), ``emit`` the **proved candidate**
     (the invariant the verifier actually found closes it). This is uniform across
@@ -558,7 +709,9 @@ def derive_structural_template(term, *, rule_id: str,
             "derive_structural_template requires the proved candidate term")
     captures: dict[str, str] = {}
     try:
-        pattern = term_to_pattern(term, captures, max_depth=64)
+        pattern = term_to_pattern(
+            term, captures, max_depth=64,
+            include_native_types=include_native_types)
     except Exception as exc:  # pragma: no cover - defensive
         return {"unsupported": f"pattern_error:{type(exc).__name__}"}
     # Emit the proved candidate, reusing the obligation pattern's captures (the

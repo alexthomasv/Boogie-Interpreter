@@ -11,6 +11,8 @@ struct ArrayMeta {
     mem_map: String,
     base_ptr: String,
     offset_delta: i64,
+    elem_size: i64,
+    num_elements: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -19,13 +21,31 @@ struct FieldMeta {
     base_ptr: String,
     offset_delta: i64,
     size: usize,
+    kind: String,
 }
 
 #[derive(Debug, Clone)]
 struct AllocRequest {
     mem_map: String,
     base_ptr: String,
+    offset_delta: i64,
     size: i64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ObjectSpan {
+    min_offset: i64,
+    max_end: i64,
+}
+
+/// Materialized input objects live in a negative address band, disjoint from
+/// SMACK's positive `$CurrAddr` heap. Static globals also use negative
+/// addresses, but start near zero and would need over a terabyte of storage to
+/// reach this reserved band.
+const INPUT_OBJECT_BASE: i64 = -(1i64 << 40) + 8;
+
+fn strip_shadow(name: &str) -> &str {
+    name.strip_suffix(".shadow").unwrap_or(name)
 }
 
 pub fn initialize_vm_from_inputs(
@@ -56,14 +76,19 @@ pub fn initialize_vm_from_inputs(
     load_scalar_inputs(program, vm, &variables)?;
     load_havoc_sequences(program, vm, &variables)?;
 
-    let ptr_assignments = allocate_addresses(&variables, &arr_inputs, &ptr_aliases)?;
-    validate_no_aliasing(&variables, &arr_inputs, &ptr_aliases, &ptr_assignments)?;
+    let ptr_assignments = allocate_addresses(&variables, &arr_inputs, &field_inputs, &ptr_aliases)?;
+    validate_no_aliasing(
+        &variables,
+        &arr_inputs,
+        &field_inputs,
+        &ptr_aliases,
+        &ptr_assignments,
+    )?;
     for (ptr, value) in &ptr_assignments {
-        if let Some(&vid) = program.name_to_var.get(ptr) {
+        if let Some(vid) = program.lookup_var(ptr) {
             vm.set_scalar(vid, *value, true);
         }
     }
-
     concretize_memory(program, vm, &variables, &arr_inputs, &field_inputs)?;
     Ok(())
 }
@@ -131,7 +156,7 @@ fn export_var_store<'py>(
     for (idx, value) in vm.vars.iter().enumerate() {
         if let Value::Scalar(v) = value {
             if *v != 0 {
-                out.set_item(program.var_names[idx].as_str(), *v)?;
+                out.set_item(&program.var_names[idx], *v)?;
             }
         }
     }
@@ -189,7 +214,7 @@ fn build_input_symbols(
             continue;
         }
         if let Some(value) = input_value(&inp)? {
-            if program.name_to_var.contains_key(&var_name) {
+            if program.lookup_var(&var_name).is_some() {
                 add_scalar_symbol(py, symbols, bindings, &var_name, value)?;
                 if let Some(root_name) = havoc_outputs.get(&var_name) {
                     if input_havoc_attr(&inp)?.is_none() {
@@ -207,7 +232,7 @@ fn build_input_symbols(
             }
         }
         if let Some(seq_obj) = input_havoc_attr(&inp)? {
-            if program.name_to_var.contains_key(&var_name) {
+            if program.lookup_var(&var_name).is_some() {
                 add_havoc_symbols(py, symbols, bindings, &var_name, &seq_obj, havoc_bound)?;
             }
         }
@@ -383,6 +408,7 @@ fn add_struct_symbols(
                 .collect()
         })
         .unwrap_or_default();
+    validate_struct_fields(var_name, fields, &field_infos)?;
 
     let mut field_idx = 0usize;
     let mut buffer_idx = 0usize;
@@ -499,7 +525,7 @@ fn load_static_scalars(
     for (key, val) in scalars.iter() {
         let name: String = key.extract()?;
         let value = extract_i64(&val)?;
-        if let Some(&vid) = program.name_to_var.get(&name) {
+        if let Some(vid) = program.lookup_var(&name) {
             vm.set_scalar(vid, value, true);
         }
     }
@@ -537,7 +563,7 @@ fn validate_shadow_inputs(
         let has_havoc = input_havoc_attr(&inp)?.is_some();
         let buffers = input_list_attr(&inp, "buffers")?;
         let fields = input_list_attr(&inp, "struct")?;
-        let scalar_shadow = program.name_to_var.contains_key(&shadow_name);
+        let scalar_shadow = program.lookup_var(&shadow_name).is_some();
         let shadow_array_count = shadow_array_count(arr_inputs, &shadow_name);
         let shadow_field_count = shadow_field_count(field_inputs, &shadow_name);
 
@@ -655,7 +681,7 @@ fn load_scalar_inputs(
     for (key, inp) in variables.iter() {
         let name: String = key.extract()?;
         if let Some(value) = input_value(&inp)? {
-            if let Some(&vid) = program.name_to_var.get(&name) {
+            if let Some(vid) = program.lookup_var(&name) {
                 vm.set_scalar(vid, value, true);
             }
         }
@@ -668,13 +694,28 @@ fn load_havoc_sequences(
     vm: &mut VM,
     variables: &Bound<'_, PyDict>,
 ) -> PyResult<()> {
+    // Buffer/struct-only inputs cannot seed scalar havoc schedules. Avoid the
+    // whole-program assignment-alias analysis in that common case: on a large
+    // natively inlined program the temporary alias relation can otherwise be
+    // much larger than the concrete state it is trying to initialize.
+    let mut has_scalar_or_havoc_input = false;
+    for (_, inp) in variables.iter() {
+        if input_havoc_attr(&inp)?.is_some() || input_value(&inp)?.is_some() {
+            has_scalar_or_havoc_input = true;
+            break;
+        }
+    }
+    if !has_scalar_or_havoc_input {
+        return Ok(());
+    }
+
     let havoc_outputs = havoc_output_aliases(program);
     for (key, inp) in variables.iter() {
         let name: String = key.extract()?;
-        if let Some(&vid) = program.name_to_var.get(&name) {
+        if let Some(vid) = program.lookup_var(&name) {
             let root_vid = havoc_outputs
                 .get(&name)
-                .and_then(|root| program.name_to_var.get(root).copied())
+                .and_then(|root| program.lookup_var(root))
                 .unwrap_or(vid);
             let Some(seq_list) = input_havoc_attr(&inp)? else {
                 if havoc_outputs.contains_key(&name) {
@@ -730,7 +771,7 @@ fn havoc_output_aliases(program: &CompiledProgram) -> BTreeMap<String, String> {
             program.var_names.get(var_id as usize),
             program.var_names.get(root_id as usize),
         ) {
-            out.insert(name.clone(), root.clone());
+            out.insert(name.to_string(), root.to_string());
         }
     }
     out
@@ -750,10 +791,24 @@ fn parse_array_meta(
         let mut metas = Vec::with_capacity(items.len());
         for item in items.iter() {
             let d: &Bound<'_, PyDict> = item.downcast()?;
+            let elem_size = required_i64(d, "elem_size")?;
+            let num_elements = required_i64(d, "num_elements")?;
+            if elem_size <= 0 {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "array metadata elem_size must be positive, got {elem_size}"
+                )));
+            }
+            if num_elements < 0 {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "array metadata num_elements must be non-negative, got {num_elements}"
+                )));
+            }
             metas.push(ArrayMeta {
                 mem_map: required_string(d, "mem_map")?,
                 base_ptr: required_string(d, "base_ptr")?,
                 offset_delta: required_i64(d, "offset_delta")?,
+                elem_size,
+                num_elements,
             });
         }
         out.insert(key, metas);
@@ -775,11 +830,24 @@ fn parse_field_meta(
         let mut metas = Vec::with_capacity(items.len());
         for item in items.iter() {
             let d: &Bound<'_, PyDict> = item.downcast()?;
+            let kind = required_string(d, "kind")?;
+            if kind != "value" && kind != "buffer" {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "field metadata kind must be 'value' or 'buffer', got {kind:?}"
+                )));
+            }
+            let size_i64 = required_i64(d, "size")?;
+            let size = usize::try_from(size_i64).map_err(|_| {
+                pyo3::exceptions::PyValueError::new_err(format!(
+                    "field metadata size must be non-negative and fit usize, got {size_i64}"
+                ))
+            })?;
             metas.push(FieldMeta {
                 mem_map: required_string(d, "mem_map")?,
                 base_ptr: required_string(d, "base_ptr")?,
                 offset_delta: required_i64(d, "offset_delta")?,
-                size: required_i64(d, "size")? as usize,
+                size,
+                kind,
             });
         }
         out.insert(key, metas);
@@ -802,35 +870,126 @@ fn parse_string_map(
     Ok(out)
 }
 
+/// Static byte spans of every annotated input object, keyed by non-shadow
+/// mem_map, then by alias-canonical non-shadow root pointer.
+///
+/// Each span retains both the smallest relative offset and largest exclusive
+/// end. This keeps negative-offset windows inside their assigned allocation
+/// instead of letting them overlap the preceding object. Shadow metas mirror
+/// the non-shadow lane at the same numeric addresses in their own map, so only
+/// the non-shadow lane is tabulated.
+fn input_object_spans(
+    variables: &Bound<'_, PyDict>,
+    arr_inputs: &FxHashMap<String, Vec<ArrayMeta>>,
+    field_inputs: &FxHashMap<String, Vec<FieldMeta>>,
+    aliases: &FxHashMap<String, String>,
+) -> PyResult<BTreeMap<String, BTreeMap<String, ObjectSpan>>> {
+    let mut spans: BTreeMap<String, BTreeMap<String, ObjectSpan>> = BTreeMap::new();
+    let mut note = |mem_map: &str, base_ptr: &str, offset: i64, size: i64| -> PyResult<()> {
+        if mem_map.ends_with(".shadow") {
+            return Ok(());
+        }
+        if size < 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "input window for {base_ptr} has negative size {size}"
+            )));
+        }
+        let end = offset.checked_add(size).ok_or_else(|| {
+            pyo3::exceptions::PyOverflowError::new_err(format!(
+                "input window for {base_ptr} overflows i64: offset={offset}, size={size}"
+            ))
+        })?;
+        let root = canon(strip_shadow(base_ptr), aliases);
+        let entry = spans
+            .entry(mem_map.to_string())
+            .or_default()
+            .entry(root)
+            .or_insert(ObjectSpan {
+                min_offset: offset,
+                max_end: end,
+            });
+        entry.min_offset = entry.min_offset.min(offset);
+        entry.max_end = entry.max_end.max(end);
+        Ok(())
+    };
+    for metas in arr_inputs.values() {
+        for meta in metas {
+            let size = meta
+                .elem_size
+                .checked_mul(meta.num_elements)
+                .ok_or_else(|| {
+                    pyo3::exceptions::PyOverflowError::new_err(format!(
+                        "array input size overflows i64 for {}",
+                        meta.base_ptr
+                    ))
+                })?;
+            note(&meta.mem_map, &meta.base_ptr, meta.offset_delta, size)?;
+        }
+    }
+    for metas in field_inputs.values() {
+        for meta in metas {
+            note(
+                &meta.mem_map,
+                &meta.base_ptr,
+                meta.offset_delta,
+                meta.size as i64,
+            )?;
+        }
+    }
+    for req in collect_alloc_requests(variables, arr_inputs)? {
+        note(&req.mem_map, &req.base_ptr, req.offset_delta, req.size)?;
+    }
+    Ok(spans)
+}
+
 fn allocate_addresses(
     variables: &Bound<'_, PyDict>,
     arr_inputs: &FxHashMap<String, Vec<ArrayMeta>>,
+    field_inputs: &FxHashMap<String, Vec<FieldMeta>>,
     aliases: &FxHashMap<String, String>,
 ) -> PyResult<FxHashMap<String, i64>> {
-    let mut grouped: BTreeMap<String, BTreeMap<String, i64>> = BTreeMap::new();
-    for req in collect_alloc_requests(variables, arr_inputs)? {
-        let root = canon(&req.base_ptr, aliases);
-        let entry = grouped
-            .entry(req.mem_map)
-            .or_default()
-            .entry(root)
-            .or_insert(0);
-        if req.size > *entry {
-            *entry = req.size;
+    let per_map_spans = input_object_spans(variables, arr_inputs, field_inputs, aliases)?;
+    let mut object_spans: BTreeMap<String, ObjectSpan> = BTreeMap::new();
+    for ptrs in per_map_spans.values() {
+        for (ptr, span) in ptrs {
+            let combined = object_spans.entry(ptr.clone()).or_insert(*span);
+            combined.min_offset = combined.min_offset.min(span.min_offset);
+            combined.max_end = combined.max_end.max(span.max_end);
         }
     }
 
+    // Pointer values share one program-wide domain even when their pointees
+    // occupy different typed memory maps. Allocate every alias-canonical root
+    // once, reserving the union of its relative spans across every map.
     let mut out = FxHashMap::default();
-    for (_mem_map, ptrs) in grouped {
-        let mut current = 0i64;
-        for (ptr, size) in ptrs {
-            out.insert(ptr, current);
-            current += (size + 7) & !7;
-        }
+    let mut current = INPUT_OBJECT_BASE;
+    for (ptr, span) in object_spans {
+        let width = span.max_end.checked_sub(span.min_offset).ok_or_else(|| {
+            pyo3::exceptions::PyOverflowError::new_err(format!(
+                "input span width overflows i64 for {ptr}"
+            ))
+        })?;
+        let aligned = width.max(1).checked_add(7).ok_or_else(|| {
+            pyo3::exceptions::PyOverflowError::new_err(format!(
+                "input span alignment overflows i64 for {ptr}"
+            ))
+        })? & !7;
+        let pointer = current.checked_sub(span.min_offset).ok_or_else(|| {
+            pyo3::exceptions::PyOverflowError::new_err(format!(
+                "input pointer assignment overflows i64 for {ptr}"
+            ))
+        })?;
+        out.insert(ptr.clone(), pointer);
+        out.insert(format!("{}.shadow", ptr), pointer);
+        current = current.checked_add(aligned).ok_or_else(|| {
+            pyo3::exceptions::PyOverflowError::new_err(
+                "input object address allocation overflows i64",
+            )
+        })?;
     }
 
     for (alias, _target) in aliases {
-        let root = canon(alias, aliases);
+        let root = canon(strip_shadow(alias), aliases);
         if let Some(value) = out.get(&root).copied() {
             out.insert(alias.clone(), value);
         }
@@ -841,26 +1000,26 @@ fn allocate_addresses(
 fn validate_no_aliasing(
     variables: &Bound<'_, PyDict>,
     arr_inputs: &FxHashMap<String, Vec<ArrayMeta>>,
+    field_inputs: &FxHashMap<String, Vec<FieldMeta>>,
     aliases: &FxHashMap<String, String>,
     ptr_assignments: &FxHashMap<String, i64>,
 ) -> PyResult<()> {
-    let mut grouped: BTreeMap<String, BTreeMap<String, i64>> = BTreeMap::new();
-    for req in collect_alloc_requests(variables, arr_inputs)? {
-        let root = canon(&req.base_ptr, aliases);
-        let entry = grouped
-            .entry(req.mem_map)
-            .or_default()
-            .entry(root)
-            .or_insert(0);
-        if req.size > *entry {
-            *entry = req.size;
-        }
-    }
-    for (mem_map, ptrs) in grouped {
+    let spans = input_object_spans(variables, arr_inputs, field_inputs, aliases)?;
+    for (mem_map, ptrs) in spans {
         let mut ranges = Vec::new();
-        for (ptr, size) in ptrs {
+        for (ptr, span) in ptrs {
             if let Some(addr) = ptr_assignments.get(&ptr) {
-                ranges.push((ptr, *addr, *addr + size));
+                let start = addr.checked_add(span.min_offset).ok_or_else(|| {
+                    pyo3::exceptions::PyOverflowError::new_err(format!(
+                        "input range start overflows i64 for {ptr}"
+                    ))
+                })?;
+                let end = addr.checked_add(span.max_end).ok_or_else(|| {
+                    pyo3::exceptions::PyOverflowError::new_err(format!(
+                        "input range end overflows i64 for {ptr}"
+                    ))
+                })?;
+                ranges.push((ptr, start, end));
             }
         }
         ranges.sort_by_key(|(_, start, _)| *start);
@@ -900,6 +1059,7 @@ fn collect_alloc_requests(
                     requests.push(AllocRequest {
                         mem_map: meta.mem_map.clone(),
                         base_ptr: meta.base_ptr.clone(),
+                        offset_delta: meta.offset_delta,
                         size: dict_i64(&buf, "size")?,
                     });
                 }
@@ -917,6 +1077,7 @@ fn collect_alloc_requests(
                         requests.push(AllocRequest {
                             mem_map: meta.mem_map.clone(),
                             base_ptr: meta.base_ptr.clone(),
+                            offset_delta: meta.offset_delta,
                             size: dict_i64(&buf, "size")?,
                         });
                     }
@@ -958,6 +1119,7 @@ fn collect_alloc_requests(
                             requests.push(AllocRequest {
                                 mem_map: meta.mem_map.clone(),
                                 base_ptr: meta.base_ptr.clone(),
+                                offset_delta: meta.offset_delta,
                                 size: dict_i64(&buf, "size")?,
                             });
                         }
@@ -972,6 +1134,7 @@ fn collect_alloc_requests(
                             requests.push(AllocRequest {
                                 mem_map: meta.mem_map.clone(),
                                 base_ptr: meta.base_ptr.clone(),
+                                offset_delta: meta.offset_delta,
                                 size: dict_i64(&buf, "size")?,
                             });
                         }
@@ -1075,14 +1238,7 @@ fn write_input_struct(
                 .collect()
         })
         .unwrap_or_default();
-    if !field_infos.is_empty() && fields.len() != field_infos.len() {
-        return Err(pyo3::exceptions::PyAssertionError::new_err(format!(
-            "Struct field count mismatch for {}: JSON has {} fields, BPL has {}",
-            var_name,
-            fields.len(),
-            field_infos.len()
-        )));
-    }
+    validate_struct_fields(var_name, fields, &field_infos)?;
     let field_infos_shadow: Vec<&FieldMeta> = field_inputs
         .get(&shadow_key)
         .map(|items| {
@@ -1121,6 +1277,9 @@ fn write_input_struct(
             "struct",
         )?)
     };
+    if let Some(fields) = shadow_struct.as_ref() {
+        validate_struct_fields(&shadow_key, fields, &field_infos_shadow)?;
+    }
 
     let mut field_idx = 0usize;
     let mut buffer_idx = 0usize;
@@ -1175,6 +1334,44 @@ fn write_input_struct(
     Ok(())
 }
 
+fn validate_struct_fields(
+    var_name: &str,
+    fields: &Bound<'_, PyList>,
+    metadata: &[&FieldMeta],
+) -> PyResult<()> {
+    if fields.len() != metadata.len() {
+        return Err(pyo3::exceptions::PyAssertionError::new_err(format!(
+            "Struct field count mismatch for {var_name}: input has {} fields, metadata has {}",
+            fields.len(),
+            metadata.len()
+        )));
+    }
+    for (index, meta) in metadata.iter().enumerate() {
+        let field = fields.get_item(index)?;
+        let has_value = dict_get(&field, "value")?.is_some();
+        let has_buffer = dict_get(&field, "buffer")?.is_some();
+        let actual_kind = match (has_value, has_buffer) {
+            (true, false) => "value",
+            (false, true) => "buffer",
+            _ => "invalid",
+        };
+        if actual_kind != meta.kind {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "Struct field kind mismatch for {var_name}[{index}]: expected {}, got {actual_kind}",
+                meta.kind
+            )));
+        }
+        let size = dict_i64(&field, "size")?;
+        if size < 0 || size as usize != meta.size {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "Struct field size mismatch for {var_name}[{index}]: expected {}, got {size}",
+                meta.size
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn write_buffer(
     program: &CompiledProgram,
     vm: &mut VM,
@@ -1214,13 +1411,14 @@ fn write_field(
     let map_idx = map_index(program, vm, &meta.mem_map)?;
     let elt_bytes = (vm.memory_maps[map_idx].element_bit_width as usize / 8).max(1);
     let base = offset_value(vm, program, &meta.base_ptr, meta.offset_delta)?;
-    let element_bw = vm.memory_maps[map_idx].element_bit_width as i64;
+    // MemoryMap addresses name element slots. load_wide/store_wide advance
+    // one slot per element, irrespective of that element's bit width.
     for (i, chunk) in contents.chunks(elt_bytes).enumerate() {
         let mut value = 0i64;
         for (shift, byte) in chunk.iter().enumerate() {
             value |= (*byte as i64) << (8 * shift);
         }
-        vm.memory_maps[map_idx].set(base + i as i64 * element_bw, value);
+        vm.memory_maps[map_idx].set(base + i as i64, value);
     }
     Ok(())
 }
@@ -1231,7 +1429,7 @@ fn offset_value(
     base_ptr: &str,
     offset_delta: i64,
 ) -> PyResult<i64> {
-    let Some(&vid) = program.name_to_var.get(base_ptr) else {
+    let Some(vid) = program.lookup_var(base_ptr) else {
         return Err(pyo3::exceptions::PyKeyError::new_err(format!(
             "unknown base pointer {}",
             base_ptr
@@ -1241,13 +1439,13 @@ fn offset_value(
 }
 
 fn map_index(program: &CompiledProgram, vm: &VM, map_name: &str) -> PyResult<usize> {
-    let Some(&vid) = program.name_to_var.get(map_name) else {
+    let Some(vid) = program.lookup_var(map_name) else {
         return Err(pyo3::exceptions::PyKeyError::new_err(format!(
             "unknown memory map {}",
             map_name
         )));
     };
-    vm.var_to_map[vid as usize].ok_or_else(|| {
+    vm.var_to_map.get(&vid).copied().ok_or_else(|| {
         pyo3::exceptions::PyKeyError::new_err(format!("uninitialized memory map {}", map_name))
     })
 }

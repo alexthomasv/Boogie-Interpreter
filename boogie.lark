@@ -179,7 +179,9 @@ exprs: expr ("," expr)*
      | expr_add "-" expr_mul        -> binary_expr_minus
      | expr_mul
 ?expr_mul: expr_mul "*" expr_unary  -> binary_expr_times
+     | expr_mul "div" expr_unary   -> binary_expr_div
      | expr_mul "/" expr_unary      -> binary_expr_div
+     | expr_mul "mod" expr_unary   -> binary_expr_mod
      | expr_mul "%" expr_unary     -> binary_expr_mod
      | expr_unary
 ?expr_unary: "!" expr_unary         -> logical_negation

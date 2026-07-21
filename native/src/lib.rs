@@ -60,6 +60,31 @@ impl CompiledProgramWrapper {
     fn mode(&self) -> &'static str {
         self.inner.mode.as_str()
     }
+
+    #[getter]
+    fn num_vars(&self) -> u32 {
+        self.inner.num_vars
+    }
+
+    #[getter]
+    fn num_blocks(&self) -> usize {
+        self.inner.blocks.len()
+    }
+
+    #[getter]
+    fn var_name_bytes(&self) -> usize {
+        self.inner.var_names.iter().map(str::len).sum()
+    }
+
+    #[getter]
+    fn block_name_bytes(&self) -> usize {
+        self.inner.blocks.iter().map(|block| block.name.len()).sum()
+    }
+
+    #[getter]
+    fn mem_map_count(&self) -> usize {
+        self.inner.mem_maps.len()
+    }
 }
 
 /// Inline `{:inline}` procedures and lower straight to bytecode, returning the
@@ -70,7 +95,9 @@ impl CompiledProgramWrapper {
 #[pyo3(signature = (program, mode))]
 fn inline_lower(py: Python<'_>, program: &Bound<'_, PyAny>, mode: &str) -> PyResult<PyObject> {
     let mode = parse_semantics_mode(mode)?;
-    let compiled = lowering::inline::inline_lower_program(py, program, None, mode)?;
+    let compiled = lowering::inline::inline_lower_program(
+        py, program, None, /*retain_runtime_name_lookup*/ true, mode,
+    )?;
     let wrapper = CompiledProgramWrapper { inner: compiled };
     Ok(Py::new(py, wrapper)?.into_py(py))
 }
@@ -90,14 +117,59 @@ fn inline_lower_to_file(
     mode: &str,
 ) -> PyResult<()> {
     let mode = parse_semantics_mode(mode)?;
-    let compiled = lowering::inline::inline_lower_program(py, program, static_scalars, mode)?;
-    let bytes = bincode::serialize(&compiled).map_err(|e| {
-        pyo3::exceptions::PyValueError::new_err(format!("bincode serialize: {}", e))
-    })?;
-    let compressed = zstd::encode_all(&bytes[..], 3)
-        .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("zstd compress: {}", e)))?;
-    std::fs::write(path, compressed)
-        .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("write {}: {}", path, e)))?;
+    let compiled = lowering::inline::inline_lower_program(
+        py,
+        program,
+        static_scalars,
+        /*retain_runtime_name_lookup*/ false,
+        mode,
+    )?;
+    // Stream beside the destination and publish only after the encoder has
+    // finished, flushed, and synced. A budget kill may leave this hidden temp
+    // file, but it cannot truncate a previously good package.
+    let destination = std::path::Path::new(path);
+    let parent = destination
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let file_name = destination
+        .file_name()
+        .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("SWCP path has no file name"))?
+        .to_string_lossy();
+    let temporary = parent.join(format!(".{file_name}.tmp.{}", std::process::id()));
+    let write_result = (|| -> PyResult<()> {
+        let file = std::fs::File::create(&temporary).map_err(|e| {
+            pyo3::exceptions::PyIOError::new_err(format!("create {}: {}", temporary.display(), e))
+        })?;
+        let writer = std::io::BufWriter::new(file);
+        let mut encoder = zstd::Encoder::new(writer, 3)
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("zstd encoder: {}", e)))?;
+        bincode::serialize_into(&mut encoder, &compiled).map_err(|e| {
+            pyo3::exceptions::PyValueError::new_err(format!("bincode serialize: {}", e))
+        })?;
+        let mut writer = encoder
+            .finish()
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("zstd finish: {}", e)))?;
+        std::io::Write::flush(&mut writer).map_err(|e| {
+            pyo3::exceptions::PyIOError::new_err(format!("flush {}: {}", temporary.display(), e))
+        })?;
+        writer.get_ref().sync_all().map_err(|e| {
+            pyo3::exceptions::PyIOError::new_err(format!("sync {}: {}", temporary.display(), e))
+        })?;
+        Ok(())
+    })();
+    if let Err(error) = write_result {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error);
+    }
+    if let Err(error) = std::fs::rename(&temporary, destination) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(pyo3::exceptions::PyIOError::new_err(format!(
+            "publish {} as {}: {}",
+            temporary.display(),
+            destination.display(),
+            error
+        )));
+    }
     Ok(())
 }
 
@@ -105,14 +177,16 @@ fn inline_lower_to_file(
 /// maps, and return the opaque CompiledProgram handle for `execute`.
 #[pyfunction]
 fn load_compiled(py: Python<'_>, path: &str) -> PyResult<PyObject> {
-    let compressed = std::fs::read(path)
-        .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("read {}: {}", path, e)))?;
-    let bytes = zstd::decode_all(&compressed[..])
-        .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("zstd decompress: {}", e)))?;
-    let mut compiled: opcodes::CompiledProgram = bincode::deserialize(&bytes).map_err(|e| {
-        pyo3::exceptions::PyValueError::new_err(format!("bincode deserialize: {}", e))
-    })?;
-    compiled.rebuild_lookup_maps();
+    let file = std::fs::File::open(path)
+        .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("open {}: {}", path, e)))?;
+    let reader = std::io::BufReader::new(file);
+    let decoder = zstd::Decoder::new(reader)
+        .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("zstd decoder: {}", e)))?;
+    let mut compiled: opcodes::CompiledProgram =
+        bincode::deserialize_from(decoder).map_err(|e| {
+            pyo3::exceptions::PyValueError::new_err(format!("bincode deserialize: {}", e))
+        })?;
+    compiled.rebuild_runtime_name_index();
     let wrapper = CompiledProgramWrapper { inner: compiled };
     Ok(Py::new(py, wrapper)?.into_py(py))
 }
@@ -150,13 +224,21 @@ fn memory_summary<'py>(py: Python<'py>, vm: &vm::VM) -> PyResult<Bound<'py, PyDi
     Ok(out)
 }
 
-/// Full sparse contents of every memory map as `{map_name: {addr: value}}`.
+/// Full sparse contents of selected memory maps as `{map_name: {addr: value}}`.
 /// Unlike `memory_summary` (which only hashes/bounds), this exposes raw bytes
 /// so callers can read specific addresses (e.g. an output buffer) back out.
-/// Opt-in (`return_raw_memory`) because it can be large for big runs.
-fn raw_memory<'py>(py: Python<'py>, vm: &vm::VM) -> PyResult<Bound<'py, PyDict>> {
+/// `map_names=None` preserves the legacy behavior of exporting every map;
+/// `Some(names)` matches only those exact map names.
+fn raw_memory<'py>(
+    py: Python<'py>,
+    vm: &vm::VM,
+    map_names: Option<&[String]>,
+) -> PyResult<Bound<'py, PyDict>> {
     let out = PyDict::new_bound(py);
     for map in &vm.memory_maps {
+        if map_names.is_some_and(|names| !names.iter().any(|name| name == &map.name)) {
+            continue;
+        }
         let m = PyDict::new_bound(py);
         for (addr, value) in map.iter_init() {
             m.set_item(addr, value)?;
@@ -164,6 +246,27 @@ fn raw_memory<'py>(py: Python<'py>, vm: &vm::VM) -> PyResult<Bound<'py, PyDict>>
         out.set_item(map.name.as_str(), m)?;
     }
     Ok(out)
+}
+
+fn validate_raw_memory_maps(vm: &vm::VM, map_names: &[String]) -> PyResult<()> {
+    for (index, name) in map_names.iter().enumerate() {
+        if name.is_empty() {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "raw_memory_maps contains an empty map name",
+            ));
+        }
+        if map_names[..index].contains(name) {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "raw_memory_maps contains duplicate map name {name:?}"
+            )));
+        }
+        if !vm.memory_maps.iter().any(|map| map.name == *name) {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "requested raw memory map {name:?} is not present in the compiled program"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn scalar_summary<'py>(
@@ -176,14 +279,14 @@ fn scalar_summary<'py>(
         match value {
             vm::Value::Scalar(scalar) => {
                 if let Some(name) = program.var_names.get(idx) {
-                    out.set_item(name.as_str(), *scalar)?;
+                    out.set_item(name, *scalar)?;
                 }
             }
             // Out-of-i64 exact integer (Int mode): surface the exact value
             // as an arbitrary-precision Python int.
             vm::Value::Big(big) => {
                 if let Some(name) = program.var_names.get(idx) {
-                    out.set_item(name.as_str(), (**big).clone())?;
+                    out.set_item(name, (**big).clone())?;
                 }
             }
             vm::Value::Map(_) => {}
@@ -231,24 +334,36 @@ fn finish_vm_result(
     return_memory_summary: bool,
     return_scalar_summary: bool,
     return_raw_memory: bool,
+    raw_memory_maps: Option<&[String]>,
     return_block_sequence: bool,
+    return_coverage: bool,
     quiet: bool,
 ) -> PyResult<PyObject> {
     let result = PyDict::new_bound(py);
 
-    let blocks_set = PySet::empty_bound(py)?;
-    for (idx, explored) in vm.explored_blocks.iter().enumerate() {
-        if *explored {
-            if let Some(block) = program.blocks.get(idx) {
-                blocks_set.add(block.name.as_str())?;
+    if return_coverage {
+        let blocks_set = PySet::empty_bound(py)?;
+        for (idx, explored) in vm.explored_blocks.iter().enumerate() {
+            if *explored {
+                if let Some(block) = program.blocks.get(idx) {
+                    blocks_set.add(block.name.as_str())?;
+                }
             }
         }
+        result.set_item("explored_blocks", blocks_set)?;
+
+        let edges_set = PySet::empty_bound(py)?;
+        for (source_id, target_id) in &vm.explored_edges {
+            let source = program.blocks[*source_id as usize].name.as_str();
+            let target = program.blocks[*target_id as usize].name.as_str();
+            edges_set.add((source, target))?;
+        }
+        result.set_item("explored_edges", edges_set)?;
     }
-    result.set_item("explored_blocks", blocks_set)?;
 
     // The per-entry sequence is one PyString per block *entry* — tens of
     // millions on long runs — so it's only materialized when the caller
-    // asked for it (coverage_gen does; the trace runner doesn't).
+    // asked for it (the high-level runner uses compact edges instead).
     if return_block_sequence {
         let block_sequence = PyList::empty_bound(py);
         for block_id in &vm.block_trace {
@@ -322,12 +437,14 @@ fn finish_vm_result(
         result.set_item("final_scalars", scalar_summary(py, program, vm)?)?;
     }
     if return_raw_memory {
-        result.set_item("memory_raw", raw_memory(py, vm)?)?;
+        result.set_item("memory_raw", raw_memory(py, vm, raw_memory_maps)?)?;
     }
     result.set_item("external_consumed", vm.external_buffer_pos)?;
     result.set_item("exec_ns", exec_elapsed.as_nanos() as u64)?;
     result.set_item("exec_ms", exec_elapsed.as_secs_f64() * 1000.0)?;
-    result.set_item("blocks_explored", vm.explored_count)?;
+    if return_coverage {
+        result.set_item("blocks_explored", vm.explored_count)?;
+    }
     result.set_item("block_sequence_len", vm.block_entries)?;
     result.set_item("no_trace", vm.no_trace)?;
     // Out-of-i64 exact values whose trace records were skipped (Int mode
@@ -425,7 +542,7 @@ fn execute(
         let index_bw: u8 = tuple.get_item(1)?.extract()?;
         let element_bw: u8 = tuple.get_item(2)?.extract()?;
 
-        if let Some(&vid) = program.name_to_var.get(&name) {
+        if let Some(vid) = program.lookup_var(&name) {
             vm.init_memory_map(vid, name.clone(), index_bw, element_bw);
         }
     }
@@ -434,7 +551,7 @@ fn execute(
     for (key, val) in var_store.iter() {
         let name: String = key.extract()?;
         let value: i64 = val.extract()?;
-        if let Some(&vid) = program.name_to_var.get(&name) {
+        if let Some(vid) = program.lookup_var(&name) {
             vm.set_scalar(vid, value, true);
         }
     }
@@ -443,8 +560,8 @@ fn execute(
     for (key, val) in memory_maps.iter() {
         let name: String = key.extract()?;
         let contents: &Bound<'_, PyDict> = val.downcast()?;
-        if let Some(&vid) = program.name_to_var.get(&name) {
-            if let Some(map_idx) = vm.var_to_map[vid as usize] {
+        if let Some(vid) = program.lookup_var(&name) {
+            if let Some(map_idx) = vm.var_to_map.get(&vid).copied() {
                 for (addr, value) in contents.iter() {
                     let a: i64 = addr.extract()?;
                     let v: i64 = value.extract()?;
@@ -458,7 +575,7 @@ fn execute(
         for (key, val) in seqs.iter() {
             let name: String = key.extract()?;
             let values: Vec<i64> = val.extract()?;
-            if let Some(&vid) = program.name_to_var.get(&name) {
+            if let Some(vid) = program.lookup_var(&name) {
                 vm.set_havoc_sequence(vid, values);
             }
         }
@@ -493,7 +610,9 @@ fn execute(
         return_memory_summary,
         return_scalar_summary,
         return_raw_memory,
+        None,
         return_block_sequence,
+        true,
         quiet,
     )
 }
@@ -504,7 +623,7 @@ fn execute(
 /// PyO3 AST lowering and removes per-input Environment construction and dict
 /// handoff.
 #[pyfunction]
-#[pyo3(signature = (compiled, native_meta, program_inputs, raw_log_path, extra_data=None, log_read=true, no_trace=false, return_memory_summary=true, quiet=true, max_steps=0, return_scalar_summary=false, return_raw_memory=false, return_block_sequence=true))]
+#[pyo3(signature = (compiled, native_meta, program_inputs, raw_log_path, extra_data=None, log_read=true, no_trace=false, return_memory_summary=true, quiet=true, max_steps=0, return_scalar_summary=false, return_raw_memory=false, return_block_sequence=true, raw_memory_maps=None, return_coverage=true))]
 fn execute_inputs(
     py: Python<'_>,
     compiled: &Bound<'_, PyAny>,
@@ -520,6 +639,8 @@ fn execute_inputs(
     return_scalar_summary: bool,
     return_raw_memory: bool,
     return_block_sequence: bool,
+    raw_memory_maps: Option<Vec<String>>,
+    return_coverage: bool,
 ) -> PyResult<PyObject> {
     let wrapper: PyRef<'_, CompiledProgramWrapper> = compiled.extract()?;
     let program = &wrapper.inner;
@@ -532,6 +653,7 @@ fn execute_inputs(
     vm.log_read = log_read;
     vm.no_trace = no_trace;
     vm.record_block_trace = return_block_sequence;
+    vm.record_coverage = return_coverage;
 
     if !no_trace {
         attach_raw_log(program, &mut vm, &raw_log_path)?;
@@ -546,6 +668,15 @@ fn execute_inputs(
         extra_data,
     )?;
     let state_elapsed = state_start.elapsed();
+
+    if let Some(map_names) = raw_memory_maps.as_deref() {
+        if !return_raw_memory {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "raw_memory_maps requires return_raw_memory=True",
+            ));
+        }
+        validate_raw_memory_maps(&vm, map_names)?;
+    }
 
     let exec_start = std::time::Instant::now();
     let status = vm.execute_with_limit(program, max_steps);
@@ -576,7 +707,9 @@ fn execute_inputs(
         return_memory_summary,
         return_scalar_summary,
         return_raw_memory,
+        raw_memory_maps.as_deref(),
         return_block_sequence,
+        return_coverage,
         quiet,
     )?;
     let result_dict = result.bind(py).downcast::<PyDict>()?;
@@ -629,8 +762,12 @@ fn dump_block(
         ));
         let mut pc = block.start_pc;
         for stmt in &block.body {
-            out.push_str(&format!("  pc={} {:?}\n", pc, stmt));
-            pc += 1;
+            if stmt.is_internal_maintenance() {
+                out.push_str(&format!("  internal {:?}\n", stmt));
+            } else {
+                out.push_str(&format!("  pc={} {:?}\n", pc, stmt));
+                pc += 1;
+            }
         }
         out.push_str(&format!("  term {:?}\n", block.terminator));
         if let Some(cond) = &block.assume_cond {
@@ -643,8 +780,44 @@ fn dump_block(
 #[pyfunction]
 fn get_var_names(py: Python<'_>, compiled: &Bound<'_, PyAny>) -> PyResult<PyObject> {
     let wrapper: PyRef<'_, CompiledProgramWrapper> = compiled.extract()?;
-    let names: Vec<&str> = wrapper.inner.var_names.iter().map(|s| s.as_str()).collect();
+    let names: Vec<&str> = wrapper.inner.var_names.iter().collect();
     Ok(names.into_py(py))
+}
+
+/// Debug introspection: return one lowered variable name without materializing
+/// the complete name table as a Python list.
+#[pyfunction]
+fn get_var_name(compiled: &Bound<'_, PyAny>, var_id: u32) -> PyResult<String> {
+    let wrapper: PyRef<'_, CompiledProgramWrapper> = compiled.extract()?;
+    wrapper
+        .inner
+        .var_names
+        .get(var_id as usize)
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| {
+            pyo3::exceptions::PyIndexError::new_err(format!(
+                "variable id {var_id} is out of range ({} names)",
+                wrapper.inner.var_names.len()
+            ))
+        })
+}
+
+/// Debug introspection: return one lowered block name without materializing
+/// the complete block-name table in Python.
+#[pyfunction]
+fn get_block_name(compiled: &Bound<'_, PyAny>, block_id: u32) -> PyResult<String> {
+    let wrapper: PyRef<'_, CompiledProgramWrapper> = compiled.extract()?;
+    wrapper
+        .inner
+        .blocks
+        .get(block_id as usize)
+        .map(|block| block.name.clone())
+        .ok_or_else(|| {
+            pyo3::exceptions::PyIndexError::new_err(format!(
+                "block id {block_id} is out of range ({} blocks)",
+                wrapper.inner.blocks.len()
+            ))
+        })
 }
 
 #[pyfunction]
@@ -754,6 +927,8 @@ fn swoosh_interp(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(concolic_suggest, m)?)?;
     m.add_function(wrap_pyfunction!(explore, m)?)?;
     m.add_function(wrap_pyfunction!(get_var_names, m)?)?;
+    m.add_function(wrap_pyfunction!(get_var_name, m)?)?;
+    m.add_function(wrap_pyfunction!(get_block_name, m)?)?;
     m.add_function(wrap_pyfunction!(dump_block, m)?)?;
     m.add_function(wrap_pyfunction!(load_raw_log_to_redis, m)?)?;
     m.add_function(wrap_pyfunction!(build_trace_index_sqlite, m)?)?;
