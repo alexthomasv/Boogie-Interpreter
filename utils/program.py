@@ -6,7 +6,10 @@ from interpreter.parser.expression import (
     FunctionApplication, StorageIdentifier, Identifier,
     BooleanLiteral,
 )
-from interpreter.parser.declaration import ImplementationDeclaration
+from interpreter.parser.declaration import (
+    ImplementationDeclaration,
+    ProcedureDeclaration,
+)
 from interpreter.parser.statement import (
     AssertStatement, AssumeStatement, CallStatement, Block,
 )
@@ -157,9 +160,15 @@ def extract_first_assume_stmt(block):
     assert False, f"No assume statement found in {block.name}"
 
 def generate_label_to_block(program):
+    """Map blocks from every executable procedure declaration.
+
+    ``ImplementationDeclaration`` is a ``ProcedureDeclaration`` subclass, so
+    this covers both accepted Boogie executable forms while skipping bodyless
+    procedure contracts.
+    """
     label_to_block = {}
     for decl in program.declarations:
-        if isinstance(decl, ImplementationDeclaration):
+        if isinstance(decl, ProcedureDeclaration) and decl.body is not None:
             for block in decl.body.blocks:
                 label_to_block[block.name] = block
     return label_to_block
