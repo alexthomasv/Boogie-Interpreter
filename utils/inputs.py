@@ -10,6 +10,7 @@ from interpreter.parser.declaration import (
     ImplementationDeclaration,
     ProcedureDeclaration,
 )
+from interpreter.parser.expression import BinaryExpression, StorageIdentifier
 from interpreter.parser.statement import CallStatement
 from interpreter.parser.specifications import RequiresClause
 
@@ -234,6 +235,64 @@ def input_contract_from_requires(proc_decl, input_names=None) -> tuple[set[str],
             target.update(_input_names_from_attr_values(
                 getattr(attr, "values", []) or [], known))
     return public, private
+
+
+def input_equalities_from_requires(
+    proc_decl, input_names=None
+) -> list[tuple[str, str]]:
+    """Return direct, typed input equalities from ordinary preconditions.
+
+    Only equality between two declared entry parameters is input metadata.
+    Equalities involving globals, locals, or results remain semantic
+    preconditions but do not constrain seed-field construction here.
+    """
+    if proc_decl is None:
+        return []
+
+    parameter_types: dict[str, str] = {}
+    parameter_order: dict[str, int] = {}
+    for declaration in getattr(proc_decl, "parameters", ()) or ():
+        for raw_name in getattr(declaration, "names", ()) or ():
+            name = str(raw_name)
+            parameter_order[name] = len(parameter_order)
+            parameter_types[name] = str(getattr(declaration, "type", ""))
+
+    known = set(parameter_types)
+    if input_names is not None:
+        known &= {str(name) for name in input_names}
+
+    pairs: list[tuple[str, str]] = []
+    seen: set[frozenset[str]] = set()
+    for spec in getattr(proc_decl, "specifications", ()) or ():
+        if not isinstance(spec, RequiresClause):
+            continue
+        expression = getattr(spec, "expression", None)
+        if not (
+            isinstance(expression, BinaryExpression)
+            and expression.op == "=="
+            and isinstance(expression.lhs, StorageIdentifier)
+            and isinstance(expression.rhs, StorageIdentifier)
+        ):
+            continue
+        left = str(expression.lhs.name)
+        right = str(expression.rhs.name)
+        if left == right or left not in known or right not in known:
+            continue
+        if parameter_types[left] != parameter_types[right]:
+            raise ValueError(
+                "input equality requires matching parameter types: "
+                f"{left}: {parameter_types[left]} != "
+                f"{right}: {parameter_types[right]}"
+            )
+        key = frozenset((left, right))
+        if key in seen:
+            continue
+        seen.add(key)
+        if parameter_order[left] <= parameter_order[right]:
+            pairs.append((left, right))
+        else:
+            pairs.append((right, left))
+    return pairs
 
 
 def _input_names_from_attr_values(values, known: set[str] | None) -> set[str]:

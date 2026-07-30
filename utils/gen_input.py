@@ -17,7 +17,8 @@ from interpreter.parser.declaration import (
 )
 from interpreter.parser.statement import CallStatement
 from interpreter.utils.inputs import (
-    input_contract_from_requires, preprocess_external_inputs,
+    input_contract_from_requires, input_equalities_from_requires,
+    preprocess_external_inputs,
     process_field_stmt, process_array_stmt,
 )
 from interpreter.utils.program import RE_SMACK, RE_SMACK_NONDET, RE_VERIFIER
@@ -617,7 +618,7 @@ def _load_template_context(pkg_path, *, program=None, source_root=None):
     json_template = generate_template(
         pkg_path, program=program, source_root=source_root
     )
-    _bpl_param_names, impl_decl, _proc_decl = _get_bpl_param_names(program)
+    bpl_param_names, impl_decl, proc_decl = _get_bpl_param_names(program)
     entry_name = impl_decl.name.rsplit('.cross_product', 1)[0]
 
     c_file = _find_package_harness(
@@ -644,6 +645,10 @@ def _load_template_context(pkg_path, *, program=None, source_root=None):
         "params_map": params_map,
         "c_params": c_params,
         "havoc_vars": havoc_vars,
+        "input_equalities": input_equalities_from_requires(
+            proc_decl if proc_decl is not None else impl_decl,
+            bpl_param_names,
+        ),
     }
 
 
@@ -831,6 +836,53 @@ def _apply_seed_variant(entries, variant):
             scalar_idx += 1
 
 
+def _apply_input_equalities(entries, equalities):
+    """Make deterministic fields satisfy typed entry-parameter equalities."""
+    by_name = {str(entry.get("var", "")): entry for entry in entries}
+    parent = {name: name for name in by_name}
+
+    def find(name):
+        while parent[name] != name:
+            parent[name] = parent[parent[name]]
+            name = parent[name]
+        return name
+
+    for left, right in equalities:
+        if left not in by_name or right not in by_name:
+            raise ValueError(
+                f"input equality names undeclared template field: {left}, {right}"
+            )
+        left_root = find(left)
+        right_root = find(right)
+        if left_root != right_root:
+            parent[right_root] = left_root
+
+    groups = defaultdict(list)
+    for name in by_name:
+        groups[find(name)].append(name)
+
+    payload_keys = ("buffers", "struct", "havoc_seq", "value")
+    for names in groups.values():
+        if len(names) < 2:
+            continue
+        source = by_name[names[0]]
+        source_kinds = [key for key in payload_keys if key in source]
+        if len(source_kinds) != 1:
+            raise ValueError(
+                f"input equality source {names[0]!r} has ambiguous payload"
+            )
+        source_kind = source_kinds[0]
+        for name in names[1:]:
+            target = by_name[name]
+            target_kinds = [key for key in payload_keys if key in target]
+            if target_kinds != [source_kind]:
+                raise ValueError(
+                    "input equality requires matching payload shapes: "
+                    f"{names[0]}={source_kind}, {name}={target_kinds}"
+                )
+            target[source_kind] = copy.deepcopy(source[source_kind])
+
+
 def generate_seed_inputs(pkg_path, *, program=None, source_root=None):
     """Return deterministic seed .input contents keyed by filename."""
     ctx = _load_template_context(
@@ -850,6 +902,7 @@ def generate_seed_inputs(pkg_path, *, program=None, source_root=None):
     for filename, variant in variants:
         entries = copy.deepcopy(base_entries)
         _apply_seed_variant(entries, variant)
+        _apply_input_equalities(entries, ctx["input_equalities"])
         out[filename] = _render_c_input(
             ctx["name"], entries, ctx["params_map"], ctx["c_params"])
     return out
