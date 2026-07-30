@@ -168,6 +168,27 @@ impl MemoryMap {
         self.pages.values().all(|p| p.init.iter().all(|w| *w == 0))
     }
 
+    /// Boogie map equality is extensional: map names and initialization
+    /// history are not observable, only the typed value at every index is.
+    ///
+    /// Uninitialized slots read as zero, so an explicitly initialized zero
+    /// compares equal to an absent slot. The compiler is responsible for
+    /// rejecting equality between different map types; retain that boundary
+    /// here as a fail-closed assertion for malformed native programs.
+    pub fn extensional_eq(&self, other: &Self) -> bool {
+        assert!(
+            self.index_bit_width == other.index_bit_width
+                && self.element_bit_width == other.element_bit_width,
+            "map equality requires identical index and element widths"
+        );
+
+        self.iter_init()
+            .all(|(addr, value)| value == 0 || other.get(addr) == value)
+            && other
+                .iter_init()
+                .all(|(addr, value)| value == 0 || self.get(addr) == value)
+    }
+
     /// Number of initialized slots.
     #[cfg(test)]
     pub fn init_len(&self) -> usize {
@@ -742,6 +763,31 @@ mod tests {
         assert_eq!(retained.get(513), 22);
         assert!(dead_frame.is_init_empty());
         assert_eq!(Arc::strong_count(&retained_page), 2);
+    }
+
+    #[test]
+    fn extensional_equality_ignores_names_and_zero_initialization_history() {
+        let mut left = MemoryMap::new("$M.P".into(), 64, 8);
+        let mut right = MemoryMap::new("$M.Q".into(), 64, 8);
+        left.set(7, 171);
+        right.set(7, 171);
+        left.set(9, 0);
+
+        assert!(left.extensional_eq(&right));
+        assert!(right.extensional_eq(&left));
+
+        right.set(7, 170);
+        assert!(!left.extensional_eq(&right));
+        assert!(!right.extensional_eq(&left));
+    }
+
+    #[test]
+    #[should_panic(expected = "map equality requires identical index and element widths")]
+    fn extensional_equality_rejects_different_map_types() {
+        let left = MemoryMap::new("$M.P".into(), 64, 8);
+        let right = MemoryMap::new("$M.Q".into(), 32, 8);
+
+        left.extensional_eq(&right);
     }
 
     #[test]

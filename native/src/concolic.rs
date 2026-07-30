@@ -2115,8 +2115,24 @@ impl<'a> Engine<'a> {
     }
 
     fn eval_binop(&mut self, op: BinOp, lhs: &Expr, rhs: &Expr) -> CEval {
-        let l = self.eval_i64(lhs);
-        let r = self.eval_i64(rhs);
+        let l = self.eval(lhs);
+        let r = self.eval(rhs);
+        match (&l.value, &r.value) {
+            (EvalResult::MapRef(left), EvalResult::MapRef(right)) => {
+                let equal = self.vm.memory_maps[*left]
+                    .extensional_eq(&self.vm.memory_maps[*right]);
+                let value = match op {
+                    BinOp::Eq => EvalResult::Bool(equal),
+                    BinOp::Ne => EvalResult::Bool(!equal),
+                    _ => panic!("maps support only equality and inequality"),
+                };
+                return CEval { value, sym: None };
+            }
+            (EvalResult::MapRef(_), _) | (_, EvalResult::MapRef(_)) => {
+                panic!("map equality operands must have matching map types")
+            }
+            _ => {}
+        }
         let lv = eval_to_i64(&l.value);
         let rv = eval_to_i64(&r.value);
         let l_profile_sym = l.sym.clone();

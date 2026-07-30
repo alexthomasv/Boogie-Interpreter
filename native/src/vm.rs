@@ -1215,10 +1215,26 @@ impl VM {
             Expr::ConstBig(b) => EvalResult::Big(b.clone()),
             Expr::Bool(b) => EvalResult::Bool(*b),
             Expr::BinOp { op, lhs, rhs } => {
+                let le = self.eval(lhs, program);
+                let re = self.eval(rhs, program);
+                match (&le, &re) {
+                    (EvalResult::MapRef(l), EvalResult::MapRef(r)) => {
+                        let equal = self.memory_maps[*l].extensional_eq(&self.memory_maps[*r]);
+                        return match op {
+                            BinOp::Eq => EvalResult::Bool(equal),
+                            BinOp::Ne => EvalResult::Bool(!equal),
+                            _ => panic!("maps support only equality and inequality"),
+                        };
+                    }
+                    (EvalResult::MapRef(_), _) | (_, EvalResult::MapRef(_)) => {
+                        panic!("map equality operands must have matching map types")
+                    }
+                    _ => {}
+                }
                 if program.mode == SemanticsMode::Bv {
                     // BV mode: the historical wrapping i64 algebra, unchanged.
-                    let l = self.eval_i64(lhs, program);
-                    let r = self.eval_i64(rhs, program);
+                    let l = eval_result_to_i64(le);
+                    let r = eval_result_to_i64(re);
                     match op {
                         BinOp::Eq => EvalResult::Bool(l == r),
                         BinOp::Ne => EvalResult::Bool(l != r),
@@ -1250,8 +1266,6 @@ impl VM {
                 } else {
                     // Int mode: exact-ℤ core. Arithmetic uses checked ops with
                     // BigInt promotion; comparisons compare exact values.
-                    let le = self.eval(lhs, program);
-                    let re = self.eval(rhs, program);
                     // Hot path: both operands are in-i64 (the overwhelmingly
                     // common case) — direct i64 comparisons, checked arith.
                     if let (Some(l), Some(r)) = (as_small(&le), as_small(&re)) {
@@ -1796,6 +1810,17 @@ fn eval_result_to_z(e: EvalResult) -> Z {
         EvalResult::Scalar(v) => Z::S(v),
         EvalResult::Bool(b) => Z::S(b as i64),
         EvalResult::Big(b) => Z::B(b),
+        EvalResult::MapRef(_) => panic!("Expected scalar, got map"),
+    }
+}
+
+/// In-i64 scalar view of an eval result (BV mode).
+#[inline]
+fn eval_result_to_i64(e: EvalResult) -> i64 {
+    match e {
+        EvalResult::Scalar(v) => v,
+        EvalResult::Bool(b) => b as i64,
+        EvalResult::Big(_) => panic!("Expected i64 scalar, got unbounded integer"),
         EvalResult::MapRef(_) => panic!("Expected scalar, got map"),
     }
 }
