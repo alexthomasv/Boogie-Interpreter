@@ -12,7 +12,9 @@ from interpreter.parser.declaration import ImplementationDeclaration
 from interpreter.parser.desugar import desugar_while_statements
 from interpreter.parser.statement import (
     AssumeStatement,
+    BreakStatement,
     GotoStatement,
+    IfStatement,
     WhileStatement,
 )
 
@@ -43,6 +45,35 @@ def _count_whiles(program) -> int:
         for blk in d.body.blocks:
             walk_stmts(blk.statements)
     return n
+
+
+def _count_structured_control(program) -> tuple[int, int, int]:
+    counts = [0, 0, 0]
+
+    def walk(statements):
+        for statement in statements:
+            if isinstance(statement, WhileStatement):
+                counts[0] += 1
+                for block in statement.blocks:
+                    walk(block.statements)
+            elif isinstance(statement, IfStatement):
+                counts[1] += 1
+                for block in statement.blocks:
+                    walk(block.statements)
+                else_value = statement.else_
+                if isinstance(else_value, IfStatement):
+                    walk([else_value])
+                else:
+                    for block in else_value or []:
+                        walk(block.statements)
+            elif isinstance(statement, BreakStatement):
+                counts[2] += 1
+
+    for declaration in program.declarations:
+        if isinstance(declaration, ImplementationDeclaration) and declaration.body:
+            for block in declaration.body.blocks:
+                walk(block.statements)
+    return tuple(counts)
 
 
 def _block_names(program) -> list[str]:
@@ -169,6 +200,85 @@ def test_desugar_exit_block_starts_with_assume_negated_guard():
     # The condition is the negation of the original guard.
     from interpreter.parser.expression import LogicalNegation
     assert isinstance(first.expression, LogicalNegation)
+
+
+def test_desugar_lowers_break_nested_in_if_to_loop_exit():
+    program = parse_boogie("""
+procedure foo(n: int) returns (r: int);
+implementation foo(n: int) returns (r: int)
+{
+  var i: int;
+  entry:
+    i := 0;
+    while (true) {
+      if (i >= n) {
+        break;
+      }
+      i := i + 1;
+    }
+    r := i;
+    return;
+}
+""")
+    assert _count_structured_control(program) == (1, 1, 1)
+
+    desugar_while_statements(program)
+
+    assert _count_structured_control(program) == (0, 0, 0)
+    impl = _impl(program)
+    exit_labels = {
+        block.name
+        for block in impl.body.blocks
+        if block.name.startswith("loop_exit_")
+    }
+    assert len(exit_labels) == 1
+    assert any(
+        isinstance(statement, GotoStatement)
+        and {identifier.name for identifier in statement.identifiers} == exit_labels
+        for block in impl.body.blocks
+        for statement in block.statements
+    )
+
+
+def test_desugar_lowers_nested_loops_and_their_breaks():
+    program = parse_boogie("""
+procedure foo() returns ();
+implementation foo() returns ()
+{
+  entry:
+    while (true) {
+      while (true) {
+        break;
+      }
+      break;
+    }
+    return;
+}
+""")
+
+    desugar_while_statements(program)
+
+    assert _count_structured_control(program) == (0, 0, 0)
+    names = _block_names(program)
+    assert len([name for name in names if name.startswith("loop_head_")]) == 2
+    assert len([name for name in names if name.startswith("loop_exit_")]) == 2
+
+
+def test_desugar_rejects_break_that_does_not_name_an_enclosing_loop():
+    program = parse_boogie("""
+procedure foo() returns ();
+implementation foo() returns ()
+{
+  entry:
+    while (true) {
+      break missing;
+    }
+    return;
+}
+""")
+
+    with pytest.raises(ValueError, match="does not name an enclosing loop"):
+        desugar_while_statements(program)
 
 
 def test_desugar_is_no_op_on_smack_style_goto_form():

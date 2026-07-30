@@ -31,8 +31,10 @@ from __future__ import annotations
 from .expression import LabelIdentifier, LogicalNegation
 from .statement import (
     AssumeStatement,
+    BreakStatement,
     GotoStatement,
     IfStatement,
+    ReturnStatement,
     Statement,
     WhileStatement,
     Block,
@@ -73,14 +75,12 @@ def desugar_while_statements(program) -> None:
 
 
 def _expand_blocks(blocks):
-    """Walk the block list once, expanding any ``while`` statements into
-    additional blocks. Body block names are made unique against the input
-    list so we never collide with an existing label."""
+    """Expand every reachable structured loop into ordinary CFG blocks."""
     existing_labels: set[str] = set()
     for block in blocks:
         for name in getattr(block, "names", []) or [block.name]:
             if name:
-                existing_labels.add(name)
+                existing_labels.add(str(name))
 
     counter = [0]
 
@@ -94,70 +94,180 @@ def _expand_blocks(blocks):
 
     expanded: list[Block] = []
     for block in blocks:
-        expanded.extend(_expand_block(block, fresh))
+        if not _contains_while(block.statements):
+            expanded.append(block)
+            continue
+        _lower_sequence(
+            expanded,
+            fresh,
+            str(block.name),
+            list(block.names) if block.names else [str(block.name)],
+            list(block.statements),
+            fallthrough=None,
+            break_targets=(),
+        )
     return expanded
 
 
-def _expand_block(block, fresh) -> list:
-    """Return a list of blocks equivalent to ``block`` but with
-    ``WhileStatement`` rewritten into goto-form. Most blocks emit just
-    themselves unchanged."""
-    has_while = any(isinstance(s, WhileStatement) for s in block.statements)
-    if not has_while:
-        return [block]
+def _contains_while(statements) -> bool:
+    for statement in statements:
+        if isinstance(statement, WhileStatement):
+            return True
+        if isinstance(statement, IfStatement):
+            if _contains_while(_structured_body(statement.blocks)):
+                return True
+            else_value = statement.else_
+            if isinstance(else_value, IfStatement):
+                if _contains_while([else_value]):
+                    return True
+            elif _contains_while(_structured_body(else_value or [])):
+                return True
+    return False
 
-    out: list = []
-    current_stmts: list[Statement] = []
-    current_label = block.name
-    current_names = list(block.names) if block.names else [block.name]
 
-    def emit(stmts: list[Statement], names: list[str], label: str) -> None:
-        new_block = Block(names=list(names), statements=list(stmts))
-        new_block.name = label
-        out.append(new_block)
+def _structured_body(items) -> list[Statement]:
+    statements: list[Statement] = []
+    for item in items or []:
+        if isinstance(item, Block):
+            statements.extend(item.statements)
+        else:
+            statements.append(item)
+    return statements
 
-    pending_names = current_names
-    for stmt in block.statements:
-        if isinstance(stmt, WhileStatement):
-            head_label = fresh(f"loop_head_{block.name}")
-            body_label = fresh(f"loop_body_{block.name}")
-            exit_label = fresh(f"loop_exit_{block.name}")
 
-            # Close the current block by jumping to the loop head.
-            current_stmts = list(current_stmts) + [_make_goto(head_label)]
-            emit(current_stmts, pending_names, current_label)
+def _emit(out, label: str, names, statements) -> None:
+    block = Block(names=list(names), statements=list(statements))
+    block.name = label
+    out.append(block)
 
-            # Loop head: branch to body or exit.
-            emit(
-                [_make_goto(body_label, exit_label)],
-                [head_label],
-                head_label,
+
+def _break_target(statement, break_targets) -> str:
+    if not break_targets:
+        raise ValueError("break statement is not enclosed by a structured loop")
+    identifier = getattr(statement, "identifier", None)
+    if identifier is None:
+        return break_targets[-1][1]
+    name = str(getattr(identifier, "name", identifier))
+    for labels, target in reversed(break_targets):
+        if name in labels:
+            return target
+    raise ValueError(f"break target {name!r} does not name an enclosing loop")
+
+
+def _lower_sequence(
+    out,
+    fresh,
+    label: str,
+    names,
+    statements,
+    *,
+    fallthrough: str | None,
+    break_targets,
+) -> None:
+    """Lower one structured statement sequence using explicit continuations."""
+    leading: list[Statement] = []
+    for index, statement in enumerate(statements):
+        trailing = list(statements[index + 1 :])
+
+        if isinstance(statement, BreakStatement):
+            leading.append(_make_goto(_break_target(statement, break_targets)))
+            _emit(out, label, names, leading)
+            return
+
+        if isinstance(statement, (GotoStatement, ReturnStatement)):
+            leading.append(statement)
+            _emit(out, label, names, leading)
+            return
+
+        if isinstance(statement, IfStatement):
+            then_label = fresh(f"if_then_{label}")
+            else_label = fresh(f"if_else_{label}")
+            continuation = fresh(f"if_cont_{label}")
+            leading.append(_make_goto(then_label, else_label))
+            _emit(out, label, names, leading)
+
+            then_statements = [_make_assume(statement.condition)]
+            then_statements.extend(_structured_body(statement.blocks))
+            _lower_sequence(
+                out,
+                fresh,
+                then_label,
+                [then_label],
+                then_statements,
+                fallthrough=continuation,
+                break_targets=break_targets,
             )
 
-            # Loop body: assume guard, run body, branch back to the head.
-            # NOTE: nested while-statements inside ``stmt.blocks`` are NOT
-            # recursively desugared — they stay as ``WhileStatement`` AST
-            # nodes so the Rust VM can lower them into ``Stmt::While`` and
-            # execute them natively. This keeps structured nested loops
-            # working without having to flatten them into multiple gotos.
-            body_blocks = list(stmt.blocks)
-            body_stmts: list[Statement] = [_make_assume(stmt.condition)]
-            for inner_block in body_blocks:
-                body_stmts.extend(inner_block.statements)
-            body_stmts.append(_make_goto(head_label))
-            emit(body_stmts, [body_label], body_label)
-
-            # The exit block holds the assume on the negated guard, and
-            # any *trailing* statements from the original block follow it.
             negated = LogicalNegation()
-            negated.expression = stmt.condition
-            current_stmts = [_make_assume(negated)]
-            current_label = exit_label
-            pending_names = [exit_label]
-            continue
+            negated.expression = statement.condition
+            else_statements = [_make_assume(negated)]
+            if isinstance(statement.else_, IfStatement):
+                else_statements.append(statement.else_)
+            else:
+                else_statements.extend(_structured_body(statement.else_ or []))
+            _lower_sequence(
+                out,
+                fresh,
+                else_label,
+                [else_label],
+                else_statements,
+                fallthrough=continuation,
+                break_targets=break_targets,
+            )
+            _lower_sequence(
+                out,
+                fresh,
+                continuation,
+                [continuation],
+                trailing,
+                fallthrough=fallthrough,
+                break_targets=break_targets,
+            )
+            return
 
-        current_stmts.append(stmt)
+        if isinstance(statement, WhileStatement):
+            head_label = fresh(f"loop_head_{label}")
+            body_label = fresh(f"loop_body_{label}")
+            exit_label = fresh(f"loop_exit_{label}")
+            leading.append(_make_goto(head_label))
+            _emit(out, label, names, leading)
+            _emit(
+                out,
+                head_label,
+                [head_label],
+                [_make_goto(body_label, exit_label)],
+            )
 
-    # Final tail block (with anything after the last while).
-    emit(current_stmts, pending_names, current_label)
-    return out
+            loop_labels = {str(item) for item in names if str(item)}
+            loop_labels.add(label)
+            body_statements = [_make_assume(statement.condition)]
+            body_statements.extend(_structured_body(statement.blocks))
+            _lower_sequence(
+                out,
+                fresh,
+                body_label,
+                [body_label],
+                body_statements,
+                fallthrough=head_label,
+                break_targets=(*break_targets, (loop_labels, exit_label)),
+            )
+
+            negated = LogicalNegation()
+            negated.expression = statement.condition
+            exit_statements = [_make_assume(negated), *trailing]
+            _lower_sequence(
+                out,
+                fresh,
+                exit_label,
+                [exit_label],
+                exit_statements,
+                fallthrough=fallthrough,
+                break_targets=break_targets,
+            )
+            return
+
+        leading.append(statement)
+
+    if fallthrough is not None:
+        leading.append(_make_goto(fallthrough))
+    _emit(out, label, names, leading)
