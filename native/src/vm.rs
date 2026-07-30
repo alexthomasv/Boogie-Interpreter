@@ -617,18 +617,21 @@ impl VM {
         let mut taken = None;
         for &target_id in targets {
             let block = &program.blocks[target_id as usize];
-            if let Some(ref cond) = block.assume_cond {
-                if self.eval_bool(cond, program) {
-                    assert!(
-                        taken.is_none(),
-                        "Multiple goto conditions are true for targets: {:?}",
-                        targets
-                            .iter()
-                            .map(|t| &program.blocks[*t as usize].name)
-                            .collect::<Vec<_>>()
-                    );
-                    taken = Some(target_id);
-                }
+            let feasible = block
+                .assume_cond
+                .as_ref()
+                .map(|cond| self.eval_bool(cond, program))
+                .unwrap_or(true);
+            if feasible {
+                assert!(
+                    taken.is_none(),
+                    "Multiple goto conditions are true for targets: {:?}",
+                    targets
+                        .iter()
+                        .map(|t| &program.blocks[*t as usize].name)
+                        .collect::<Vec<_>>()
+                );
+                taken = Some(target_id);
             }
         }
         taken.ok_or_else(|| {

@@ -11,16 +11,18 @@ The rewrite is local. For a block ``B`` ending its statements with::
 
     while (g) invariant I; { body_stmts }
 
-it produces four blocks::
+it produces five blocks::
 
     B { leading_stmts; goto loop_head_<B>_<n>; }
-    loop_head_<B>_<n> { goto loop_body_<B>_<n>, loop_exit_<B>_<n>; }
+    loop_head_<B>_<n> { goto loop_body_<B>_<n>, loop_guard_exit_<B>_<n>; }
     loop_body_<B>_<n> { assume g; body_stmts; goto loop_head_<B>_<n>; }
-    loop_exit_<B>_<n> { assume !g; <original transfer of B> }
+    loop_guard_exit_<B>_<n> { assume !g; goto loop_exit_<B>_<n>; }
+    loop_exit_<B>_<n> { <original transfer of B> }
 
 Invariants are dropped — the interpreter does not check them; they are a
 verifier-only annotation. Body statements may themselves contain
-``WhileStatement`` and are recursively desugared.
+``WhileStatement`` and are recursively desugared. ``break`` jumps directly
+to ``loop_exit`` so it does not incorrectly execute the natural-exit guard.
 
 The pass is idempotent and a no-op on programs without any
 ``WhileStatement`` (the SMACK-generated common case), so it is safe to
@@ -228,6 +230,7 @@ def _lower_sequence(
         if isinstance(statement, WhileStatement):
             head_label = fresh(f"loop_head_{label}")
             body_label = fresh(f"loop_body_{label}")
+            guard_exit_label = fresh(f"loop_guard_exit_{label}")
             exit_label = fresh(f"loop_exit_{label}")
             leading.append(_make_goto(head_label))
             _emit(out, label, names, leading)
@@ -235,7 +238,7 @@ def _lower_sequence(
                 out,
                 head_label,
                 [head_label],
-                [_make_goto(body_label, exit_label)],
+                [_make_goto(body_label, guard_exit_label)],
             )
 
             loop_labels = {str(item) for item in names if str(item)}
@@ -254,13 +257,21 @@ def _lower_sequence(
 
             negated = LogicalNegation()
             negated.expression = statement.condition
-            exit_statements = [_make_assume(negated), *trailing]
+            _lower_sequence(
+                out,
+                fresh,
+                guard_exit_label,
+                [guard_exit_label],
+                [_make_assume(negated)],
+                fallthrough=exit_label,
+                break_targets=break_targets,
+            )
             _lower_sequence(
                 out,
                 fresh,
                 exit_label,
                 [exit_label],
-                exit_statements,
+                trailing,
                 fallthrough=fallthrough,
                 break_targets=break_targets,
             )

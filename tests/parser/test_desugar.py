@@ -114,8 +114,10 @@ implementation foo(n: int) returns (r: int)
 
 
 def test_desugar_replaces_simple_while_with_goto_cycle():
-    """One ``while`` becomes one entry stub + head + body + exit (4 blocks)
-    where the original entry contributed one. The total grows by 3."""
+    """One ``while`` becomes entry + head + body + guarded/common exits.
+
+    The original entry contributed one block, so the total grows by four.
+    """
     program = parse_boogie(SIMPLE_WHILE)
     assert _count_whiles(program) == 1
     before = len(_block_names(program))
@@ -124,7 +126,7 @@ def test_desugar_replaces_simple_while_with_goto_cycle():
 
     assert _count_whiles(program) == 0
     after = len(_block_names(program))
-    assert after == before + 3
+    assert after == before + 4
 
 
 def test_desugar_preserves_existing_blocks():
@@ -187,12 +189,14 @@ def test_desugar_body_block_starts_with_assume_guard():
     assert isinstance(first, AssumeStatement)
 
 
-def test_desugar_exit_block_starts_with_assume_negated_guard():
-    """Symmetric: exit block needs ``assume !guard`` for branch resolution."""
+def test_desugar_guard_exit_starts_with_assume_negated_guard():
+    """Natural exit needs ``assume !guard`` before the common continuation."""
     program = parse_boogie(SIMPLE_WHILE)
     desugar_while_statements(program)
     impl = _impl(program)
-    exit_blocks = [b for b in impl.body.blocks if b.name.startswith("loop_exit_")]
+    exit_blocks = [
+        b for b in impl.body.blocks if b.name.startswith("loop_guard_exit_")
+    ]
     assert len(exit_blocks) == 1
     exit_block = exit_blocks[0]
     first = exit_block.statements[0]

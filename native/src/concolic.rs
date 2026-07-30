@@ -934,6 +934,17 @@ impl<'a> Engine<'a> {
                 }
                 evals.push((target_id, Some(ev)));
             } else {
+                if taken.is_some() {
+                    self.unsupported(
+                        "multiple_true_branch_targets",
+                        &[
+                            ("source", source.name.clone()),
+                            ("targets", targets.len().to_string()),
+                        ],
+                    );
+                    return None;
+                }
+                taken = Some(target_id);
                 evals.push((target_id, None));
             }
         }

@@ -110,6 +110,31 @@ def test_concolic_map_equality_uses_concrete_typed_maps(tmp_path):
 
 
 @pytest.mark.native
+@pytest.mark.parametrize("n", [0, 3])
+def test_structured_while_true_break_has_an_unconditional_body_target(n, tmp_path):
+    source = """
+    procedure main(n: int);
+    implementation {:entrypoint} main(n: int) {
+      var i: int;
+    entry:
+      i := 0;
+      while (true) {
+        if (i >= n) {
+          break;
+        }
+        i := i + 1;
+      }
+      assert i == n;
+      return;
+    }
+    """
+    inputs = scalar_inputs({"n": n})
+    result = run_native_case(source, inputs, tmp_path=tmp_path)
+
+    assert result["status"] == "ok"
+
+
+@pytest.mark.native
 @pytest.mark.parametrize("node", ["select", "update"])
 def test_multi_index_direct_map_is_a_typed_lowering_error(node):
     expression = "$M[1, 2]" if node == "select" else "$M[1, 2 := 3]"
