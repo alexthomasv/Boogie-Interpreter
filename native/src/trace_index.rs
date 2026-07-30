@@ -15,7 +15,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::ffi::CStr;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Cursor, Read, Write};
 use std::os::raw::{c_char, c_int, c_void};
 use std::path::{Path, PathBuf};
@@ -40,6 +40,8 @@ const CHUNK_BYTES: usize = RECORD_SIZE * CHUNK_RECORDS;
 const MAX_FRAME_OUTPUT: usize = 128 * 1024 * 1024;
 
 const DEFAULT_PARSER_FLUSH_MEMBERS: u64 = 12_500_000;
+const DEFAULT_MAX_MERGE_FAN_IN: usize = 64;
+const MERGE_FD_HEADROOM: u64 = 32;
 const RUN_MAGIC: &[u8; 4] = b"SWIR";
 const RUN_VERSION: u8 = 1;
 const RUN_KEY_SIZE: usize = 10;
@@ -199,6 +201,58 @@ struct Counters {
     rows_written: AtomicU64,
 }
 
+struct SqlitePublication {
+    target: PathBuf,
+    staging: PathBuf,
+    published: bool,
+}
+
+impl SqlitePublication {
+    fn new(target: &Path) -> io::Result<Self> {
+        let parent = target
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        fs::create_dir_all(parent)?;
+        let file_name = target
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "trace-index SQLite output must have a file name",
+                )
+            })?;
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let staging = parent.join(format!(
+            ".{file_name}.partial.{}.{stamp}",
+            std::process::id()
+        ));
+        Ok(Self {
+            target: target.to_path_buf(),
+            staging,
+            published: false,
+        })
+    }
+
+    fn publish(&mut self) -> io::Result<()> {
+        fs::rename(&self.staging, &self.target)?;
+        self.published = true;
+        Ok(())
+    }
+}
+
+impl Drop for SqlitePublication {
+    fn drop(&mut self) {
+        if !self.published {
+            let _ = fs::remove_file(&self.staging);
+        }
+    }
+}
+
 pub fn build_trace_index_sqlite(
     raw_paths: &[PathBuf],
     sqlite_path: &Path,
@@ -213,12 +267,10 @@ pub fn build_trace_index_sqlite(
     if let Some(parent) = sqlite_path.parent() {
         fs::create_dir_all(parent)?;
     }
-    if sqlite_path.exists() {
-        fs::remove_file(sqlite_path)?;
-    }
 
     let kinds = IndexKinds::from_env()?;
     let flush_members = parser_flush_members();
+    let keep_runs = keep_run_files();
     let counters = Arc::new(Counters::default());
     let sampler_stop = Arc::new(AtomicBool::new(false));
     let sampler = {
@@ -228,8 +280,9 @@ pub fn build_trace_index_sqlite(
     };
 
     let started = Instant::now();
-    let mut run_writer = RunFileWriter::create(sqlite_path)?;
-    let mut sqlite = SqliteTraceIndexWriter::create(sqlite_path, bench)?;
+    let mut publication = SqlitePublication::new(sqlite_path)?;
+    let mut run_writer = RunFileWriter::create(&publication.staging)?;
+    let mut sqlite = SqliteTraceIndexWriter::create(&publication.staging, bench)?;
     eprintln!(
         "[trace-index] building {} from {} raw trace file(s) via sorted runs",
         sqlite_path.display(),
@@ -281,10 +334,18 @@ pub fn build_trace_index_sqlite(
         }
 
         let records = counters.records_indexed.load(Ordering::Relaxed);
+        let merge_fan_in = merge_fan_in()?;
         eprintln!(
-            "[trace-index] merging {} sorted run file(s)",
-            format_commas(run_writer.run_paths.len() as u64)
+            "[trace-index] merging {} sorted run file(s) with fan-in {}",
+            format_commas(run_writer.run_paths.len() as u64),
+            merge_fan_in,
         );
+        let final_run_paths = reduce_runs_to_fan_in(
+            &run_writer.run_paths,
+            &run_writer.dir,
+            merge_fan_in,
+            !keep_runs,
+        )?;
         sqlite.set_meta("source", "raw_log")?;
         sqlite.set_meta("builder", "native_sqlite_sorted_runs")?;
         sqlite.set_meta("raw_files", raw_paths.len().to_string().as_str())?;
@@ -308,11 +369,14 @@ pub fn build_trace_index_sqlite(
         sqlite.set_meta("index_kinds", kinds.meta_value())?;
 
         let rows = merge_runs_into_sqlite(
-            &run_writer.run_paths,
+            &final_run_paths,
             &run_writer.names,
             &mut sqlite,
             Arc::clone(&counters),
         )?;
+        if !keep_runs {
+            remove_run_files(&final_run_paths)?;
+        }
         sqlite.insert_contexts(&run_writer.contexts, &run_writer.names)?;
         let rows = sqlite.finish(rows)?;
 
@@ -326,7 +390,7 @@ pub fn build_trace_index_sqlite(
         })
     })();
 
-    if !keep_run_files() {
+    if !keep_runs {
         let _ = run_writer.cleanup();
     }
 
@@ -334,6 +398,7 @@ pub fn build_trace_index_sqlite(
     let _ = sampler.join();
 
     let result = build_result?;
+    publication.publish()?;
     let elapsed = started.elapsed().as_secs_f64().max(1e-3);
     eprintln!(
         "[trace-index] DONE {} rows, {} records in {:.1}s ({:.1}k rec/s)",
@@ -376,6 +441,66 @@ fn keep_run_files() -> bool {
             .as_str(),
         "1" | "true" | "yes" | "on"
     )
+}
+
+fn merge_fan_in() -> io::Result<usize> {
+    let soft_limit = soft_nofile_limit()?;
+    let configured = match std::env::var("SWOOSH_TRACE_INDEX_MERGE_FAN_IN") {
+        Ok(raw) => raw
+            .parse::<usize>()
+            .ok()
+            .filter(|value| *value >= 2)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "SWOOSH_TRACE_INDEX_MERGE_FAN_IN must be an integer of at least 2",
+                )
+            })?,
+        Err(std::env::VarError::NotPresent) => DEFAULT_MAX_MERGE_FAN_IN,
+        Err(error) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("invalid SWOOSH_TRACE_INDEX_MERGE_FAN_IN: {error}"),
+            ))
+        }
+    };
+    merge_fan_in_for_limit(soft_limit, configured)
+}
+
+fn merge_fan_in_for_limit(soft_limit: u64, configured: usize) -> io::Result<usize> {
+    let safe_limit = soft_limit.saturating_sub(MERGE_FD_HEADROOM);
+    if safe_limit < 2 {
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            format!(
+                "RLIMIT_NOFILE soft limit {soft_limit} leaves fewer than two merge inputs \
+                 after reserving {MERGE_FD_HEADROOM} descriptors"
+            ),
+        ));
+    }
+    let safe_limit = usize::try_from(safe_limit).unwrap_or(usize::MAX);
+    Ok(configured.min(safe_limit))
+}
+
+#[cfg(unix)]
+fn soft_nofile_limit() -> io::Result<u64> {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    let result = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) };
+    if result != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if limit.rlim_cur == libc::RLIM_INFINITY {
+        return Ok(u64::MAX);
+    }
+    Ok(limit.rlim_cur as u64)
+}
+
+#[cfg(not(unix))]
+fn soft_nofile_limit() -> io::Result<u64> {
+    Ok((DEFAULT_MAX_MERGE_FAN_IN as u64) + MERGE_FD_HEADROOM)
 }
 
 fn process_raw_file(
@@ -1149,13 +1274,18 @@ fn write_run_file(path: &Path, groups: &[RunGroup]) -> io::Result<()> {
     writer.write_all(RUN_MAGIC)?;
     writer.write_all(&[RUN_VERSION])?;
     for group in groups {
-        write_run_key(&mut writer, group.key)?;
-        writer.write_all(&(group.members.len() as u64).to_le_bytes())?;
-        for member in &group.members {
-            writer.write_all(member)?;
-        }
+        write_run_group(&mut writer, group)?;
     }
     writer.flush()
+}
+
+fn write_run_group<W: Write>(writer: &mut W, group: &RunGroup) -> io::Result<()> {
+    write_run_key(writer, group.key)?;
+    writer.write_all(&(group.members.len() as u64).to_le_bytes())?;
+    for member in &group.members {
+        writer.write_all(member)?;
+    }
+    Ok(())
 }
 
 fn write_run_key<W: Write>(writer: &mut W, key: GlobalKey) -> io::Result<()> {
@@ -1167,8 +1297,10 @@ fn write_run_key<W: Write>(writer: &mut W, key: GlobalKey) -> io::Result<()> {
 }
 
 struct RunCursor {
+    path: PathBuf,
     reader: BufReader<File>,
     current: Option<RunGroup>,
+    previous_key: Option<GlobalKey>,
 }
 
 impl RunCursor {
@@ -1191,15 +1323,33 @@ impl RunCursor {
             ));
         }
         let mut cursor = Self {
+            path: path.to_path_buf(),
             reader,
             current: None,
+            previous_key: None,
         };
         cursor.advance()?;
         Ok(cursor)
     }
 
     fn advance(&mut self) -> io::Result<()> {
-        self.current = read_run_group(&mut self.reader)?;
+        let next = read_run_group(&mut self.reader)?;
+        if let Some(group) = next.as_ref() {
+            if self
+                .previous_key
+                .is_some_and(|previous| group.key <= previous)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "{}: run keys are not in strict ascending order",
+                        self.path.display()
+                    ),
+                ));
+            }
+            self.previous_key = Some(group.key);
+        }
+        self.current = next;
         Ok(())
     }
 }
@@ -1257,12 +1407,128 @@ struct HeapItem {
     cursor_idx: usize,
 }
 
+fn reduce_runs_to_fan_in(
+    run_paths: &[PathBuf],
+    run_dir: &Path,
+    fan_in: usize,
+    reclaim_inputs: bool,
+) -> io::Result<Vec<PathBuf>> {
+    if fan_in < 2 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "trace-index merge fan-in must be at least 2",
+        ));
+    }
+    let mut current = run_paths.to_vec();
+    let mut pass = 0usize;
+    while current.len() > fan_in {
+        pass += 1;
+        let batch_count = current.len().div_ceil(fan_in);
+        eprintln!(
+            "[trace-index] merge pass {}: {} input run(s) -> {} run(s)",
+            pass,
+            format_commas(current.len() as u64),
+            format_commas(batch_count as u64),
+        );
+        let mut next = Vec::with_capacity(batch_count);
+        for (batch_index, batch) in current.chunks(fan_in).enumerate() {
+            if batch.len() == 1 {
+                next.push(batch[0].clone());
+                continue;
+            }
+            let output = run_dir.join(format!("merge_{pass:04}_{batch_index:08}.swir"));
+            merge_runs_into_run_atomically(batch, &output)?;
+            if reclaim_inputs {
+                remove_run_files(batch)?;
+            }
+            next.push(output);
+        }
+        current = next;
+    }
+    Ok(current)
+}
+
+fn remove_run_files(run_paths: &[PathBuf]) -> io::Result<()> {
+    for path in run_paths {
+        fs::remove_file(path)?;
+    }
+    Ok(())
+}
+
+struct PartialRunPublication {
+    path: PathBuf,
+    published: bool,
+}
+
+impl PartialRunPublication {
+    fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            published: false,
+        }
+    }
+}
+
+impl Drop for PartialRunPublication {
+    fn drop(&mut self) {
+        if !self.published {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+fn merge_runs_into_run_atomically(run_paths: &[PathBuf], output: &Path) -> io::Result<()> {
+    let file_name = output
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("merged.swir");
+    let partial = output.with_file_name(format!(".{file_name}.partial"));
+    if partial.exists() {
+        fs::remove_file(&partial)?;
+    }
+    let mut publication = PartialRunPublication::new(partial);
+    {
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&publication.path)?;
+        let mut writer = BufWriter::with_capacity(4 * 1024 * 1024, file);
+        writer.write_all(RUN_MAGIC)?;
+        writer.write_all(&[RUN_VERSION])?;
+        merge_sorted_run_groups(run_paths, |group| write_run_group(&mut writer, group))?;
+        writer.flush()?;
+    }
+    fs::rename(&publication.path, output)?;
+    publication.published = true;
+    Ok(())
+}
+
 fn merge_runs_into_sqlite(
     run_paths: &[PathBuf],
     names: &NameInterner,
     sqlite: &mut SqliteTraceIndexWriter,
     counters: Arc<Counters>,
 ) -> io::Result<u64> {
+    let mut rows = 0u64;
+    sqlite.begin()?;
+    merge_sorted_run_groups(run_paths, |group| {
+        sqlite.insert_members(group.key, &group.members, names)?;
+        rows += 1;
+        counters.rows_written.store(rows, Ordering::Relaxed);
+        if rows % 100_000 == 0 {
+            sqlite.commit()?;
+            sqlite.begin()?;
+        }
+        Ok(())
+    })?;
+    sqlite.commit()?;
+    Ok(rows)
+}
+
+fn merge_sorted_run_groups<F>(run_paths: &[PathBuf], mut emit: F) -> io::Result<u64>
+where
+    F: FnMut(&RunGroup) -> io::Result<()>,
+{
     let mut cursors = Vec::with_capacity(run_paths.len());
     let mut heap = BinaryHeap::new();
     for path in run_paths {
@@ -1277,8 +1543,7 @@ fn merge_runs_into_sqlite(
         cursors.push(cursor);
     }
 
-    let mut rows = 0u64;
-    sqlite.begin()?;
+    let mut groups = 0u64;
     while let Some(Reverse(item)) = heap.pop() {
         let key = item.key;
         let mut members = Vec::new();
@@ -1292,16 +1557,10 @@ fn merge_runs_into_sqlite(
         }
         members.sort_unstable();
         members.dedup();
-        sqlite.insert_members(key, &members, names)?;
-        rows += 1;
-        counters.rows_written.store(rows, Ordering::Relaxed);
-        if rows % 100_000 == 0 {
-            sqlite.commit()?;
-            sqlite.begin()?;
-        }
+        emit(&RunGroup { key, members })?;
+        groups += 1;
     }
-    sqlite.commit()?;
-    Ok(rows)
+    Ok(groups)
 }
 
 fn consume_heap_item(
@@ -1881,4 +2140,162 @@ unsafe fn reset_and_clear(db: *mut sqlite3, stmt: *mut sqlite3_stmt) -> io::Resu
         return Err(sqlite_error(db, "sqlite3_clear_bindings"));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_dir(label: &str) -> PathBuf {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "swoosh-trace-index-{label}-{}-{stamp}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    fn member(value: i64, iter_id: u32) -> [u8; 12] {
+        let mut member = [0u8; 12];
+        member[..8].copy_from_slice(&(value as u64).to_le_bytes());
+        member[8..].copy_from_slice(&iter_id.to_le_bytes());
+        member
+    }
+
+    fn sample_runs(dir: &Path, count: usize) -> Vec<PathBuf> {
+        let mut paths = Vec::new();
+        for index in 0..count {
+            let groups = vec![
+                RunGroup {
+                    key: GlobalKey {
+                        kind: KIND_PC,
+                        var_id: 0,
+                        loc: 10,
+                        op: 0,
+                    },
+                    members: vec![
+                        member((index % 7) as i64, (index % 5) as u32),
+                        member(index as i64, index as u32),
+                    ],
+                },
+                RunGroup {
+                    key: GlobalKey {
+                        kind: KIND_OP,
+                        var_id: 0,
+                        loc: 10,
+                        op: OP_WRITE,
+                    },
+                    members: vec![member(-(index as i64), index as u32)],
+                },
+            ];
+            let path = dir.join(format!("run_{index:08}.swir"));
+            write_run_file(&path, &groups).unwrap();
+            paths.push(path);
+        }
+        paths
+    }
+
+    #[test]
+    fn bounded_merge_is_byte_identical_across_fan_in_limits() {
+        let baseline_dir = test_dir("baseline");
+        let bounded_dir = test_dir("bounded");
+        let baseline_runs = sample_runs(&baseline_dir, 23);
+        let bounded_runs = sample_runs(&bounded_dir, 23);
+
+        let baseline = baseline_dir.join("final.swir");
+        merge_runs_into_run_atomically(&baseline_runs, &baseline).unwrap();
+
+        let reduced = reduce_runs_to_fan_in(&bounded_runs, &bounded_dir, 3, false).unwrap();
+        assert!(reduced.len() <= 3);
+        let bounded = bounded_dir.join("final.swir");
+        merge_runs_into_run_atomically(&reduced, &bounded).unwrap();
+
+        assert_eq!(fs::read(&baseline).unwrap(), fs::read(&bounded).unwrap());
+        fs::remove_dir_all(baseline_dir).unwrap();
+        fs::remove_dir_all(bounded_dir).unwrap();
+    }
+
+    #[test]
+    fn bounded_merge_reclaims_consumed_temporary_runs() {
+        let dir = test_dir("reclaim");
+        let input_runs = sample_runs(&dir, 9);
+        let reduced = reduce_runs_to_fan_in(&input_runs, &dir, 3, true).unwrap();
+
+        assert_eq!(reduced.len(), 3);
+        assert!(reduced.iter().all(|path| path.exists()));
+        assert!(input_runs.iter().all(|path| !path.exists()));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn corrupt_run_cleans_partial_output_and_publishes_nothing() {
+        let dir = test_dir("corrupt");
+        let mut runs = sample_runs(&dir, 2);
+        let corrupt = dir.join("corrupt.swir");
+        fs::write(&corrupt, b"not-a-run").unwrap();
+        runs.push(corrupt);
+
+        let output = dir.join("merged.swir");
+        let error = merge_runs_into_run_atomically(&runs, &output).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(!output.exists());
+        assert!(!dir.join(".merged.swir.partial").exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn unwind_cleans_partial_run_publication() {
+        let dir = test_dir("unwind");
+        let partial = dir.join(".merged.swir.partial");
+        let result = std::panic::catch_unwind({
+            let partial = partial.clone();
+            move || {
+                let _publication = PartialRunPublication::new(partial.clone());
+                fs::write(&partial, b"partial").unwrap();
+                panic!("simulated interruption");
+            }
+        });
+        assert!(result.is_err());
+        assert!(!partial.exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn failed_build_preserves_existing_sqlite_and_cleans_staging() {
+        let dir = test_dir("sqlite-publication");
+        let raw = dir.join("corrupt.trace.raw.zst");
+        let sqlite = dir.join("index.sqlite");
+        fs::write(&raw, b"not-a-trace").unwrap();
+        fs::write(&sqlite, b"previous-complete-index").unwrap();
+
+        let error = build_trace_index_sqlite(&[raw], &sqlite, Some("test")).unwrap_err();
+        assert!(
+            error.kind() == io::ErrorKind::InvalidData
+                || error.kind() == io::ErrorKind::UnexpectedEof
+        );
+        assert_eq!(fs::read(&sqlite).unwrap(), b"previous-complete-index");
+        let staged: Vec<PathBuf> = fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(".index.sqlite.partial."))
+            })
+            .collect();
+        assert!(staged.is_empty());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn merge_fan_in_reserves_descriptors_and_clips_configuration() {
+        assert_eq!(merge_fan_in_for_limit(1_024, 256).unwrap(), 256);
+        assert_eq!(merge_fan_in_for_limit(64, 256).unwrap(), 32);
+        assert_eq!(merge_fan_in_for_limit(64, 8).unwrap(), 8);
+        assert!(merge_fan_in_for_limit(33, 8).is_err());
+    }
 }

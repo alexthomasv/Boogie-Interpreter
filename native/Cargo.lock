@@ -527,6 +527,7 @@ version = "0.1.0"
 dependencies = [
  "bincode",
  "crossbeam-channel",
+ "libc",
  "memchr",
  "memmap2",
  "num-bigint",
