@@ -25,6 +25,7 @@ Read-only with respect to the package: the run uses no_trace and writes its
 raw-log path under tmp_path only.
 """
 
+import os
 import pickle
 from pathlib import Path
 
@@ -39,10 +40,12 @@ pytestmark = [
     pytest.mark.requires_compiled_package,
 ]
 
+_PROJECT_ROOT = Path(__file__).resolve().parents[3]
+_EXPLICIT_PACKAGE = str(os.environ.get("SWOOSH_C2I_094_PACKAGE") or "").strip()
 _PKG_CANDIDATES = [
-    Path("/home/ubuntu/boogie-parser/target/swoosh/package/c2i_094_pkg"),
-    Path(__file__).resolve().parents[3] / "target/swoosh/package/c2i_094_pkg",
-    Path(__file__).resolve().parents[3] / "test_packages/c2i_094_pkg",
+    *([Path(_EXPLICIT_PACKAGE).expanduser()] if _EXPLICIT_PACKAGE else []),
+    _PROJECT_ROOT / "target/swoosh/package/c2i_094_pkg",
+    _PROJECT_ROOT / "test_packages/c2i_094_pkg",
 ]
 
 # Root-assert dataflow in the compiled package ($bb5):
