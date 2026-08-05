@@ -43,6 +43,7 @@ from typing import Any
 from cvc5 import Kind
 
 from interpreter.utils.cvc5_serde import term_op_indices
+from src.rule_surface import STRUCTURAL_KIND_TO_EMIT_OP
 
 
 class UnsupportedShape(Exception):
@@ -53,24 +54,9 @@ class UnsupportedShape(Exception):
         self.reason = reason
 
 
-# cvc5 ``Kind`` name → *emit* op key (the one-key op-mapping form the DSL emit
-# surface uses). Patterns use the raw Kind name; emit uses these lowercase ops.
-KIND_TO_EMIT_OP: dict[str, str] = {
-    "EQUAL": "eq", "DISTINCT": "neq",
-    "GEQ": "gte", "LEQ": "lte", "GT": "gt", "LT": "lt",
-    "ADD": "add", "MULT": "mul", "SUB": "sub",
-    "ITE": "ite", "NOT": "not", "AND": "and", "OR": "or", "IMPLIES": "implies",
-    "SELECT": "select", "STORE": "store",
-    "BITVECTOR_SGE": "bvsge", "BITVECTOR_SLE": "bvsle",
-    "BITVECTOR_SGT": "bvsgt", "BITVECTOR_SLT": "bvslt",
-    "BITVECTOR_UGE": "bvuge", "BITVECTOR_ULE": "bvule",
-    "BITVECTOR_UGT": "bvugt", "BITVECTOR_ULT": "bvult",
-    "BITVECTOR_ADD": "add", "BITVECTOR_MULT": "mul", "BITVECTOR_SUB": "sub",
-    "BITVECTOR_AND": "band", "BITVECTOR_OR": "bor", "BITVECTOR_XOR": "bxor",
-    "BITVECTOR_SHL": "shl", "BITVECTOR_LSHR": "lshr", "BITVECTOR_ASHR": "ashr",
-    "BITVECTOR_UDIV": "udiv", "BITVECTOR_SDIV": "sdiv",
-    "BITVECTOR_UREM": "urem", "BITVECTOR_SREM": "srem",
-}
+# Compatibility name for callers.  The dependency-neutral rule-surface
+# registry is the sole owner of these spellings.
+KIND_TO_EMIT_OP = STRUCTURAL_KIND_TO_EMIT_OP
 
 
 def _const_value(term) -> int | None:
