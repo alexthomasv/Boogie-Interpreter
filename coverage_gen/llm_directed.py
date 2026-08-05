@@ -12,13 +12,17 @@ candidate operations update values inside a host-owned :class:`ProgramInputs`:
      {"op": "set_struct_scalar", "variable": "$p3",
       "field": "n_bitlen", "value": 2048},
      {"op": "set_struct_buffer_bytes", "variable": "$p3",
-      "field": "p", "offset": 2, "hex": "0102"}
+      "field": "p", "offset": 2, "hex": "0102"},
+     {"op": "set_havoc_sequence", "variable": "$h",
+      "values": [1, 1, 0]}
    ]}]}
 
 Names, payload kinds, privacy, field order, field widths, and buffer lengths
-come exclusively from the host input.  A candidate is exposed only after a
-canonical writer/parser round trip and a bounded native evaluation with novel
-reachable block or edge coverage.
+come exclusively from the host input.  Deterministic havoc sequence length is
+an authored value because it controls how many nondeterministic calls can be
+replayed.  A candidate is exposed only after a canonical writer/parser round
+trip and a bounded native evaluation with novel reachable block or edge
+coverage.
 
 This module intentionally contains no production LLM provider or filesystem
 publication policy.  Callers inject a text callback and decide how admitted
@@ -50,6 +54,7 @@ HARD_MAX_RESPONSE_BYTES = 64 * 1024
 HARD_MAX_OPERATIONS = 64
 HARD_MAX_CHANGED_BYTES = 2 * 1024
 HARD_MAX_CANDIDATES = 8
+HARD_MAX_HAVOC_SEQUENCE_VALUES = HARD_MAX_CHANGED_BYTES // 8
 MAX_RECEIPT_EVIDENCE_BYTES = 1024
 
 _HEX_RE = re.compile(r"^[0-9a-fA-F]+$")
@@ -227,8 +232,9 @@ class AppliedDirectedInputPatch:
     Unlike :class:`AdmittedDirectedInput`, this result carries no coverage or
     proof claim.  It is the reusable normalization boundary for diagnostic
     callers (for example, concrete falsification): the caller supplies typed
-    operations, while the host preserves the input shape and owns the final
-    writer/parser round trip.
+    operations, while the host preserves the declared input structure and owns
+    the final writer/parser round trip.  A typed havoc-sequence replacement may
+    resize that sequence within the same bounded havoc input channel.
     """
 
     program_inputs: ProgramInputs
@@ -310,11 +316,13 @@ def apply_directed_input_operations(
             f"patch changes {changed_bytes} bytes; limit is "
             f"{limits.max_changed_bytes}",
         )
+    candidate_shape = _resized_havoc_compatible_shape(
+        shape, _program_shape(patched))
     canonical_text = _canonical_round_trip(
         patched,
         params_line=params_line,
         field_sizes=normalized_field_sizes,
-        expected_shape=shape,
+        expected_shape=candidate_shape,
         host_input=False,
     )
     return AppliedDirectedInputPatch(
@@ -454,11 +462,13 @@ def generate_directed_inputs(
         semantic_keys.add(semantic_key)
 
         try:
+            candidate_shape = _resized_havoc_compatible_shape(
+                shape, _program_shape(patched))
             canonical_text = _canonical_round_trip(
                 patched,
                 params_line=params_line,
                 field_sizes=normalized_field_sizes,
-                expected_shape=shape,
+                expected_shape=candidate_shape,
                 host_input=False,
             )
         except _PatchError as exc:
@@ -659,6 +669,7 @@ def _parse_response(
 _OPERATION_KEYS = {
     "set_scalar": {"op", "variable", "value"},
     "set_havoc_value": {"op", "variable", "index", "value"},
+    "set_havoc_sequence": {"op", "variable", "values"},
     "set_buffer_bytes": {
         "op", "variable", "buffer_index", "offset", "hex"
     },
@@ -699,6 +710,19 @@ def _validate_operation_schema(operation: object) -> None:
         raise DirectedInputError(
             "invalid_value", "operation value must be a signed 64-bit integer"
         )
+    if "values" in operation:
+        values = operation["values"]
+        if (
+            type(values) is not list
+            or not values
+            or len(values) > HARD_MAX_HAVOC_SEQUENCE_VALUES
+            or any(not _is_i64(value) for value in values)
+        ):
+            raise DirectedInputError(
+                "invalid_values",
+                "operation values must be 1.."
+                f"{HARD_MAX_HAVOC_SEQUENCE_VALUES} signed 64-bit integers",
+            )
     if "hex" in operation:
         raw_hex = operation["hex"]
         if (
@@ -807,6 +831,19 @@ def _apply_operation(
             raise _PatchError("havoc_index_out_of_range")
         inp.havoc_seq[index] = operation["value"]
         return 8
+    if op == "set_havoc_sequence":
+        if _input_kind(inp) != "havoc":
+            raise _PatchError("kind_mismatch")
+        assert inp.havoc_seq is not None
+        values = operation["values"]
+        assert type(values) is list
+        overlap = min(len(inp.havoc_seq), len(values))
+        changed_values = sum(
+            inp.havoc_seq[index] != values[index]
+            for index in range(overlap)
+        ) + abs(len(inp.havoc_seq) - len(values))
+        inp.havoc_seq = list(values)
+        return changed_values * 8
     if op == "set_buffer_bytes":
         if _input_kind(inp) != "buffer":
             raise _PatchError("kind_mismatch")
@@ -991,6 +1028,39 @@ def _program_shape(program_inputs: ProgramInputs) -> tuple:
         items.append((name, inp.private, kind, detail))
     extra = bytes(program_inputs.extra_data or b"")
     return (extra, tuple(items))
+
+
+def _resized_havoc_compatible_shape(base_shape: tuple, candidate_shape: tuple) -> tuple:
+    """Admit only bounded havoc lengths as structural shape differences."""
+
+    if (
+        type(base_shape) is not tuple
+        or len(base_shape) != 2
+        or type(candidate_shape) is not tuple
+        or len(candidate_shape) != 2
+        or base_shape[0] != candidate_shape[0]
+        or type(base_shape[1]) is not tuple
+        or type(candidate_shape[1]) is not tuple
+        or len(base_shape[1]) != len(candidate_shape[1])
+    ):
+        raise _PatchError("candidate_shape_mismatch")
+    for base, candidate in zip(base_shape[1], candidate_shape[1], strict=True):
+        if base[:3] != candidate[:3]:
+            raise _PatchError("candidate_shape_mismatch")
+        kind = base[2]
+        if kind != "havoc" and base[3] != candidate[3]:
+            raise _PatchError("candidate_shape_mismatch")
+        if (
+            kind == "havoc"
+            and (
+                type(candidate[3]) is not tuple
+                or len(candidate[3]) != 1
+                or type(candidate[3][0]) is not int
+                or not 1 <= candidate[3][0] <= HARD_MAX_HAVOC_SEQUENCE_VALUES
+            )
+        ):
+            raise _PatchError("candidate_shape_mismatch")
+    return candidate_shape
 
 
 def _input_kind(inp: Input) -> str:
