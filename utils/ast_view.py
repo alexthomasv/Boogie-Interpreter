@@ -711,7 +711,6 @@ def derive_structural_template(term, *, rule_id: str,
         "id": rule_id,
         "kind": "structural_template",
         "match": {
-            "source": "p_target_transformed",
             "pattern": pattern,
         },
         "action": {"emit": [emit]},
