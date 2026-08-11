@@ -12,13 +12,14 @@ cvc5 ``Kind`` enum, so the verifier (``src/loop/freeze.py``) can derive the view
 once, at freeze time, from the exact Term it proved — the single source of truth
 every agent then reads off the freeze payload (no re-parse, no sort/width drift).
 
-- :func:`term_to_pattern` — cvc5 ``Term`` → structural ``pattern`` dict using the
-  cvc5 ``Kind`` name directly (``EQUAL``/``ITE``/``GEQ``/``BITVECTOR_SGE``); the
-  DSL matcher accepts uppercase Kind names, so no alias table is needed. Free
-  program-symbol leaves → ``{capture: name, sort: var}``; other symbolic leaves
-  explicitly retain the old open-subterm domain as ``sort: subterm``; integer/bv
-  literals → ``{const: N}``.  The explicit domain is executable AST, not prose:
-  it prevents a capture observed on a scalar leaf from silently binding a
+- :func:`term_to_pattern` — cvc5 ``Term`` → native structural ``pattern`` dict
+  using the exact cvc5 ``Kind`` name
+  (``EQUAL``/``ITE``/``GEQ``/``BITVECTOR_SGE``).  This is diagnostic/runtime
+  evidence, not authored DSL. Free program-symbol leaves →
+  ``{capture: name, sort: var}``; other symbolic leaves explicitly retain the
+  old open-subterm domain as ``sort: subterm``; integer/bv literals →
+  ``{const: N}``.  The explicit domain is executable AST, not prose: it
+  prevents a capture observed on a scalar leaf from silently binding a
   compound expression in a learned rule.
 - :func:`term_to_emit` — same walk in *emit* form (one-key op mappings,
   ``{gte: [...]}``); raises :class:`UnsupportedShape` for a Kind with no emit op.
@@ -43,7 +44,19 @@ from typing import Any
 from cvc5 import Kind
 
 from interpreter.utils.cvc5_serde import term_op_indices
-from src.rule_surface import STRUCTURAL_KIND_TO_EMIT_OP
+from src.rule_surface import (
+    STRUCTURAL_KIND_TO_EMIT_OP,
+    project_pattern_to_authored_operator_vocabulary,
+)
+
+
+PROPOSER_TARGET_FRAME_SCHEMA = "anvil.proposer-target-frame/v2"
+PROPOSER_TARGET_PATTERN_REPRESENTATION = (
+    "canonical-authored-lowercase-pattern/v1")
+PROPOSER_NATIVE_PATTERN_REPRESENTATION = (
+    "cvc5-native-diagnostic-pattern-fingerprint/v1")
+PROPOSER_TARGET_PATTERN_PROJECTION = (
+    "interpreter.utils.ast_view.canonical_authored_pattern_from_native/v1")
 
 
 class UnsupportedShape(Exception):
@@ -346,6 +359,58 @@ def target_pattern_fingerprint(pattern: dict[str, Any]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def canonical_authored_pattern_from_native(
+        pattern: dict[str, Any]) -> dict[str, Any]:
+    """Project one exact native pattern to the agent's authoring vocabulary.
+
+    Every cvc5 ``Kind`` token, including an exact nullary-literal kind, is
+    translated through the runtime-derived mapping owned by
+    :mod:`src.rule_surface`.  Captures, sorts, constants, indices, and tree
+    shape are copied exactly.  The result is therefore paste-ready authored
+    DSL, while the caller can retain the native pattern fingerprint as a
+    separate diagnostic/verifier identity.
+    """
+
+    if not isinstance(pattern, dict) or not pattern:
+        raise ValueError("native target pattern must be a non-empty object")
+
+    try:
+        projected = project_pattern_to_authored_operator_vocabulary(
+            pattern, frozenset(Kind.__members__))
+    except ValueError as exc:
+        raise UnsupportedShape(
+            f"no_authored_pattern_operator:{exc}") from exc
+    if not isinstance(projected, dict) or not projected:
+        raise UnsupportedShape("empty_authored_pattern_projection")
+    return projected
+
+
+def target_frame_projection_fingerprint(
+        *, native_pattern_sha256: str,
+        pattern_sha256: str) -> str:
+    """Bind the native diagnostic identity to its authored projection."""
+
+    native_sha = str(native_pattern_sha256 or "").strip().lower()
+    authored_sha = str(pattern_sha256 or "").strip().lower()
+    if not all(
+        len(value) == 64 and all(ch in "0123456789abcdef" for ch in value)
+        for value in (native_sha, authored_sha)
+    ):
+        raise ValueError("target pattern projection requires two sha256 values")
+    payload = {
+        "schema": PROPOSER_TARGET_FRAME_SCHEMA,
+        "native_pattern_representation": (
+            PROPOSER_NATIVE_PATTERN_REPRESENTATION),
+        "native_pattern_sha256": native_sha,
+        "pattern_representation": PROPOSER_TARGET_PATTERN_REPRESENTATION,
+        "pattern_sha256": authored_sha,
+        "projection": PROPOSER_TARGET_PATTERN_PROJECTION,
+    }
+    return hashlib.sha256(json.dumps(
+        payload, sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()
+
+
 def _match_type_from_serialized_sort(sort: Any) -> dict[str, Any] | None:
     """Serialized-sort twin of :func:`_match_type_from_native_sort`."""
     kind = str(getattr(sort, "kind", "") or "")
@@ -493,8 +558,14 @@ def native_predicate_pattern(
 
 
 def validate_proposer_native_target_b64(
-        value: Any, *, expected_pattern_sha256: str = "") -> str:
-    """Return a native payload whose bytes agree with its advertised pattern."""
+        value: Any, *, expected_pattern_sha256: str = "",
+        expected_native_pattern_sha256: str = "") -> str:
+    """Return native bytes whose native-pattern identity is authenticated.
+
+    ``expected_pattern_sha256`` is the compatibility spelling for callers that
+    predate the separate authored/native identities.  New target-frame code
+    uses ``expected_native_pattern_sha256`` explicitly.
+    """
     serialized = str(value or "").strip()
     if not serialized:
         raise ValueError(
@@ -526,7 +597,13 @@ def validate_proposer_native_target_b64(
         raise ValueError(
             "proposer target frame serialized_transformed_b64 is not a "
             "native predicate pickle") from exc
-    expected = str(expected_pattern_sha256 or "").strip().lower()
+    legacy_expected = str(expected_pattern_sha256 or "").strip().lower()
+    expected = str(
+        expected_native_pattern_sha256 or legacy_expected).strip().lower()
+    if legacy_expected and expected != legacy_expected:
+        raise ValueError(
+            "proposer target frame supplied conflicting native pattern "
+            "fingerprints")
     if expected and native_fingerprint != expected:
         raise ValueError(
             "proposer target frame native predicate pattern fingerprint "
@@ -578,7 +655,12 @@ def build_proposer_target_frame_from_pattern(
         pattern: dict[str, Any], *, proof_obligation_id: str, run_id: str,
         pc: int | str, surface: str, serialized_transformed_b64: str,
         source: str = "native") -> dict[str, Any]:
-    """Build a target frame from a pattern already derived at the native edge."""
+    """Build a target frame from a native pattern derived at the native edge.
+
+    The agent-facing ``pattern`` is the exact lowercase authoring projection.
+    ``native_pattern_sha256`` retains the verifier-native diagnostic identity,
+    and ``projection_sha256`` binds both to the same native predicate bytes.
+    """
     poid = str(proof_obligation_id or "").strip()
     rid = str(run_id or "").strip()
     if not poid:
@@ -595,19 +677,32 @@ def build_proposer_target_frame_from_pattern(
         pc_value = int(pc)
     except (TypeError, ValueError) as exc:
         raise ValueError("proposer target frame needs an integer pc") from exc
-    fingerprint = target_pattern_fingerprint(pattern)
+    native_pattern = copy.deepcopy(pattern)
+    native_fingerprint = target_pattern_fingerprint(native_pattern)
+    authored_pattern = canonical_authored_pattern_from_native(native_pattern)
+    fingerprint = target_pattern_fingerprint(authored_pattern)
     serialized = validate_proposer_native_target_b64(
         serialized_transformed_b64,
-        expected_pattern_sha256=fingerprint,
+        expected_native_pattern_sha256=native_fingerprint,
+    )
+    projection_fingerprint = target_frame_projection_fingerprint(
+        native_pattern_sha256=native_fingerprint,
+        pattern_sha256=fingerprint,
     )
     return {
-        "schema": "anvil.proposer-target-frame/v1",
+        "schema": PROPOSER_TARGET_FRAME_SCHEMA,
         "proof_obligation_id": poid,
         "run_id": rid,
         "pc": pc_value,
         "surface": surface_text,
-        "pattern": copy.deepcopy(pattern),
+        "pattern": authored_pattern,
         "pattern_sha256": fingerprint,
+        "pattern_representation": PROPOSER_TARGET_PATTERN_REPRESENTATION,
+        "native_pattern_sha256": native_fingerprint,
+        "native_pattern_representation": (
+            PROPOSER_NATIVE_PATTERN_REPRESENTATION),
+        "projection": PROPOSER_TARGET_PATTERN_PROJECTION,
+        "projection_sha256": projection_fingerprint,
         "serialized_transformed_b64": serialized,
         "source": source_text,
     }
@@ -632,6 +727,130 @@ def build_proposer_target_frame(
         serialized_transformed_b64=serialized_transformed_b64,
         source=source,
     )
+
+
+def validate_proposer_target_frame(
+        value: Any, *, proof_obligation_id: str = "", run_id: str = "",
+        pc: int | str | None = None) -> dict[str, Any]:
+    """Validate and copy one current proposer target frame.
+
+    Validation re-derives both pattern views from the serialized native term.
+    It therefore authenticates the native diagnostic fingerprint, the
+    lowercase agent-facing projection, and the binding between them without
+    trusting any display string or caller-supplied tree.
+    """
+
+    if not isinstance(value, dict):
+        raise ValueError("proposer target_frame must be a JSON object")
+    frame = copy.deepcopy(value)
+    schema = str(frame.get("schema") or "").strip()
+    if schema != PROPOSER_TARGET_FRAME_SCHEMA:
+        raise ValueError(
+            "unsupported proposer target_frame schema: "
+            f"{schema or '<missing>'}")
+    required = {
+        "proof_obligation_id", "run_id", "pc", "surface", "pattern",
+        "pattern_sha256", "pattern_representation",
+        "native_pattern_sha256", "native_pattern_representation",
+        "projection", "projection_sha256",
+        "serialized_transformed_b64", "source",
+    }
+    missing = sorted(required - set(frame))
+    if missing:
+        raise ValueError(
+            "proposer target_frame missing field(s): " + ", ".join(missing))
+
+    from src.state.persistence import proof_obligation_id as validate_id
+
+    try:
+        frame_id = validate_id(str(frame.get("proof_obligation_id") or ""))
+        expected_id = (
+            validate_id(str(proof_obligation_id))
+            if str(proof_obligation_id or "").strip() else "")
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"invalid target_frame proof_obligation_id: {exc}") from exc
+    if expected_id and frame_id != expected_id:
+        raise ValueError("proposer target_frame proof_obligation_id mismatch")
+    frame["proof_obligation_id"] = frame_id
+
+    frame_run = str(frame.get("run_id") or "").strip()
+    if not frame_run:
+        raise ValueError("proposer target_frame run_id is empty")
+    if str(run_id or "").strip() and frame_run != str(run_id).strip():
+        raise ValueError("proposer target_frame run_id mismatch")
+    frame["run_id"] = frame_run
+    try:
+        frame_pc = int(frame.get("pc"))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("proposer target_frame pc must be an integer") from exc
+    if pc is not None and str(pc).strip() and frame_pc != int(pc):
+        raise ValueError("proposer target_frame pc mismatch")
+    frame["pc"] = frame_pc
+    if not str(frame.get("surface") or "").strip():
+        raise ValueError("proposer target_frame surface is empty")
+    if not str(frame.get("source") or "").strip():
+        raise ValueError("proposer target_frame source is empty")
+
+    if frame.get("pattern_representation") != (
+            PROPOSER_TARGET_PATTERN_REPRESENTATION):
+        raise ValueError(
+            "proposer target_frame pattern representation mismatch")
+    if frame.get("native_pattern_representation") != (
+            PROPOSER_NATIVE_PATTERN_REPRESENTATION):
+        raise ValueError(
+            "proposer target_frame native pattern representation mismatch")
+    if frame.get("projection") != PROPOSER_TARGET_PATTERN_PROJECTION:
+        raise ValueError("proposer target_frame projection owner mismatch")
+
+    pattern = frame.get("pattern")
+    if not isinstance(pattern, dict) or not pattern:
+        raise ValueError(
+            "proposer target_frame pattern must be a nonempty object")
+    if _pattern_contains_elision(pattern):
+        raise ValueError("proposer target_frame pattern is bounded/nonexact")
+    authored_sha = target_pattern_fingerprint(pattern)
+    expected_authored_sha = str(
+        frame.get("pattern_sha256") or "").strip().lower()
+    if authored_sha != expected_authored_sha:
+        raise ValueError(
+            "proposer target_frame authored pattern fingerprint mismatch")
+
+    native_sha = str(
+        frame.get("native_pattern_sha256") or "").strip().lower()
+    serialized = validate_proposer_native_target_b64(
+        frame.get("serialized_transformed_b64"),
+        expected_native_pattern_sha256=native_sha,
+    )
+    predicate = pickle.loads(base64.b64decode(serialized, validate=True))
+    native_term = getattr(predicate, "predicate", None)
+    if native_term is None:
+        raise ValueError(
+            "proposer target_frame native carrier has no predicate term")
+    native_pattern = _serialized_target_pattern(native_term)
+    actual_native_sha = target_pattern_fingerprint(native_pattern)
+    if actual_native_sha != native_sha:
+        raise ValueError(
+            "proposer target_frame native pattern fingerprint mismatch")
+    projected = canonical_authored_pattern_from_native(native_pattern)
+    if projected != pattern:
+        raise ValueError(
+            "proposer target_frame authored pattern projection mismatch")
+    expected_projection_sha = target_frame_projection_fingerprint(
+        native_pattern_sha256=native_sha,
+        pattern_sha256=authored_sha,
+    )
+    if str(frame.get("projection_sha256") or "").strip().lower() != (
+            expected_projection_sha):
+        raise ValueError(
+            "proposer target_frame projection fingerprint mismatch")
+
+    frame["pattern"] = projected
+    frame["pattern_sha256"] = authored_sha
+    frame["native_pattern_sha256"] = native_sha
+    frame["projection_sha256"] = expected_projection_sha
+    frame["serialized_transformed_b64"] = serialized
+    return frame
 
 
 def term_to_emit(term, captures: dict[str, str]) -> dict[str, Any]:
@@ -695,9 +914,12 @@ def derive_structural_template(term, *, rule_id: str,
             "derive_structural_template requires the proved candidate term")
     captures: dict[str, str] = {}
     try:
-        pattern = term_to_pattern(
+        native_pattern = term_to_pattern(
             term, captures, max_depth=64,
             include_native_types=include_native_types)
+        pattern = canonical_authored_pattern_from_native(native_pattern)
+    except UnsupportedShape as exc:
+        return {"unsupported": exc.reason}
     except Exception as exc:  # pragma: no cover - defensive
         return {"unsupported": f"pattern_error:{type(exc).__name__}"}
     # Emit the proved candidate, reusing the obligation pattern's captures (the
