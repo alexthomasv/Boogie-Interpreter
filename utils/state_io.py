@@ -17,12 +17,20 @@ def _key_mints():
     dict lookup, noise against the Redis round-trip these keys gate.
     """
     from src.state.state_store import (
-        coi_key_name, state_key_from_id, state_serialized_key_name)
-    return state_key_from_id, coi_key_name, state_serialized_key_name
+        coi_key_name,
+        enqueue_state_serialized_key_index_write,
+        state_key_from_id,
+    )
+    return (
+        state_key_from_id,
+        coi_key_name,
+        enqueue_state_serialized_key_index_write,
+    )
 
 __all__ = [
     'cached_proof_obligation_id',
-    'get_state', 'get_state_batch', 'get_state_only', 'put_state',
+    'get_state', 'get_state_batch', 'get_state_only',
+    'get_state_payload_bytes', 'get_state_payload_batch', 'put_state',
 ]
 
 
@@ -40,7 +48,7 @@ def cached_proof_obligation_id(data: bytes) -> str:
 
 
 def get_state(serialized_state_key: bytes, state_cache):
-    state_key_from_id, coi_key_name, _ = _key_mints()
+    state_key_from_id, coi_key_name, *_ = _key_mints()
     proof_obligation_id = cached_proof_obligation_id(serialized_state_key)
     pipe = state_cache.redis_runtime.pipeline()
     pipe.get(state_key_from_id(proof_obligation_id))
@@ -48,8 +56,14 @@ def get_state(serialized_state_key: bytes, state_cache):
     serialized_state, serialized_coi = pipe.execute()
     if serialized_state:
         state = pickle.loads(zlib.decompress(serialized_state))
+        iterator = None
         if serialized_coi:
-            state.iterator = pickle.loads(zlib.decompress(serialized_coi))
+            iterator = pickle.loads(zlib.decompress(serialized_coi))
+        binder = getattr(state, "bind_iterator_checkpoint", None)
+        if callable(binder):
+            binder(iterator)
+        else:
+            state.iterator = iterator
         if state.iterator:
             state.iterator.deserialize(state_cache)
         return state
@@ -67,7 +81,7 @@ def get_state_batch(serialized_keys, state_cache):
     """
     if not serialized_keys:
         return {}
-    state_key_from_id, coi_key_name, _ = _key_mints()
+    state_key_from_id, coi_key_name, *_ = _key_mints()
     keys = list(serialized_keys)
     proof_obligation_ids = [cached_proof_obligation_id(k) for k in keys]
     pipe = state_cache.redis_runtime.pipeline()
@@ -83,8 +97,14 @@ def get_state_batch(serialized_keys, state_cache):
             out[key] = None
             continue
         state = pickle.loads(zlib.decompress(ser_state))
+        iterator = None
         if ser_coi:
-            state.iterator = pickle.loads(zlib.decompress(ser_coi))
+            iterator = pickle.loads(zlib.decompress(ser_coi))
+        binder = getattr(state, "bind_iterator_checkpoint", None)
+        if callable(binder):
+            binder(iterator)
+        else:
+            state.iterator = iterator
         if state.iterator:
             state.iterator.deserialize(state_cache)
         out[key] = state
@@ -92,7 +112,7 @@ def get_state_batch(serialized_keys, state_cache):
 
 
 def get_state_only(serialized_state_key: bytes, state_cache):
-    state_key_from_id, _, _ = _key_mints()
+    state_key_from_id, *_ = _key_mints()
     proof_obligation_id = cached_proof_obligation_id(serialized_state_key)
     serialized_state = state_cache.redis_runtime.get(state_key_from_id(proof_obligation_id))
     if serialized_state:
@@ -102,24 +122,95 @@ def get_state_only(serialized_state_key: bytes, state_cache):
         return None
 
 
+def get_state_payload_bytes(serialized_state_key: bytes, state_cache):
+    """Return the exact persisted ``(State, iterator)`` payload bytes.
+
+    This is the raw counterpart of :func:`get_state`: callers that must attest
+    the worker-written persistence occurrence hash these bytes before any
+    driver-side mutation.  No decompression, migration, or fallback occurs.
+    ``(None, None)`` means the obligation State is absent; a present State with
+    a missing iterator is returned as ``(state_bytes, None)`` so completeness
+    remains explicit.
+    """
+
+    if not isinstance(serialized_state_key, bytes):
+        raise TypeError("serialized_state_key must be bytes")
+    state_key_from_id, coi_key_name, *_ = _key_mints()
+    identity = cached_proof_obligation_id(serialized_state_key)
+    pipe = state_cache.redis_runtime.pipeline()
+    pipe.get(state_key_from_id(identity))
+    pipe.get(coi_key_name(identity))
+    state_payload, iterator_payload = pipe.execute()
+    if state_payload is None:
+        return None, None
+    if not isinstance(state_payload, bytes):
+        raise TypeError("persisted State payload must be bytes")
+    if iterator_payload is not None and not isinstance(iterator_payload, bytes):
+        raise TypeError("persisted iterator payload must be bytes")
+    return state_payload, iterator_payload
+
+
+def get_state_payload_batch(serialized_keys, state_cache):
+    """Batch-read exact persisted payload pairs without decoding them."""
+
+    keys = tuple(serialized_keys or ())
+    if not keys:
+        return {}
+    if any(not isinstance(key, bytes) for key in keys):
+        raise TypeError("serialized State payload keys must be bytes")
+    if len(keys) != len(set(keys)):
+        raise ValueError("serialized State payload keys must be distinct")
+    state_key_from_id, coi_key_name, *_ = _key_mints()
+    identities = [cached_proof_obligation_id(key) for key in keys]
+    pipe = state_cache.redis_runtime.pipeline()
+    for identity in identities:
+        pipe.get(state_key_from_id(identity))
+        pipe.get(coi_key_name(identity))
+    raw = pipe.execute()
+    if len(raw) != 2 * len(keys):
+        raise RuntimeError("persisted State payload batch has wrong result count")
+    result = {}
+    for index, key in enumerate(keys):
+        state_payload = raw[2 * index]
+        iterator_payload = raw[2 * index + 1]
+        if state_payload is None:
+            if iterator_payload is not None:
+                raise RuntimeError(
+                    "persisted iterator exists without its State payload"
+                )
+            result[key] = (None, None)
+            continue
+        if not isinstance(state_payload, bytes):
+            raise TypeError("persisted State payload must be bytes")
+        if iterator_payload is not None and not isinstance(
+            iterator_payload, bytes
+        ):
+            raise TypeError("persisted iterator payload must be bytes")
+        result[key] = (state_payload, iterator_payload)
+    return result
+
+
 def put_state(serialized_state_key: bytes, state, state_cache):
-    serialized_state = pickle.dumps(state)
+    proof_obligation_id = cached_proof_obligation_id(serialized_state_key)
+    from src.state.state_store import (
+        enqueue_canonical_state_checkpoint_write,
+        prepare_canonical_state_checkpoint_write,
+    )
+
     try:
-        serialized_coi = pickle.dumps(state.iterator)
+        prepared_state = prepare_canonical_state_checkpoint_write(
+            proof_obligation_id,
+            serialized_state_key,
+            state,
+        )
     except Exception as e:
         import traceback
-        print(f"Error serializing COI: {e}")
+        print(f"Error serializing State checkpoint: {e}")
         traceback.print_exc()
         _find_unpicklable(state.iterator)
         raise
-    state_key_from_id, coi_key_name, state_serialized_key_name = _key_mints()
-    proof_obligation_id = cached_proof_obligation_id(serialized_state_key)
-    compressed_state = zlib.compress(serialized_state)
-    compressed_coi = zlib.compress(serialized_coi)
     pipe = state_cache.redis_runtime.pipeline()
-    pipe.set(state_key_from_id(proof_obligation_id), compressed_state)
-    pipe.set(state_serialized_key_name(proof_obligation_id), serialized_state_key)
-    pipe.set(coi_key_name(proof_obligation_id), compressed_coi)
+    enqueue_canonical_state_checkpoint_write(pipe, prepared_state)
     pipe.execute()
 
 
