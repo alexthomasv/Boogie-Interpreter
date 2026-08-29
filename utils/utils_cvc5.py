@@ -2007,6 +2007,16 @@ def _parse_infix_expr(s, state_cache):
             return args
 
     def _mk_function_call(name, args):
+        # ``hollow_to_str`` is the canonical display owner for persisted
+        # cvc5 terms and renders Boolean NOT as ``not(<term>)``.  Accept that
+        # spelling at the explicitly authored/copy-paste text boundary.  Live
+        # verifier terms never round-trip through this parser.
+        if name == "not":
+            if len(args) != 1:
+                raise ValueError(f"not expects 1 arg, got {len(args)}")
+            if not args[0].getSort().isBoolean():
+                raise ValueError("not expects one Bool argument")
+            return solver.mkTerm(Kind.NOT, args[0])
         if _INTEGER_ENCODING:
             special = _int_enc_special_term(solver, name, args)
             if special is not None:
