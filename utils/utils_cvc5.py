@@ -8,6 +8,7 @@ from interpreter.utils.cvc5_helper import pretty_print_term, sign_extend, zero_e
 from interpreter.utils.cvc5_serde import (
     SerializedCvc5TermV2 as _SerializedCvc5TermV2,
     deserialize_cvc5_term as _deserialize_cvc5_term,
+    hollow_to_str as _hollow_to_str,
 )
 
 from interpreter.utils.program import boogie_type_bitwidth
@@ -222,6 +223,102 @@ class Cvc5ToBoogieLoweringUnavailable(ValueError):
     """
 
 
+class _SerializedSortView:
+    """The sort operations used by the structural Boogie lowerer.
+
+    A serialized term is the cross-process authority.  Adapting its immutable
+    sort record lets the one cvc5-to-Boogie lowering walk that authority
+    directly, without rebuilding a process-local cvc5 term first.
+    """
+
+    __slots__ = ("_sort",)
+
+    def __init__(self, sort):
+        self._sort = sort
+
+    def isBitVector(self) -> bool:
+        return self._sort.kind == "BITVECTOR_SORT"
+
+    def getBitVectorSize(self) -> int:
+        if not self.isBitVector():
+            raise RuntimeError("serialized sort is not a bitvector")
+        return int(self._sort.args[0])
+
+
+class _SerializedOpView:
+    __slots__ = ("_indices",)
+
+    def __init__(self, indices):
+        self._indices = tuple(indices)
+
+    def getNumIndices(self) -> int:
+        return len(self._indices)
+
+    def __getitem__(self, index: int) -> int:
+        return self._indices[index]
+
+
+class _SerializedTermView:
+    """Term-shaped read-only view over one canonical serialized AST."""
+
+    __slots__ = ("_wire",)
+
+    def __init__(self, wire: _SerializedCvc5TermV2):
+        self._wire = wire
+
+    def getNumChildren(self) -> int:
+        return len(self._wire.node.children)
+
+    def __getitem__(self, index: int):
+        return _SerializedTermView(self._wire.children[index])
+
+    def getKind(self):
+        return Kind[self._wire.node.kind]
+
+    def getSort(self):
+        return _SerializedSortView(self._wire.node.sort)
+
+    def getOp(self):
+        return _SerializedOpView(self._wire.node.op_indices)
+
+    def isBooleanValue(self) -> bool:
+        return self._wire.node.kind == "CONST_BOOLEAN"
+
+    def getBooleanValue(self) -> bool:
+        if not self.isBooleanValue():
+            raise RuntimeError("serialized term is not a Boolean literal")
+        return bool(self._wire.node.value)
+
+    def isIntegerValue(self) -> bool:
+        return self._wire.node.kind == "CONST_INTEGER"
+
+    def getIntegerValue(self) -> int:
+        if not self.isIntegerValue():
+            raise RuntimeError("serialized term is not an integer literal")
+        return int(self._wire.node.value)
+
+    def isBitVectorValue(self) -> bool:
+        return self._wire.node.kind == "CONST_BITVECTOR"
+
+    def getBitVectorValue(self, base: int = 2) -> str:
+        if not self.isBitVectorValue():
+            raise RuntimeError("serialized term is not a bitvector literal")
+        value = int(self._wire.node.value)
+        if base == 2:
+            return format(value, f"0{self.getSort().getBitVectorSize()}b")
+        if base == 10:
+            return str(value)
+        raise ValueError(f"unsupported bitvector display base: {base}")
+
+    def getSymbol(self) -> str:
+        if self._wire.node.kind not in {"CONSTANT", "VARIABLE"}:
+            raise RuntimeError("serialized term has no symbol")
+        return self._wire.node.symbol
+
+    def __str__(self) -> str:
+        return _hollow_to_str(self._wire, max_depth=10_000)
+
+
 def cvc5_to_boogie(term) -> str:
     """Render a cvc5 term as Boogie/SMACK syntax the parser can read back
     (e.g. ``$mul.i32($i6, $sub.i32($i6, 1))``).
@@ -272,6 +369,8 @@ def cvc5_to_boogie_ast(
     )
     if term is None:
         raise ValueError("cvc5_to_boogie_ast: term is None")
+    if isinstance(term, _SerializedCvc5TermV2):
+        term = _SerializedTermView(term)
     if depth > 60:
         raise ValueError("cvc5_to_boogie_ast: term nesting exceeds 60")
 
