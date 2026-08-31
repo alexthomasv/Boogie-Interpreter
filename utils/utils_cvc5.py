@@ -204,12 +204,66 @@ fn_to_cvc5_op = {
     "%": (Kind.INTS_MODULUS, 2, None, None),
 }
 
+
+# Exact width-sensitive source intrinsics used by SMACK's integer encoding.
+# ``_int_enc_special_term`` lowers these names to
+# ``bv2nat(bvop(int2bv(width, ...)))``.  The reverse structural lowerer uses
+# the same table below to recover an executable Boogie FunctionApplication;
+# Boolean BinaryExpression operators are a different theory and cannot carry
+# these semantics.
+_INT_ENC_BITWISE_OPS = {
+    "$and": Kind.BITVECTOR_AND,
+    "$or": Kind.BITVECTOR_OR,
+    "$xor": Kind.BITVECTOR_XOR,
+    "$not": Kind.BITVECTOR_NOT,
+    "$shl": Kind.BITVECTOR_SHL,
+    "$lshr": Kind.BITVECTOR_LSHR,
+    "$ashr": Kind.BITVECTOR_ASHR,
+}
+_INT_ENC_BITWISE_ARITY = {
+    Kind.BITVECTOR_AND: 2,
+    Kind.BITVECTOR_OR: 2,
+    Kind.BITVECTOR_XOR: 2,
+    Kind.BITVECTOR_NOT: 1,
+    Kind.BITVECTOR_SHL: 2,
+    Kind.BITVECTOR_LSHR: 2,
+    Kind.BITVECTOR_ASHR: 2,
+}
+
+
 # Reverse mapping: cvc5 Kind → SMACK function name (prefer i32 for BV32)
 _CVC5_KIND_TO_BOOGIE = {}
 for _name, (_kind, _nargs, _width, _out) in fn_to_cvc5_op.items():
     if _name.startswith("$") and _width == 32 and _kind is not None:
         if _kind not in _CVC5_KIND_TO_BOOGIE:
             _CVC5_KIND_TO_BOOGIE[_kind] = _name
+
+# Width-aware reverse map for the exact integer-encoding bitwise family.  Its
+# support set comes from ``fn_to_cvc5_op``, the existing owner of executable
+# SMACK intrinsic names and widths.  Prefer ``.i64`` over the equivalent
+# ``.ref`` spelling so a bitvector sort has one deterministic projection.
+_INT_ENC_BITWISE_BOOGIE_BY_KIND_WIDTH = {}
+for _name, (_kind, _nargs, _width, _out) in fn_to_cvc5_op.items():
+    _base = next(
+        (base for base, kind in _INT_ENC_BITWISE_OPS.items()
+         if kind == _kind),
+        None,
+    )
+    if (
+        _base is None
+        or not isinstance(_width, int)
+        or _nargs != _INT_ENC_BITWISE_ARITY[_kind]
+        or _out != _width
+    ):
+        continue
+    _key = (_kind, _width)
+    _canonical_name = f"{_base}.i{_width}"
+    if (
+        _key not in _INT_ENC_BITWISE_BOOGIE_BY_KIND_WIDTH
+        or _name == _canonical_name
+    ):
+        _INT_ENC_BITWISE_BOOGIE_BY_KIND_WIDTH[_key] = _name
+del _base, _canonical_name, _key, _kind, _name, _nargs, _out, _width
 
 
 class Cvc5ToBoogieLoweringUnavailable(ValueError):
@@ -446,6 +500,19 @@ def cvc5_to_boogie_ast(
             return result
         if value_kind == Kind.BITVECTOR_ZERO_EXTEND and value_n == 1:
             return _unsigned_bv(value[0], value_depth + 1)
+        bitwise_arity = _INT_ENC_BITWISE_ARITY.get(value_kind)
+        if bitwise_arity == value_n:
+            width = value.getSort().getBitVectorSize()
+            intrinsic = _INT_ENC_BITWISE_BOOGIE_BY_KIND_WIDTH.get(
+                (value_kind, width))
+            if intrinsic is not None:
+                return FunctionApplication(
+                    function=FunctionIdentifier(name=intrinsic),
+                    arguments=[
+                        _unsigned_bv(value[index], value_depth + 1)
+                        for index in range(value_n)
+                    ],
+                )
         if value_kind in {
                 Kind.BITVECTOR_ADD, Kind.BITVECTOR_SUB,
                 Kind.BITVECTOR_MULT} and value_n == 2:
@@ -935,16 +1002,6 @@ del _w
 # are the only width-sensitive residual ops in the integer encoding. Each is
 # modeled EXACTLY as SMT-LIB `bv2nat(bvop((_ int2bv w) a, (_ int2bv w) b))`,
 # which is also what the native interpreter's `builtins::int` implements.
-_INT_ENC_BITWISE_OPS = {
-    "$and": Kind.BITVECTOR_AND,
-    "$or": Kind.BITVECTOR_OR,
-    "$xor": Kind.BITVECTOR_XOR,
-    "$not": Kind.BITVECTOR_NOT,  # unary (the old fn-map entry declared 2-ary SUB)
-    "$shl": Kind.BITVECTOR_SHL,
-    "$lshr": Kind.BITVECTOR_LSHR,
-    "$ashr": Kind.BITVECTOR_ASHR,
-}
-
 _INT_ENC_WIDTH_SUFFIX = {
     "i1": 1, "i5": 5, "i6": 6, "i8": 8, "i16": 16, "i24": 24, "i32": 32,
     "i33": 33, "i40": 40, "i48": 48, "i56": 56, "i64": 64, "i128": 128,
