@@ -44,18 +44,21 @@ fn_to_cvc5_op = {
     "$and.i32": (Kind.BITVECTOR_AND, 2, 32, 32),
     "$and.i8": (Kind.BITVECTOR_AND, 2, 8, 8),
     "$and.i1": (Kind.BITVECTOR_AND, 2, 1, 1),
+    "$and.i128": (Kind.BITVECTOR_AND, 2, 128, 128),
 
     "$or.ref": (Kind.BITVECTOR_OR, 2, 64, 64),
     "$or.i64": (Kind.BITVECTOR_OR, 2, 64, 64),
     "$or.i32": (Kind.BITVECTOR_OR, 2, 32, 32),
     "$or.i8": (Kind.BITVECTOR_OR, 2, 8, 8),
     "$or.i1": (Kind.BITVECTOR_OR, 2, 1, 1),
+    "$or.i128": (Kind.BITVECTOR_OR, 2, 128, 128),
 
     "$xor.ref": (Kind.BITVECTOR_XOR, 2, 64, 64),
     "$xor.i64": (Kind.BITVECTOR_XOR, 2, 64, 64),
     "$xor.i32": (Kind.BITVECTOR_XOR, 2, 32, 32),
     "$xor.i8": (Kind.BITVECTOR_XOR, 2, 8, 8),
     "$xor.i1": (Kind.BITVECTOR_XOR, 2, 1, 1),
+    "$xor.i128": (Kind.BITVECTOR_XOR, 2, 128, 128),
 
     "$not.i1": (Kind.BITVECTOR_NOT, 1, 1, 1),
     "$not.i8": (Kind.BITVECTOR_NOT, 1, 8, 8),
@@ -175,12 +178,15 @@ fn_to_cvc5_op = {
     "$shl.i64": (Kind.BITVECTOR_SHL, 2, 64, 64),
     "$shl.i32": (Kind.BITVECTOR_SHL, 2, 32, 32),
     "$shl.i8": (Kind.BITVECTOR_SHL, 2, 8, 8),
+    "$shl.i128": (Kind.BITVECTOR_SHL, 2, 128, 128),
     "$lshr.i64": (Kind.BITVECTOR_LSHR, 2, 64, 64),
     "$lshr.i32": (Kind.BITVECTOR_LSHR, 2, 32, 32),
     "$lshr.i8": (Kind.BITVECTOR_LSHR, 2, 8, 8),
+    "$lshr.i128": (Kind.BITVECTOR_LSHR, 2, 128, 128),
     "$ashr.i64": (Kind.BITVECTOR_ASHR, 2, 64, 64),
     "$ashr.i32": (Kind.BITVECTOR_ASHR, 2, 32, 32),
     "$ashr.i8": (Kind.BITVECTOR_ASHR, 2, 8, 8),
+    "$ashr.i128": (Kind.BITVECTOR_ASHR, 2, 128, 128),
 
     # ——— casts / identity ————————————————————————————————————————————
     "$bitcast.ref.ref": (None, 1, 64, 64),

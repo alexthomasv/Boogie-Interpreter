@@ -30,6 +30,12 @@ _EVALUATION_CASES = (
     (Kind.BITVECTOR_SHL, 8, (0x81, 2)),
     (Kind.BITVECTOR_LSHR, 32, (-1, 31)),
     (Kind.BITVECTOR_ASHR, 64, (1 << 63, 63)),
+    (Kind.BITVECTOR_AND, 128, (-1, (1 << 127) | 0x55)),
+    (Kind.BITVECTOR_OR, 128, (1 << 127, (1 << 64) | 1)),
+    (Kind.BITVECTOR_XOR, 128, (-1, 1 << 127)),
+    (Kind.BITVECTOR_SHL, 128, ((1 << 127) | 1, 1)),
+    (Kind.BITVECTOR_LSHR, 128, (-1, 127)),
+    (Kind.BITVECTOR_ASHR, 128, (1 << 127, 127)),
 )
 
 
@@ -88,6 +94,37 @@ def test_unsigned_or_serialized_wire_keeps_its_width(width, intrinsic):
     assert repr(wire) == repr(live)
     assert isinstance(wire, FunctionApplication)
     assert wire.function.name == intrinsic
+
+
+@pytest.mark.parametrize(
+    "kind,intrinsic",
+    (
+        (Kind.BITVECTOR_AND, "$and.i128"),
+        (Kind.BITVECTOR_OR, "$or.i128"),
+        (Kind.BITVECTOR_XOR, "$xor.i128"),
+        (Kind.BITVECTOR_SHL, "$shl.i128"),
+        (Kind.BITVECTOR_LSHR, "$lshr.i128"),
+        (Kind.BITVECTOR_ASHR, "$ashr.i128"),
+    ),
+)
+def test_unsigned_i128_bitwise_live_and_wire_terms_are_executable(
+    kind,
+    intrinsic,
+):
+    solver = _solver()
+    integer = solver.getIntegerSort()
+    term = _unsigned_result(
+        solver,
+        kind,
+        128,
+        (solver.mkConst(integer, "x"), solver.mkConst(integer, "y")),
+    )
+
+    for ast in (cvc5_to_boogie_ast(term),
+                cvc5_to_boogie_ast(canonical_wire(term))):
+        assert isinstance(ast, FunctionApplication)
+        assert ast.function.name == intrinsic
+        assert " || " not in repr(ast)
 
 
 def test_nested_unsigned_or_under_int_to_bv_extract_concat_lowers_exactly():
