@@ -59,6 +59,30 @@ PROPOSER_TARGET_PATTERN_PROJECTION = (
     "interpreter.utils.ast_view.canonical_authored_pattern_from_native/v1")
 
 
+class PatternBudgetExceeded(Exception):
+    """The in-walk node budget was crossed; the expansion was never built.
+
+    Raised by :func:`term_to_pattern` when called with ``max_nodes`` the
+    instant the running serialized-node count exceeds the budget, so an
+    over-budget term costs O(max_nodes) work instead of materializing its
+    full tree first (shared subterms in the cvc5 DAG can make that tree
+    exponentially larger than the DAG).
+    """
+
+    def __init__(self, node_count: int) -> None:
+        super().__init__(f"pattern node budget exceeded at {node_count}")
+        self.node_count = node_count
+
+
+def _count_pattern_nodes(value: Any) -> int:
+    """Node count of one already-built (leaf-sized) pattern fragment."""
+    if isinstance(value, dict):
+        return 1 + sum(_count_pattern_nodes(child) for child in value.values())
+    if isinstance(value, (list, tuple)):
+        return sum(_count_pattern_nodes(child) for child in value)
+    return 0
+
+
 class UnsupportedShape(Exception):
     """Raised when a cvc5 Kind has no emit-op mapping (typed, not silent)."""
 
@@ -253,31 +277,67 @@ def term_to_pattern(term, captures: dict[str, str], *,
                     max_depth: int = 64, _depth: int = 0,
                     include_native_types: bool = False,
                     zero_one_flag_vars: frozenset[str] = frozenset(),
+                    max_nodes: int | None = None,
+                    _walk_state: dict[str, Any] | None = None,
                     ) -> dict[str, Any]:
     """cvc5 ``Term`` → structural ``pattern`` dict (records leaf captures).
 
     Interior nodes use the raw cvc5 ``Kind`` name (uppercase), which the matcher
     accepts directly. ``max_depth`` elides deep subtrees for the bounded prompt
     view; pass a large value for the exact deterministic template.
+
+    ``max_nodes`` (bounded packet mode only) makes the walk DAG-aware and
+    budget-enforcing: the serialized-node count is charged DURING the walk and
+    :class:`PatternBudgetExceeded` is raised the moment it crosses the budget
+    (never materializing the expansion first), and an interior cvc5 term
+    already serialized once in this walk is emitted as the existing
+    ``{"elided": ...}`` censor marker instead of being re-expanded — a shared
+    subterm DAG therefore costs linear work, not exponential.  Without
+    ``max_nodes`` the walk is byte-for-byte the historical exact template.
     """
+    if max_nodes is not None and _walk_state is None:
+        _walk_state = {"count": 0, "seen": set()}
+
+    def _charge(n: int) -> None:
+        if _walk_state is None:
+            return
+        _walk_state["count"] += n
+        if _walk_state["count"] > max_nodes:
+            raise PatternBudgetExceeded(_walk_state["count"])
+
     c = _const_literal(term)
     if c is not None:
+        _charge(1)
         return {"const": c}
     if term.getNumChildren() == 0:
         if term.getKind() in (Kind.CONSTANT, Kind.VARIABLE):
-            return _symbol_capture_pattern(
+            leaf = _symbol_capture_pattern(
                 term, captures, include_native_type=include_native_types,
                 zero_one_flag_vars=zero_one_flag_vars)
-        return exact_nullary_literal_pattern(term)
+        else:
+            leaf = exact_nullary_literal_pattern(term)
+        _charge(_count_pattern_nodes(leaf))
+        return leaf
     if _depth >= max_depth:
+        _charge(1)
         return {"elided": term.getKind().name,
                 "nchildren": term.getNumChildren()}
+    if _walk_state is not None:
+        term_id = term.getId()
+        if term_id in _walk_state["seen"]:
+            _charge(1)
+            return {"elided": term.getKind().name,
+                    "nchildren": term.getNumChildren()}
+        _walk_state["seen"].add(term_id)
+    _charge(1)
     pattern = {
         "kind": term.getKind().name,
         "args": [term_to_pattern(term[i], captures,
                                  max_depth=max_depth, _depth=_depth + 1,
                                  include_native_types=include_native_types,
-                                 zero_one_flag_vars=zero_one_flag_vars)
+                                 zero_one_flag_vars=zero_one_flag_vars,
+                                 max_nodes=max_nodes,
+                                 _walk_state=_walk_state)
                  for i in range(term.getNumChildren())],
     }
     indices = term_op_indices(term)
