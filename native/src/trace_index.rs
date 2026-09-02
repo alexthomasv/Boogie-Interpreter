@@ -30,7 +30,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 // frame/record position; the raw record stays compact and unchanged.
 // SWRL v2 inputs are intentionally rejected: publishing a v4 SQLite index from
 // an aggregate-only raw stream could mislabel missing PRE visits as authority.
-const TRACE_INDEX_VERSION: &str = "4";
+// "5": both lanes of the composed program are indexed ("4" dropped every
+// `.shadow` record).  Must match `TRACE_INDEX_VERSION` in
+// `src/state/trace_evidence.py`.
+const TRACE_INDEX_VERSION: &str = "5";
 const ORDERED_TRACE_VERSION: &str = "1";
 
 const NUM_DECODERS: usize = 8;
@@ -194,7 +197,6 @@ struct Counters {
     bytes_decoded: AtomicU64,
     records_parsed: AtomicU64,
     records_indexed: AtomicU64,
-    shadow_records_skipped: AtomicU64,
     contexts_indexed: AtomicU64,
     runs_written: AtomicU64,
     run_groups_written: AtomicU64,
@@ -350,14 +352,8 @@ pub fn build_trace_index_sqlite(
         sqlite.set_meta("builder", "native_sqlite_sorted_runs")?;
         sqlite.set_meta("raw_files", raw_paths.len().to_string().as_str())?;
         sqlite.set_meta("records", records.to_string().as_str())?;
-        sqlite.set_meta(
-            "skipped_shadow",
-            counters
-                .shadow_records_skipped
-                .load(Ordering::Relaxed)
-                .to_string()
-                .as_str(),
-        )?;
+        // Both lanes index; the key stays for the index meta contract.
+        sqlite.set_meta("skipped_shadow", "0")?;
         sqlite.set_meta(
             "contexts",
             counters
@@ -385,7 +381,7 @@ pub fn build_trace_index_sqlite(
             rows,
             records,
             raw_files: raw_paths.len() as u64,
-            skipped_shadow: counters.shadow_records_skipped.load(Ordering::Relaxed),
+            skipped_shadow: 0,
             contexts: counters.contexts_indexed.load(Ordering::Relaxed),
         })
     })();
@@ -801,7 +797,6 @@ fn parser_loop(
     while let Ok(chunk) = chunk_rx.recv() {
         let mut parsed_this_chunk = 0u64;
         let mut indexed_this_chunk = 0u64;
-        let mut skipped_shadow_this_chunk = 0u64;
         let mut contexts_this_chunk = 0u64;
         let mut ordered_visits: FxHashMap<u32, OrderedVisitChunk> = FxHashMap::default();
         let mut ordered_scalars: FxHashMap<u32, OrderedScalarChunk> = FxHashMap::default();
@@ -887,10 +882,12 @@ fn parser_loop(
                 if var_id as usize >= n_vars {
                     continue;
                 }
-                if var_names[var_id as usize].ends_with(".shadow") {
-                    skipped_shadow_this_chunk += 1;
-                    continue;
-                }
+                // The traced program is the self-composition: the shadow lane
+                // is an ordinary input (the runner completes every declared
+                // shadow formal before executing), so `.shadow` scalars index
+                // exactly like base ones.  A differing-lane pair trace is the
+                // cheap refutation instrument; dropping the shadow half here
+                // made it blind (aead #34: 0 of 102,799 timelines were shadow).
                 push_ordered_scalar(&mut ordered_scalars, var_id, event_seq, kind, pc, value);
                 if kind != OP_WRITE {
                     continue;
@@ -903,10 +900,9 @@ fn parser_loop(
             if var_id as usize >= n_vars || block_id as usize >= n_blocks {
                 continue;
             }
-            if !scalar_event && var_names[var_id as usize].ends_with(".shadow") {
-                skipped_shadow_this_chunk += 1;
-                continue;
-            }
+            // Shadow-lane reads index like base-lane reads (see above); the
+            // `skipped_shadow` counter stays in the index meta as an
+            // always-zero typed fact so the contract keys are unchanged.
 
             // Loop records get this execution's per-iteration id; straight-line
             // records (iter_id==0) get the execution's reserved base id — NOT a
@@ -991,9 +987,6 @@ fn parser_loop(
         counters
             .records_indexed
             .fetch_add(indexed_this_chunk, Ordering::Relaxed);
-        counters
-            .shadow_records_skipped
-            .fetch_add(skipped_shadow_this_chunk, Ordering::Relaxed);
         counters
             .contexts_indexed
             .fetch_add(contexts_this_chunk, Ordering::Relaxed);
